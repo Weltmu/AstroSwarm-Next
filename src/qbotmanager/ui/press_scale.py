@@ -13,9 +13,12 @@ from PySide6.QtCore import QEasingCurve, Qt, QVariantAnimation
 from PySide6.QtGui import QPainter
 from PySide6.QtWidgets import QPushButton, QStyle, QStyleOptionButton
 
+from . import motion
+
 PRESS_SCALE = 0.96
-PRESS_MS = 90
-RELEASE_MS = 170
+# 时长统一由 ui/motion.py 定义（设置里关掉动效时那边会直接落位）
+PRESS_MS = motion.DUR_PRESS
+RELEASE_MS = motion.DUR_RELEASE
 
 _ORIG_PAINT = QPushButton.paintEvent
 _ORIG_MOUSE_PRESS = QPushButton.mousePressEvent
@@ -41,6 +44,10 @@ def _apply_scale(btn: QPushButton, scale: float) -> None:
 
 
 def _animate_to(btn: QPushButton, target: float) -> None:
+    if not motion.enabled():
+        # 关掉动效：不做缩放过渡，直接按到目标值（留一点点按感也要瞬时）
+        _apply_scale(btn, target)
+        return
     _ensure_anim(btn)
     anim = btn._press_scale_anim
     current = getattr(btn, "_press_scale", 1.0)

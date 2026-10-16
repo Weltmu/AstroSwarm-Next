@@ -32,6 +32,23 @@ def resolve_log(name) -> tuple:
     return key, platform_info.log_home() / filename
 
 
+def prune_old(days: int = 10) -> dict:
+    """按天数清理无头端日志（默认留最近 10 天，和桌面端同一个策略）。
+
+    无头端没有常驻的清理线程，所以在这里给一个"调用即清理"的入口：
+    控制台启动时、以及每天第一次读日志时各来一次就够（开销只有几次 stat）。
+    """
+    from qbotmanager.core import cleanup as cleanup_mod
+
+    from . import platform_info
+
+    try:
+        return cleanup_mod.rotate_and_prune_logs(platform_info.log_home(), days)
+    except Exception:  # noqa: BLE001 —— 清理失败绝不能影响看日志
+        return {"rotated": [], "deleted": [], "skipped": [], "keep_days": days,
+                "bytes_freed": 0}
+
+
 def tail(path: Path, n: int = 200) -> str:
     path = Path(path)
     if not path.exists():

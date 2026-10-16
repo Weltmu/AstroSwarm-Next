@@ -10,8 +10,10 @@ class PluginConfig(BaseModel):
     aichat_super_users: Set[str] = set()
 
     # ---- 群聊免@会话 ----
-    # 与机器人聊天后，多少秒内不需要再@；超过后需重新@
-    aichat_session_expire_seconds: int = 30
+    # 与机器人聊天后，多少秒内不需要再@；超过后需重新@（30~300）
+    aichat_session_expire_seconds: int = 180
+    # 免@连续对话的判断模式：timeout=按时间窗（默认），api=每条都让 AI 读群记录判断
+    aichat_session_mode: str = "timeout"
     # 连续多少条与机器人无关的消息后结束免@会话（需重新@）
     aichat_session_unrelated_limit: int = 5
 

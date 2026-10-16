@@ -1,13 +1,18 @@
 {
   "name": "astroswarm-console",
   "private": true,
-  "version": "0.1.6",
+  "version": "0.1.4",
   "type": "module",
-  "description": "星群控制台前端：Linux 无头版的网页界面（React + Vite）。构建产物 console-dist/ 由无头端直接托管。",
+  "description": "星巢 Nest 控制台前端：Linux 无头版的网页界面（React + Vite）。构建产物 console-dist/ 由无头端直接托管。",
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "smoke": "esbuild _smoke/smoke.jsx --bundle --platform=node --format=cjs --jsx=automatic --loader:.jsx=jsx --outfile=_smoke/smoke.cjs --log-level=error && node _smoke/smoke.cjs",
+    "shots": "node _shots/shoot.mjs",
+    "shots:before": "node _shots/serve-before.mjs",
+    "shots:keytest": "node _shots/keytest.mjs",
+    "shots:contrast": "node _shots/contrast.mjs"
   },
   "dependencies": {
     "react": "^18.3.1",

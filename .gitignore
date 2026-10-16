@@ -56,3 +56,31 @@ __pycache__/
 
 # 本机敏感串守卫（不进仓库）
 tools/.release_guard.txt
+# 本机一次性脚本（内含真实 API key / 个人目录，2026-10-16 退出仓库）
+tools/apply_deepseek_key_and_codex_window.py
+tools/scan_api_keys.py
+
+# ---------- 本地工作件（2026-10-16 整理：这些从来没进过仓库，别误提交）----------
+# 会话备忘 / 模拟脚本 / 检查产物
+work/
+# 服务器操作留痕脚本
+_ops/
+# 机器人运行数据（下载目录等）
+data/
+# 给客户/内部的工作文档
+deliverables/
+outputs/
+.smoke_root/
+# 历次改动的手工备份目录
+_backup_*/
+# 交接文档（含服务器信息，不进公开仓库）
+docs/交接总览*.md
+.pill_*.png
+.verify_*
+.font_preview.png
+.tmp_*
+.coord_backup_*
+.last_backup_ai.txt
+_pytest_*.txt
+*.err
+

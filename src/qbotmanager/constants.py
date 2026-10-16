@@ -2,8 +2,10 @@ from pathlib import Path
 import os
 
 APP_NAME = "AstroSwarm"
-APP_DISPLAY = "AstroSwarm 星群"
-APP_VERSION = "1.2.14"
+APP_DISPLAY = "星巢 Nest"        # 用户可见的软件名（网站仍是 AstroSwarm 星群）
+# 必须和 __init__.py 的 APP_VERSION 同步：标题栏显示与更新检查读的是这里。
+# （1.2.14 那版漏改过一次，1.2.15 用户在标题栏看到的还是 v1.2.14 并被提示升级。）
+APP_VERSION = "1.2.23"
 
 # ---- Python runtime (for the bot) ----
 # 使用 embeddable 精简版：纯解压、不写注册表、不需要管理员权限，

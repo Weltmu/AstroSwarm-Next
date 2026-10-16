@@ -1,9 +1,17 @@
-<!doctype html>
+﻿<!doctype html>
 <html lang="zh-CN">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>AstroSwarm 控制台</title>
+    <!-- 页面标题 = 软件品牌（老板 2026-10-10 定名：软件叫「星巢 Nest」，
+         网站才叫「AstroSwarm 星群」）。别把标题改回公司的旧程序名。 -->
+    <title>星巢 Nest 控制台</title>
+    <!-- 页签图标 = 星巢 Nest 枝条巢 logo（白底）。
+         public/logo.png 是 Vite 的静态目录，build 时会原样拷到 console-dist/logo.png，
+         无头端 StaticFiles 挂在 "/" 上 → 浏览器请求 /logo.png 直接命中。
+         加了这行，浏览器就不再盲请求 /favicon.ico，服务器日志里的 favicon 404 随之消失。
+         注意：只做页签图标，密码屏/顶栏**不放**图片 logo（老板 2026-10-10 要求）。 -->
+    <link rel="icon" type="image/png" href="/logo.png" />
   </head>
   <body>
     <div id="root"></div>

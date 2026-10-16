@@ -17,6 +17,7 @@ from typing import Dict, List, Optional
 
 from nonebot import get_bots, get_driver, logger
 
+from . import gates, reply_format
 from .manager import chat_manager
 
 # 本模块只负责在导入时注册后台任务，不向外面导出任何名字
@@ -190,10 +191,14 @@ def _pack_cfg() -> dict:
         return _PACK_CFG_CACHE["cfg"]
     cfg = dict(_PACK_DEFAULTS)
     d = _pack_dir()
+    import json as _json          # 本模块顶层没有 json，统一在函数里按需导入
     for name in ("behavior.json", "config.json"):      # 后者优先级更高
         try:
             raw = (d / name).read_text(encoding="utf-8")
-            data = json.loads(raw)
+            # 注意用 _json：本模块只在函数里 `import json as _json`（顶层没有 json 这个名字）。
+            # 以前这里写的是裸 `json.loads` → NameError 被下面的 except 吞掉，
+            # 表现是"能力包里的 proactive 参数永远不生效"（静默失效，查起来很贵）。
+            data = _json.loads(raw)
             if isinstance(data, dict):
                 # 允许 {"proactive": {...}} 或直接 {...}
                 merged = data.get("proactive") if isinstance(data.get("proactive"), dict) else data
@@ -319,7 +324,23 @@ def _pick_local_opener(user_id: str) -> str:
     return opener
 
 
-async def _build_opener_messages(user_id: str) -> List[str]:
+def _opener_context_key(user_id: str, platform: str = "") -> str:
+    """主动消息的上下文 key —— 与正常会话同一口径（2026-10-15 审计）。
+
+    以前这里是裸 `str(user_id)`，而用户回话时 brain 按
+    `platform.context_key` = `qq_official:private:<openid>` 读上下文 ——
+    两条路不在同一个"抽屉"里，开场白永远进不了后续对话。
+    """
+    plat = str(platform or "").strip().lower() or "qq_official"
+    try:
+        from .platform import SCENE_PRIVATE, context_key_for
+
+        return context_key_for(plat, SCENE_PRIVATE, str(user_id))
+    except Exception:  # noqa: BLE001 —— 兜底：至少别退化成裸 id
+        return f"{plat}:private:{user_id}"
+
+
+async def _build_opener_messages(user_id: str, platform: str = "") -> List[str]:
     """
     生成主动聊天的开场白分段列表
 
@@ -331,7 +352,10 @@ async def _build_opener_messages(user_id: str) -> List[str]:
         from .chat import get_chat_reply
         from .context import add_message, get_context
 
-        key = str(user_id)
+        # 2026-10-15（审计 memory/extra-4）：上下文 key 必须和用户回话时用的
+        # **同一个**（platform.context_key_for），否则这次开场白进了"另一个抽屉"，
+        # 用户回复时机器人完全不记得自己刚主动说过话。
+        key = _opener_context_key(user_id, platform)
         context = get_context(key)
         context = context + [
             {
@@ -345,14 +369,9 @@ async def _build_opener_messages(user_id: str) -> List[str]:
         ]
         reply = await get_chat_reply(context, is_group=False)
 
-        import json
-
-        data = json.loads(reply)
-        segments = [
-            segment
-            for segment in data.get("reply", [])
-            if segment and segment.strip()
-        ]
+        # 不再假设模型一定按 {"reply": [...]} 回：解析不出就当一段话用
+        segments = [_clean_outbound(s) for s in reply_format.reply_segments(reply)]
+        segments = [s for s in segments if s]
         if not segments:
             raise ValueError("AI 返回的回复为空")
 
@@ -365,7 +384,7 @@ async def _build_opener_messages(user_id: str) -> List[str]:
         from .context import add_message
 
         text = _pick_local_opener(user_id)
-        add_message(str(user_id), "assistant", text)
+        add_message(_opener_context_key(user_id, platform), "assistant", text)
         return [text]
 
 
@@ -384,6 +403,17 @@ async def _send_proactive_message(bot, user_id: str) -> None:
 
 async def _try_send_one() -> None:
     """尝试给一个随机目标用户发送一条主动消息（带开关/免打扰/冷却检查）"""
+    # 2026-10-15（审计 F1）：补平台开关与聊天总开关 —— 以前只判 ai_disabled，
+    # 客户端关掉「QQ 平台」或聊天总开关后，主动消息照发。
+    # 2026-10-16（对抗性复核 F1）：这里只查**总开关** —— 平台门要按"实际发到哪条
+    # 平台"查：以前一律拿 "qq" 查，只关 QQ 平台时微信主动消息被误挡，只关微信时
+    # 微信那条路又漏查照发。具体平台门在下面各自分支里（QQ / 微信 / 跨平台）。
+    if gates.ai_disabled():
+        logger.info("[proactive] " + gates.blocked_reason(""))
+        return
+    if not chat_manager.is_chat_enabled():
+        logger.info("[proactive] 主动聊天跳过：聊天总开关是关的")
+        return
     if not chat_manager.is_proactive_enabled():
         return
 
@@ -413,6 +443,21 @@ async def _try_send_one() -> None:
         return
 
     target = random.choice(eligible)
+
+    # ---- 跨平台主动聊天（2026-10-04 老板要的"整合进软件"）----
+    # 目标可以写成 `平台:身份`（如 qq_official:openid / qq:12345 / wechat:wxid），
+    # 这时**严格按这条目标自己记录的平台+身份**发，绝不看"最近聊过谁"——
+    # 那正是把该发给 QQ 上某人的话从微信发出去的原因。
+    if ":" in str(target):
+        # 平台门按**目标自己记的平台**查（2026-10-16 复核 F1）
+        _plat = str(target).partition(":")[0].strip().lower() or "qq"
+        _blocked = gates.blocked_reason(_plat)
+        if _blocked:
+            logger.info("[proactive] " + _blocked)
+            return
+        await _send_proactive_cross(str(target))
+        return
+
     if bot is not None and target.isdigit():
         logger.info(
             f"主动聊天目标 {target} 是 QQ 号；QQ 官方主动消息需要 openid，"
@@ -439,6 +484,12 @@ async def _try_send_one() -> None:
     if un >= int(cfg.get("max_unanswered", 3)):
         logger.info(f"主动聊天：{target} 已连续 {un} 条没回（上限 {cfg.get('max_unanswered')}），跳过")
         return
+    # 平台门：这条最终发给谁就查谁（2026-10-16 复核 F1）
+    _plat = "qq" if bot is not None else "wechat"
+    _blocked = gates.blocked_reason(_plat)
+    if _blocked:
+        logger.info("[proactive] " + _blocked)
+        return
     try:
         if bot is not None:
             await _send_proactive_message(bot, target)
@@ -454,14 +505,92 @@ async def _try_send_one() -> None:
     _note_mark(target)
 
 
-async def _proactive_loop() -> None:
-    """主动聊天主循环：每次随机等待一段时间后发一条消息"""
-    logger.info("主动聊天后台任务已启动（不定时随机找用户聊天）")
+async def _send_proactive_cross(target_key: str) -> None:
+    """跨平台主动聊天：把这条消息发到目标自己记录的那个平台身份上。
+
+    target_key 形如 `平台:身份`（qq_official:openid / qq:12345 / wechat:wxid）。
+    身份隔离规矩（老板特别强调的那条）：
+    - 只发 target_key 这一个身份，**不查绑定关系、不扩散到其它平台**；
+    - 不参与"QQ 号 → openid"之类的猜测；
+    - 发送失败就如实记日志，不换人重试。
+    """
+    platform, _, identity = str(target_key).partition(":")
+    platform = platform.strip().lower()
+    identity = identity.strip()
+    if not platform or not identity:
+        logger.info(f"主动聊天：跨平台目标格式不对（{target_key}），跳过")
+        return
+    if _is_quiet_hour():
+        logger.info("当前处于免打扰时段，跳过本轮跨平台主动聊天")
+        return
+    # 上下文 key 用**目标平台那一套**（qq_official:private:<id> / wechat:private:<id>），
+    # 与用户在那个平台回话时 brain 用的 key 一致（2026-10-15 审计）
+    text = await _build_opener_text(identity, platform=platform)
+    if not text:
+        logger.info("主动聊天：这一次没生成出内容，跳过")
+        return
+    from . import cross_platform
+
+    result = await cross_platform._send(target_key, platform, identity, "file", None, text=text)
+    if result.get("ok"):
+        logger.info(f"跨平台主动消息 -> {target_key}：已发送")
+        _note_sent(target_key, False)
+        _note_mark(target_key)
+    else:
+        logger.info(f"跨平台主动消息 -> {target_key} 失败：{result.get('error')}"
+                    f"（不换人重试）")
+
+
+async def _build_opener_text(user_id: str, platform: str = "") -> str:
+    """生成一句开场白（复用主动聊天那套提示词，失败返回空串）。
+
+    `platform` 给了就按那条平台的上下文 key 存（与用户回话时读的 key 一致）。
+    """
+    try:
+        segments = await _build_opener_messages(user_id, platform=platform)
+        return " ".join(str(s) for s in (segments or []) if s).strip()
+    except Exception as e:  # noqa: BLE001
+        logger.info(f"主动聊天：生成开场白失败：{e}")
+        return ""
+
+
+async def _wait_effective(interval_picker, *, label: str, step: float = 10.0) -> None:
+    """按"当前生效的随机间隔"等一等 —— **等的过程里改配置也立即生效**。
+
+    2026-10-11 热重载修的问题：以前这里是
+    ``await asyncio.sleep(random.uniform(min, max) * 60)``，
+    也就是"间隔 90 分钟 = 接下来 90 分钟里改配置一律不理会"，
+    界面上把主动聊天关掉、机器人还可能过一小时才发一条 —— 看着就像没生效。
+    现在：
+      * 每 ``step`` 秒醒一次（顺带一次 ``os.stat`` 热重载配置）；
+      * 配置一被改过就**按新间隔重新计时**；
+      * 间隔被改短时立刻跟上，改长时也不会"睡死"。
+    """
     while True:
         try:
-            interval_min, interval_max = chat_manager.get_proactive_interval()
-            interval_seconds = random.uniform(interval_min, interval_max) * 60
-            await asyncio.sleep(interval_seconds)
+            low, high = interval_picker()
+            total = max(1.0, random.uniform(low, high) * 60)
+        except Exception as e:  # noqa: BLE001 —— 读配置失败按 5 分钟兜底，别空转
+            logger.warning("%s：读间隔失败（%s），按 5 分钟重试", label, e)
+            total = 300.0
+        waited = 0.0
+        while waited < total:
+            await asyncio.sleep(min(step, total - waited))
+            waited += step
+            try:
+                if chat_manager.maybe_reload():
+                    logger.info("%s：配置刚改过，按新参数重新计时", label)
+                    break
+            except Exception:  # noqa: BLE001
+                pass
+
+
+async def _proactive_loop() -> None:
+    """主动聊天主循环：每次按**当前生效的**随机间隔等一等，再试着发一条。"""
+    logger.info("主动聊天后台任务已启动（不定时随机找用户聊天；参数热读）")
+    while True:
+        try:
+            await _wait_effective(chat_manager.get_proactive_interval, label="主动聊天")
             await _try_send_one()
         except asyncio.CancelledError:
             logger.info("主动聊天后台任务已停止")
@@ -482,6 +611,27 @@ def _is_in_group_cooldown(group_id: str) -> bool:
     return (datetime.now().timestamp() - last_time) < cooldown * 60
 
 
+def _clean_outbound(text: str) -> str:
+    """旁路出站（主动消息 / 群搭话 / 入群欢迎）也要过一遍清洗（2026-10-15 审计 F2）。
+
+    这些路径以前只过 reply_format.reply_segments —— 模型照 2026-10-12 那次事故
+    吐 `<||DSML|| invoke …>` 或裸 JSON 调用时，会**原样发到用户微信/群里**。
+    主链路（brain）与戳一戳早就补了 tool_marker，这里补齐同一道。
+    """
+    try:
+        from . import tool_marker
+
+        clean, removed = tool_marker.strip_markers(str(text or ""))
+        clean, removed_json = tool_marker.strip_json_tool_calls(clean)
+        clean = tool_marker.strip_fake_tool_calls(clean)
+        if removed or removed_json:
+            logger.warning("[proactive] 出站清洗：主动消息里的工具调用标记已剥掉")
+        return clean.strip()
+    except Exception as e:  # noqa: BLE001 —— 清洗失败不能挡住发消息
+        logger.warning(f"[proactive] 出站清洗异常（原样发送）: {e}")
+        return str(text or "")
+
+
 async def _build_interject_content(group_id: str) -> str:
     """生成群聊搭话内容：随机选一种构思（读记录搭话 / 不读记录找话题）"""
     from .chat import get_interject_reply
@@ -496,7 +646,7 @@ async def _build_interject_content(group_id: str) -> str:
             if not history:
                 mode = "random"
         text = await get_interject_reply(history, mode)
-        return text
+        return _clean_outbound(text)
     except Exception as e:
         logger.warning(f"AI生成搭话内容失败，改用本地开场白: {e}")
         return _pick_local_opener(group_id)
@@ -505,6 +655,9 @@ async def _build_interject_content(group_id: str) -> str:
 async def _send_interject(bot, group_id: str) -> None:
     """向指定群发送搭话消息（QQ 官方 send_to_group，group_openid）。"""
     text = await _build_interject_content(group_id)
+    if not text:
+        logger.info(f"群 {group_id} 搭话内容清洗后为空，跳过")
+        return
     await bot.send_to_group(
         group_openid=group_id, message=text, msg_seq=_next_seq(group_id))
     _last_interject_time[group_id] = datetime.now().timestamp()
@@ -513,6 +666,16 @@ async def _send_interject(bot, group_id: str) -> None:
 
 async def _try_interject_one() -> None:
     """按概率尝试向配置的群聊搭话"""
+    # 2026-10-15（审计 F1）：以前只判 ai_disabled —— 客户端把**聊天总开关**关掉、
+    # 或者把某个群从允许群聊里移掉之后，机器人照样往那个群搭话（"关了还说话"）。
+    # `gates.blocked_reason("qq")` 同时看总开关与 QQ 平台开关。
+    _blocked = gates.blocked_reason("qq")
+    if _blocked:
+        logger.info("[proactive] " + _blocked)
+        return
+    if not chat_manager.is_chat_enabled():
+        logger.info("[proactive] 群聊搭话跳过：聊天总开关是关的")
+        return
     if not chat_manager.is_interject_enabled():
         return
 
@@ -539,6 +702,12 @@ async def _try_interject_one() -> None:
             continue
         if _is_in_group_cooldown(group_id):
             continue
+        # 2026-10-16（对抗性复核 F1）：群白名单也要查 —— 客户端把某个群从
+        # 「允许群聊」里移掉之后，机器人以前照样往那个群搭话（"关了还说话"）。
+        if not chat_manager.is_group_enabled(group_id):
+            logger.info(f"[proactive] 群 {group_id} 未开启群聊回话，跳过搭话"
+                        "（客户端 AI 大脑页「允许在群里回话」可打开）")
+            continue
         if random.random() >= probability:
             continue
         try:
@@ -548,12 +717,11 @@ async def _try_interject_one() -> None:
 
 
 async def _interject_loop() -> None:
-    """群聊搭话主循环：随机间隔触发，按概率决定是否搭话"""
-    logger.info("群聊搭话后台任务已启动（随机不定时，按概率触发）")
+    """群聊搭话主循环：按**当前生效的**随机间隔触发，按概率决定是否搭话。"""
+    logger.info("群聊搭话后台任务已启动（随机不定时、按概率触发；参数热读）")
     while True:
         try:
-            interval_min, interval_max = chat_manager.get_interject_interval()
-            await asyncio.sleep(random.uniform(interval_min, interval_max) * 60)
+            await _wait_effective(chat_manager.get_interject_interval, label="群聊搭话")
             await _try_interject_one()
         except asyncio.CancelledError:
             logger.info("群聊搭话后台任务已停止")
@@ -565,7 +733,14 @@ async def _interject_loop() -> None:
 
 @get_driver().on_startup
 async def _start_proactive_task() -> None:
-    """机器人启动时启动主动聊天后台任务"""
+    """机器人启动时启动主动聊天后台任务。
+
+    **总开关现在不在这里判**（2026-10-11 热重载）：任务照常起，但循环里每次
+    干活前都读一次开关 —— 界面上把总开关关掉，它下一次醒来就什么都不做，
+    不用重启机器人（以前关掉总开关要么不注册、要么继续发）。
+    """
+    if gates.ai_disabled():
+        logger.info("[proactive] AI 总开关是关的，后台任务先空转（打开立即生效，不用重启）")
     global _proactive_task
     if _proactive_task is None or _proactive_task.done():
         _proactive_task = asyncio.create_task(_proactive_loop())

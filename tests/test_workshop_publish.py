@@ -186,7 +186,9 @@ def test_fix_from_errors_keeps_id_and_passes_checks(tmp_path, monkeypatch):
     _install(s)
     repair.record(s, "weather_demo", "check_weather", "TypeError: boom")
 
-    def fake_model(settings, system, user, timeout=240):
+    # **kwargs 要收：真 `call_model` 还有 budget / usage 两个参数（用量记账），
+    # 调用方会带过来；不收就会 TypeError: unexpected keyword argument 'usage'。
+    def fake_model(settings, system, user, timeout=240, **kwargs):
         return json.dumps({
             "manifest": {
                 "id": "renamed_by_model", "name": "查天气", "version": "1.0.1",

@@ -15,6 +15,8 @@ import subprocess
 import time
 import urllib.error
 import urllib.request
+
+from . import json_cache
 from pathlib import Path
 
 # 与服务器一致
@@ -35,13 +37,56 @@ logger = logging.getLogger("qbotmanager")
 
 
 def _appdata_dir() -> Path:
-    base = Path(os.environ.get("APPDATA", str(Path.home() / "AppData" / "Roaming")))
-    d = base / "QBotManager"
+    """账号/许可证/头像的存放目录。
+
+    Windows 桌面端：还是 %APPDATA% 下的 QBotManager（行为一个字不变）。
+    其它平台（Linux 无头端）：按下面顺序，全都落在程序自己的数据目录附近，
+    这样备份、迁移、卸载脚本都能带上它。
+
+    2026-10-10 修：以前只看 APPDATA，Linux 上会落到
+    /root/AppData/Roaming/QBotManager —— 又丑又不在 /opt/astroswarm/data 里，
+    备份会漏掉账号与头像（老板要求"配置都在服务器端"）。
+    """
+    if os.name == "nt":
+        base = Path(os.environ.get("APPDATA", str(Path.home() / "AppData" / "Roaming")))
+        d = base / "QBotManager"
+    else:
+        explicit = os.environ.get("ASTROSWARM_DATA_HOME") or os.environ.get("QBM_DATA_HOME")
+        if explicit:
+            d = Path(explicit)
+        else:
+            xdg = os.environ.get("XDG_DATA_HOME")
+            base = Path(xdg) if xdg else (Path.home() / ".local" / "share")
+            d = base / "qbotmanager"
     try:
         d.mkdir(parents=True, exist_ok=True)
+        _migrate_legacy_appdata(d)
     except OSError as e:
-        logger.warning("写入许可证失败: %s", e)
+        logger.warning("写入数据目录失败: %s", e)
     return d
+
+
+# 老位置（Linux 上被 APPDATA 逻辑写出来的那个）里值得搬过来的文件
+_LEGACY_NAMES = ("account.json", "avatar.jpg", "license.json", "activate.log")
+
+
+def _migrate_legacy_appdata(new_dir: Path) -> None:
+    """把老目录里的账号/头像/许可证搬到新目录（只在新目录没有该文件时搬，不覆盖）。"""
+    if os.name == "nt":
+        return
+    legacy = Path.home() / "AppData" / "Roaming" / "QBotManager"
+    if not legacy.is_dir() or legacy.resolve() == Path(new_dir).resolve():
+        return
+    for name in _LEGACY_NAMES:
+        src_f = legacy / name
+        dst_f = Path(new_dir) / name
+        if not src_f.is_file() or dst_f.exists():
+            continue
+        try:
+            dst_f.write_bytes(src_f.read_bytes())
+            logger.info("已把 %s 从老目录搬过来：%s -> %s", name, legacy, new_dir)
+        except OSError as e:
+            logger.warning("搬 %s 失败（不影响使用）: %s", name, e)
 
 
 def license_file() -> Path:
@@ -154,15 +199,17 @@ def verify_key_offline(machine_id: str, key: str) -> bool:
 
 # ---------------------------------------------------------------- 本地存档
 def load_license() -> dict | None:
+    """读本机许可证存档。
+
+    走带缓存的读（core/json_cache）：界面每次心跳都会问一次权益，
+    以前每次都真读盘 + 解析 JSON（py-spy 现场里 license.json 属于读得最勤的几个之一）。
+    """
     p = license_file()
     if not p.exists():
         return None
-    try:
-        data = json.loads(p.read_text(encoding="utf-8"))
-        if data.get("machine_id") and data.get("key"):
-            return data
-    except (ValueError, OSError) as e:
-        logger.warning("读取许可证失败: %s", e)
+    data = json_cache.load_json(p)
+    if data.get("machine_id") and data.get("key"):
+        return data
     return None
 
 
@@ -170,6 +217,7 @@ def save_license(data: dict):
     p = license_file()
     try:
         p.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        json_cache.invalidate(p)
     except OSError as e:
         logger.warning("清除许可证失败: %s", e)
 
@@ -280,15 +328,19 @@ def entitlements() -> dict:
     字段必须通过服务器签名校验；校验不过按未开通处理。
 
     - `all_plugins` / `full` = 历史字段（能力包已全部免费，运行时不再按它放行）；
-    - `member` = 已开通的档位且未过期（微信通道看它）；trial 不算。
+    - `member` = 微信通道是否可用；**已免费开放**（`WECHAT_FREE_FOR_ALL`），所以恒为 True，
+      与 `feature_gate()` 保持一致（两处口径不同会让界面互相打架）。
     """
     lic = load_license() or {}
     if not verify_entitlement(lic):
         return {"plan": "none", "plan_expires_at": 0, "full": False,
-                "member": False, "all_plugins": False, "owned_plugins": []}
+                "member": bool(WECHAT_FREE_FOR_ALL), "all_plugins": False,
+                "owned_plugins": []}
     plan = str(lic.get("plan") or "none").lower()
     plan_exp = float(lic.get("plan_expires_at") or 0)
     allp, member = _plan_flags(plan, plan_exp, lic)
+    if WECHAT_FREE_FOR_ALL:
+        member = True
     owned = [
         str(x).strip() for x in (lic.get("owned_plugins") or []) if str(x).strip()
     ]
@@ -316,21 +368,42 @@ def _plan_flags(plan: str, plan_exp: float, lic: dict) -> tuple:
     return allp, member
 
 
+# 微信通道免费开放（2026-10-01 老板拍板）：True = 所有人可用，不再需要开通验证。
+# 改回 False 就恢复"看会员档位"的老逻辑（下面的签名校验与档位判断都还在）。
+WECHAT_FREE_FOR_ALL = True
+
+
 def feature_gate() -> dict:
     """功能闸门：邮箱账号授权，不再需要激活码。
 
     - `full` / `all_plugins` = 历史字段（能力包已全部免费，运行时不再按它放行）；
-    - `member` = 已开通的档位且未过期，微信通道看它；trial 不算。
+    - `member` = 微信通道是否可用。
+
+    2026-10-01 老板拍板：**微信通道不再需要开通验证，所有人都能用**（和"插件全部免费"
+    一个口径）。所以这里恒为 True，`reason` 也改成一句说明而不是"未开通"警告；
+    下面那段签名校验逻辑保留着，将来若要恢复收费闸门，把 WECHAT_FREE_FOR_ALL 改成 False 即可。
     """
     lic = load_license() or {}
+    signed = verify_entitlement(lic)
+    plan = str(lic.get("plan") or "trial").lower() if signed else "none"
+    plan_exp = float(lic.get("plan_expires_at") or 0) if signed else 0.0
+    allp, member = _plan_flags(plan, plan_exp, lic) if signed else (False, False)
+    if WECHAT_FREE_FOR_ALL:
+        # 只把「微信通道可用」放开；full/all_plugins 仍按真实档位+签名算
+        # （能力包本来就全部免费，那两个字段只剩历史意义）。
+        return {
+            "full": allp,
+            "member": True,
+            "all_plugins": allp,
+            "plan": plan,
+            "plan_expires_at": plan_exp,
+            "reason": "微信通道已免费开放（扫码即用，不需要开通）",
+        }
     # 没签名（或签名不对）一律按未开通处理：改本地 plan 不会开通微信通道
-    if not verify_entitlement(lic):
+    if not signed:
         return {"full": False, "member": False, "all_plugins": False,
                 "plan": "none", "plan_expires_at": 0,
                 "reason": "QQ 通道可用；微信通道未开通（本机权益未通过签名校验）"}
-    plan = str(lic.get("plan") or "trial").lower()
-    plan_exp = float(lic.get("plan_expires_at") or 0)
-    allp, member = _plan_flags(plan, plan_exp, lic)
     return {
         "full": allp,
         "member": member,

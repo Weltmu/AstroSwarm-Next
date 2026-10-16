@@ -49,7 +49,7 @@ class AccessPage(QWidget):
 
         title = QLabel("接入")
         title.setObjectName("pageTitle")
-        sub = QLabel("想让机器人在哪几个平台说话，就来这里；点每行的「配置」就地展开这条通道的设置")
+        sub = QLabel("想让机器人在哪个平台说话，就配哪一条。")
         sub.setObjectName("pageSub")
         outer.addWidget(title)
         outer.addWidget(sub)
@@ -63,8 +63,8 @@ class AccessPage(QWidget):
             "qq", "QQ 机器人",
             "官方机器人（q.qq.com 凭证）或第三方 OneBot 协议", "QQ"))
         pv.addWidget(self._make_channel_block(
-            "wechat", "微信 ClawBot",
-            "腾讯官方 iLink 通道，扫码登录（需先开通）", "微信"))
+            "wechat", "微信 iLink",
+            "腾讯官方 iLink 通道，扫码登录（已免费开放，不需要开通）", "微信"))
         for key, name, desc in (
             ("feishu", "飞书", "适配器还没做"),
             ("telegram", "纸飞机", "适配器还没做"),
@@ -73,9 +73,8 @@ class AccessPage(QWidget):
 
         outer.addWidget(panel)
 
-        tip = QLabel("提示：一个通道配好之后，机器人会用同一个 AI 大脑、同一份记忆和人设说话。"
-                     "走 QQ 官方机器人要填 q.qq.com 的 AppID / Token / AppSecret；"
-                     "走第三方 OneBot 的话，协议端（NapCat 等）要自己安装并登录，星群不内置。")
+        tip = QLabel("所有通道共用同一个 AI 大脑、记忆和人设。")
+        tip.setToolTip("QQ 官方机器人凭证在 q.qq.com 申请。")
         tip.setWordWrap(True)
         tip.setStyleSheet(f"color: {TEXT_3}; font-size: 12px;")
         outer.addWidget(tip)
@@ -280,11 +279,11 @@ class AccessPage(QWidget):
         wx_badge = self._rows["wechat"][0]
         try:
             gate = lic_mod.feature_gate()
-            member = bool(gate.get("member", False))
+            member = bool(gate.get("member", True))     # 通道已免费开放，默认就是可用
         except Exception:  # noqa: BLE001
-            member = False
+            member = True
         if not member:
-            wx_badge.set_status("stopped", "微信 · 未开通")
+            wx_badge.set_status("stopped", "微信 · 通道已关闭")
         else:
             try:
                 wx = m.wechat_status()

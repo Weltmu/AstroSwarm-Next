@@ -13,8 +13,16 @@
 - 联网：socket/urllib.request 都不可导入，联网只能走 ctx.send("http_request", ...)；
 - 插件的 print 会被重定向到 stderr，避免污染协议；
 - 超时与进程回收由父进程负责（超时强杀）。
+
+已知边界（2026-10-16 对抗性复核实测记录，别当成"已经密不透风"）：
+- 白名单模块里**自己 import 过 os/sys 的**（如 `typing.sys`）仍可能被绕来碰 os ——
+  这是**进程内沙箱的固有软肋**，已堵掉 _frozen_importlib/_io/_imp 这几条实测通道，
+  但不打算（也无法）做到内核级隔离；
+- 定位：挡"工坊生成代码的手滑与常规恶意"，**不挡**铁了心要逃逸的原生对抗。
+  真要害的插件改动仍应人工过目（见工坊的发布/审核流程）。
 """
 import builtins
+import importlib.util          # 守卫装上之后插件再也拿不到它（见文件头限制说明）
 import json
 import sys
 import traceback
@@ -40,6 +48,16 @@ DENY_TOP = {
     "code", "codeop", "runpy", "site", "sysconfig", "zipfile", "tarfile",
     "gzip", "bz2", "lzma", "logging", "warnings", "traceback",
 }
+
+# 2026-10-16（对抗性复核 platform/A）：`_` 开头的"内部模块豁免"（见 guarded_import）
+# 要留几个活口 —— 但这两个是**已实测的逃逸通道**，必须堵死：
+#   · _frozen_importlib / _frozen_importlib_external：模块属性里带着 sys →
+#     `sys.modules["os"].system(...)` 直接拿 shell；
+#   · _imp：能直接执行 code 对象、摸 import 机制。
+# ⚠ `_io` **不能**列进来：导入机器自己读插件文件时就会 `import _io`
+#   （实测：一拦，插件加载直接 sandbox_load_failed）。_io 那条路只能在
+#   文件头"已知边界"里记着 —— 进程内沙箱不追求内核级隔离。
+DENY_INTERNAL = {"_frozen_importlib", "_frozen_importlib_external", "_imp"}
 
 MAX_RESULT_CHARS = 60000
 
@@ -68,10 +86,17 @@ def _install_guard():
 
     def guarded_import(name, globals=None, locals=None, fromlist=(), level=0):
         top = str(name).split(".")[0]
+        # 2026-10-16（对抗性复核）：先判"整名白名单"再判 DENY_TOP ——
+        # "urllib" 在 DENY_TOP 里而 "urllib.parse" 在 ALLOWED_EXACT 里，
+        # 原来的顺序让 `import urllib.parse` 也吃 DENY（白名单形同虚设，误伤插件）。
+        if name in ALLOWED_EXACT:
+            return real_import(name, globals, locals, fromlist, level)
         if top in DENY_TOP:
             raise ImportError(f"sandbox_denied: 不允许导入 {top}")
-        if top in ALLOWED_TOP or name in ALLOWED_EXACT:
+        if top in ALLOWED_TOP:
             return real_import(name, globals, locals, fromlist, level)
+        if name in DENY_INTERNAL:
+            raise ImportError(f"sandbox_denied: 不允许导入 {name}")
         if top.startswith("_") and name in _PRELOADED:
             return real_import(name, globals, locals, fromlist, level)
         raise ImportError(f"sandbox_denied: 不允许导入 {name}")
@@ -183,8 +208,9 @@ class SandboxCtx:
 
 
 def _load_module(path):
-    import importlib.util  # 守卫安装前导入，之后插件自己拿不到 importlib
-
+    # 2026-10-15：importlib 挪到文件顶部导入。以前这里是"守卫安装前导入"，
+    # 而 now 守卫先装、插件后加载 —— 在守卫之后再做 `import importlib.util`
+    # 会被白名单挡掉（沙箱里本来也不该让插件拿到它）。
     spec = importlib.util.spec_from_file_location("workshop_plugin", path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -206,6 +232,14 @@ def main():
     tool = str(payload.get("tool") or "")
     module_path = f"{pack_dir}/tools/{tool}.py".replace("\\", "/")
     stdout, stdin = sys.stdout, sys.stdin
+    # 2026-10-15（安全）：顺序很重要 —— 守卫必须在**执行插件的第一行代码之前**装好。
+    # 以前是 `_load_module()` → `_preload()` → `_install_guard()`，于是这个文件头
+    # 承诺的"导入白名单 / 禁 open / 禁 input"对插件模块的**顶层语句**完全无效：
+    # 顶层 import os.subprocess、读写任意文件、甚至直接碰协议用的 stdin/stdout
+    # 都在守卫之前跑完了。现在：预热 → 装守卫 → 再加载插件代码。
+    _preload()
+    _install_guard()
+    sys.stdout = sys.stderr  # 插件里的 print 不再污染协议（错误回包写捕获的 stdout）
     try:
         module = _load_module(module_path)
         handle = getattr(module, "handle")
@@ -216,9 +250,6 @@ def main():
         }, ensure_ascii=False) + "\n")
         stdout.flush()
         return 0
-    _preload()
-    _install_guard()
-    sys.stdout = sys.stderr  # 插件里的 print 不再污染协议
     ctx = SandboxCtx(payload.get("ctx") or {}).bind(_HostCall(stdout, stdin))
     try:
         out = handle(ctx, dict(payload.get("args") or {}))

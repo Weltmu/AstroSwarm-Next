@@ -10,9 +10,8 @@ import threading
 import time
 
 from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
-    QApplication, QCheckBox, QColorDialog, QComboBox, QDialog, QFileDialog, QFrame,
+    QApplication, QCheckBox, QComboBox, QDialog, QFileDialog, QFrame,
     QHBoxLayout, QLabel, QLineEdit, QMessageBox, QPushButton,
     QPlainTextEdit, QScrollArea, QSlider, QTabWidget, QTextBrowser,
     QVBoxLayout, QWidget,
@@ -21,13 +20,15 @@ from PySide6.QtWidgets import (
 from ...constants import APP_VERSION
 from ...core import ai_config
 from ...core import autostart as autostart_mod
+from ...core import bot
 from ...core import license as lic_mod
 from ...core import migrate as migrate_mod
 from ...core import update_check
 from ...tasks.workers import UninstallTask
+from .. import motion
 from .. import theme as theme_mod
-from ..theme import TEXT_3, THEMES, UI_THEMES
-from ..widgets import FoldSection, GlassPanel, ToggleSwitch
+from ..theme import TEXT_3, THEMES
+from ..widgets import FoldSection, GlassPanel, ToggleSwitch, set_busy
 from .common import PageContext, Worker, make_row
 
 
@@ -52,7 +53,7 @@ class SettingsPage(QWidget):
         ("python_exe", "Python 路径"),
         ("pip_index", "pip 源"),
         ("account_qq", "登录 QQ"),
-        ("wechat_status", "微信 ClawBot"),
+        ("wechat_status", "微信 iLink"),
         ("app_version", "当前版本"),
         ("latest_version", "最新版本"),
         ("update_time", "上次检查"),
@@ -66,25 +67,18 @@ class SettingsPage(QWidget):
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
 
-        # ---- 页头：三个页签共用（标题 / 说明 / BETA 提示）----
+        # ---- 页头：三个页签共用（标题 / 说明）----
+        # 2026-10-06 用户要求：去掉「⚠ BETA 测试版，可能不稳定。」那条横幅
+        #（开发词 + 自己给用户打预防针，没必要）。
         head = QVBoxLayout()
         head.setContentsMargins(24, 24, 24, 16)
         head.setSpacing(8)
         title = QLabel("设置")
         title.setObjectName("pageTitle")
-        sub = QLabel("外观、账号与高级选项；改动会自动保存（约 1 秒），也可以随时点「立即保存」")
+        sub = QLabel("外观、账号与高级选项，改动会自动保存。")
         sub.setObjectName("pageSub")
         head.addWidget(title)
         head.addWidget(sub)
-        self.beta_notice = QLabel(
-            "⚠ 当前为 BETA 测试版，未经充分测试，可能存在不兼容或 Bug。"
-            "如遇问题，请等待后续更新。")
-        self.beta_notice.setWordWrap(True)
-        self.beta_notice.setStyleSheet(
-            "font-size: 12px; color: #F59E0B; background: rgba(245,158,11,0.12);"
-            "border: 1px solid rgba(245,158,11,0.35); border-radius: 8px;"
-            "padding: 8px 10px;")
-        head.addWidget(self.beta_notice)
         root.addLayout(head)
 
         # ---- 三页签：外观（默认）/ 账号 / 高级 ----
@@ -195,7 +189,7 @@ class SettingsPage(QWidget):
         self.path_edit.setPlaceholderText("选择视频或图片背景（留空 = 默认）")
         btn_browse = QPushButton("选择文件 ...")
         btn_browse.setMinimumHeight(32)
-        btn_browse.setToolTip("支持 mp4/mkv/mov 视频 与 png/jpg/webp 等图片")
+        btn_browse.setToolTip("支持 mp4/mkv/mov 视频与常见图片")
         btn_browse.clicked.connect(self._browse_bg)
         btn_default = QPushButton("清除")
         btn_default.setMinimumHeight(32)
@@ -233,20 +227,12 @@ class SettingsPage(QWidget):
         bright_row.addWidget(self.bright_value)
         bl.addLayout(bright_row)
 
-        # ---- 界面主题 ----
+        # ---- 界面外观（固定极光玻璃一套主题）----
         ui, ul = self._card(
-            "界面主题",
-            "每个 UI 主题拥有独立的布局、导航、配色与质感；改动即时生效。",
+            "界面外观",
+            "极光玻璃主题；可调强调色、框质感与不透明度，改动即时生效。",
             strong=True)
         lay.addWidget(ui)
-
-        theme_row, _ = self._labeled_row("UI 主题")
-        self.theme_combo = QComboBox()
-        for key, cfg in UI_THEMES.items():
-            self.theme_combo.addItem(cfg["name"], key)
-        self.theme_combo.setToolTip("每个 UI 主题拥有独立的布局、导航、配色与质感")
-        theme_row.addWidget(self.theme_combo, 1)
-        ul.addLayout(theme_row)
 
         self.accent_box = QWidget()
         accent_row, _ = self._labeled_row("强调色")
@@ -265,22 +251,10 @@ class SettingsPage(QWidget):
         self.glass_combo.addItem("默认（原样）", "default")
         self.glass_combo.addItem("液态玻璃", "liquid")
         self.glass_combo.addItem("颗粒磨砂", "frosted")
-        self.glass_combo.setToolTip("液态玻璃：通透渐变 + 高光描边；颗粒磨砂：半透明磨砂质感")
+        self.glass_combo.setToolTip("液态玻璃偏通透，颗粒磨砂偏质感。")
         glass_row.addWidget(self.glass_combo, 1)
         self.glass_box.setLayout(glass_row)
         ul.addWidget(self.glass_box)
-
-        self.color_box = QWidget()
-        color_row, _ = self._labeled_row("UI 框颜色")
-        color_row.setContentsMargins(0, 0, 0, 0)
-        self.btn_color = QPushButton("#FFFFFF")
-        self.btn_color.setCursor(Qt.PointingHandCursor)
-        self.btn_color.setFixedHeight(30)
-        self.btn_color.setToolTip("瑞士极简的卡片/面板底色，默认白色；建议选浅色保证文字可读")
-        self.btn_color.clicked.connect(self._pick_color)
-        color_row.addWidget(self.btn_color, 1)
-        self.color_box.setLayout(color_row)
-        ul.addWidget(self.color_box)
 
         self.opacity_box = QWidget()
         op_row, _ = self._labeled_row("UI 不透明度")
@@ -335,14 +309,12 @@ class SettingsPage(QWidget):
         return self._make_tab_area(self._fill_advanced_tab)
 
     def _fill_advanced_tab(self, lay):
-        swiss = theme_mod.UI_STYLE == "swiss"
-
         # ---- 配置抢救提示（仅当配置被抢救过时出现）----
         self.rescue_box = QFrame()
         self.rescue_box.setObjectName("rescueBox")
-        warn_fg = "#8A5300" if swiss else "#F59E0B"
-        warn_bg = "rgba(245,158,11,0.10)" if swiss else "rgba(245,158,11,0.12)"
-        warn_border = "rgba(245,158,11,0.55)" if swiss else "rgba(245,158,11,0.35)"
+        warn_fg = "#F59E0B"
+        warn_bg = "rgba(245,158,11,0.12)"
+        warn_border = "rgba(245,158,11,0.35)"
         self.rescue_box.setStyleSheet(
             f"QFrame#rescueBox {{ background: {warn_bg}; border: 1px solid {warn_border};"
             " border-radius: 8px; }")
@@ -358,8 +330,7 @@ class SettingsPage(QWidget):
         rescue_row.setSpacing(8)
         self.btn_restore_config = QPushButton("回滚到上一份配置")
         self.btn_restore_config.setMinimumHeight(32)
-        self.btn_restore_config.setToolTip(
-            "把上一份能正常解析的配置（settings.json.bak）恢复回来，重启程序后生效")
+        self.btn_restore_config.setToolTip("恢复上一份可用配置，重启后生效。")
         self.btn_restore_config.clicked.connect(self._restore_last_good)
         rescue_row.addWidget(self.btn_restore_config)
         rescue_row.addStretch(1)
@@ -416,7 +387,7 @@ class SettingsPage(QWidget):
         btn_import.setObjectName("ghost")
         btn_import.setMinimumHeight(32)
         btn_import.setMinimumWidth(130)
-        btn_import.setToolTip("选择旧版本安装目录并沿用：配置、插件、QQ/微信登录信息原地保留，无需重新部署")
+        btn_import.setToolTip("沿用已有安装目录，配置和登录信息保留。")
         btn_import.clicked.connect(self._import_old)
         btn_update = QPushButton("检查更新")
         btn_update.setObjectName("ghost")
@@ -438,16 +409,17 @@ class SettingsPage(QWidget):
                                  "维护操作（打开目录 · 导入旧版本 · 检查更新 · 许可）　▴",
                                  maint_actions))
 
-        # ---- 人格设定（从「AI 大脑」挪过来：一处编辑，避免两边互相覆盖）----
+        # ---- 人格设定（从「AI 大脑」挪过来；2026-10-07 起「人格」页人设卡的自定义态里
+        #      也有一个同样的框，写的是同一份 —— 这段说明要指回去，别两处各说各话）----
         per, pl = self._card(
             "人格设定",
             "机器人的人格 / 性格。保存后重启机器人生效；启用了「智能体档案」时，"
-            "档案只决定功能层，人格仍以这里为准。",
+            "档案只决定功能层，人格仍以这里为准。也可以直接在「人格」页的"
+            "「人设与主动聊天 → 自定义」里改，两边是同一份。",
             strong=True)
         lay.addWidget(per)
         self.personality_edit = QPlainTextEdit()
-        self.personality_edit.setPlaceholderText(
-            "例如：你是 AstroSwarm 星群内置 AI 助手，回答简洁直接，不废话…")
+        self.personality_edit.setPlaceholderText("例如：回答简洁直接，不废话…")
         self.personality_edit.setFixedHeight(96)
         pl.addWidget(self.personality_edit)
 
@@ -459,7 +431,7 @@ class SettingsPage(QWidget):
             strong=True)
         lay.addWidget(ai)
         self.chk_ai_enabled = QCheckBox("启用 AI 插件")
-        self.chk_ai_enabled.setToolTip("关闭后启动机器人会注入 AI_DISABLED=1，内置 AI 插件不注册任何功能")
+        self.chk_ai_enabled.setToolTip("关闭后机器人不加载任何 AI 功能。")
         al.addWidget(self.chk_ai_enabled)
 
         # ---- 启动行为 ----
@@ -474,13 +446,9 @@ class SettingsPage(QWidget):
         self.chk_autostart_boot = QCheckBox("开机自动启动 AstroSwarm")
         self.chk_autostart_boot.setToolTip("登录 Windows 时自动启动本程序（当前用户）")
         self.chk_developer_mode = QCheckBox("开发者模式（恢复第三方插件安装，后果自负）")
-        self.chk_developer_mode.setToolTip(
-            "开启后插件页恢复 PyPI / zip 第三方插件安装；兼容性、安全性、"
-            "平台协议合规由用户自行承担")
+        self.chk_developer_mode.setToolTip("开启后可装第三方插件，风险自负。")
         self.chk_beginner_mode = ToggleSwitch("小白模式（只显示常用功能）")
-        self.chk_beginner_mode.setToolTip(
-            "默认开启：侧边栏只保留 首页 / 微信 / QQ / AI 大脑 / 设置，"
-            "飞书、纸飞机、消息中心、插件、日志、依赖自动隐藏")
+        self.chk_beginner_mode.setToolTip("只留常用的几个页面，其它自动隐藏。")
         bl.addWidget(self.chk_auto_start_services)
         bl.addWidget(self.chk_autostart_boot)
         bl.addWidget(self.chk_developer_mode)
@@ -492,7 +460,7 @@ class SettingsPage(QWidget):
             "卸载会停止全部服务并删除整个安装目录（bot / python / 日志等）；"
             "账号登录与授权保留，exe 文件需手动删除。",
             strong=True,
-            title_color="#B00020" if swiss else theme_mod.DANGER)
+            title_color=theme_mod.DANGER)
         lay.addWidget(dgr)
         dgr_row = QHBoxLayout()
         dgr_row.setSpacing(8)
@@ -500,7 +468,7 @@ class SettingsPage(QWidget):
         btn_uninstall.setObjectName("danger")
         btn_uninstall.setMinimumHeight(32)
         btn_uninstall.setMinimumWidth(130)
-        btn_uninstall.setToolTip("停止全部服务并删除整个安装目录（bot / python 等），账号登录与授权保留；exe 文件需手动删除")
+        btn_uninstall.setToolTip("删除整个安装目录（不可恢复），登录与授权保留。")
         btn_uninstall.clicked.connect(self._uninstall_app)
         dgr_row.addWidget(btn_uninstall)
         dgr_row.addStretch(1)
@@ -508,14 +476,11 @@ class SettingsPage(QWidget):
 
     # ------------------------------------------------------------ 页签外观
     def _tab_qss(self) -> str:
-        """页签样式：跟随当前 UI 主题（瑞士浅色 / 玻璃·终端深色）与皮肤强调色。"""
+        """页签样式：跟随极光玻璃主题与皮肤强调色。"""
         accent = theme_mod.THEMES.get(
             self.ctx.settings.accent or "default",
             theme_mod.THEMES["default"])["ACCENT"]
-        if theme_mod.UI_STYLE == "swiss":
-            idle, hover, active = "#6B6B67", "#111111", "#111111"
-        else:
-            idle, hover, active = theme_mod.TEXT_3, theme_mod.TEXT_2, theme_mod.TEXT
+        idle, hover, active = theme_mod.TEXT_3, theme_mod.TEXT_2, theme_mod.TEXT
         return f"""
 QTabWidget::pane {{ border: none; background: transparent; }}
 QTabBar {{ background: transparent; }}
@@ -562,7 +527,6 @@ QTabBar::tab:selected {{ color: {active}; border-bottom: 2px solid {accent}; }}
         self.opacity_slider.valueChanged.connect(self._on_opacity_changed)
         self.bright_slider.valueChanged.connect(self._on_brightness_changed)
         self.chk_animations.toggled.connect(self._apply_live)
-        self.theme_combo.currentIndexChanged.connect(self._apply_live)
         self.accent_combo.currentIndexChanged.connect(self._apply_live)
         self.glass_combo.currentIndexChanged.connect(self._apply_live)
         self.chk_ai_enabled.toggled.connect(self._apply_live)
@@ -635,14 +599,10 @@ QTabBar::tab:selected {{ color: {active}; border-bottom: 2px solid {accent}; }}
         self.bright_slider.setValue(max(-100, min(100, s.bg_brightness)))
         self.chk_animations.setChecked(not s.animations_enabled)
         self.personality_edit.setPlainText(ai_config.read_personality(s))
-        idx = self.theme_combo.findData(s.theme)
-        self.theme_combo.setCurrentIndex(idx if idx >= 0 else 0)
         idx = self.accent_combo.findData(s.accent)
         self.accent_combo.setCurrentIndex(idx if idx >= 0 else 0)
         idx = self.glass_combo.findData(s.glass_effect)
         self.glass_combo.setCurrentIndex(idx if idx >= 0 else 0)
-        self._set_color_button(s.ui_color or "#FFFFFF")
-        self._update_ui_rows()
         # ---- AI 插件 ----
         self.chk_ai_enabled.setChecked(s.ai_enabled)
         self.chk_auto_start_services.setChecked(s.auto_start_services)
@@ -724,22 +684,25 @@ QTabBar::tab:selected {{ color: {active}; border-bottom: 2px solid {accent}; }}
             plan_exp = float(lic.get("plan_expires_at") or 0)
         except Exception:  # noqa: BLE001
             plan, plan_exp = "none", 0
-        if plan == "permanent" or (plan == "monthly" and plan_exp > time.time()):
-            label = "已开通 · 含微信通道"
+        # 微信通道已免费开放（2026-10-01）：这里只描述账号档位，不再写「仅 QQ 通道」
+        if plan == "permanent":
+            label = "已开通 · 永久档"
+        elif plan == "monthly" and plan_exp > time.time():
+            label = "已开通 · 月费档"
         elif plan == "monthly":
-            label = "已到期 · 仅 QQ 通道"
+            label = "月费档已到期 · 通道不受影响"
         else:
-            label = "仅 QQ 通道"
+            label = "未登录账号 · 所有通道都可用"
         self.info_labels["license_status"].setText(label)
-        self.info_labels["license_status"].setToolTip(
-            "授权随星群账号同步（邮箱登录，无需激活码）")
+        self.info_labels["license_status"].setToolTip("授权随账号同步，QQ 与微信免费。")
 
     # ------------------------------------------------------------ 星群账号
     def _refresh_account_status(self):
         from ...core import account
         acc = account.load_account()
+        email = str(acc.get("email") or "") if acc else ""
         self.btn_account.setText(
-            "星群账号（已登录：%s）" % acc.get("email") if acc else "打开星群账号窗口")
+            f"星群账号（已登录：{email}）" if email else "打开星群账号窗口")
         self.acct_status.setText(
             f"已登录：{acc.get('email')}，点上方按钮可退出/切换账号"
             if acc else "未登录，点上方按钮打开账号窗口")
@@ -760,7 +723,8 @@ QTabBar::tab:selected {{ color: {active}; border-bottom: 2px solid {accent}; }}
             self.btn_restore_config.setVisible(False)
         elif msg:
             self.rescue_text.setText(
-                "⚠ 配置文件曾被抢救：%s\n当前用的是抢救后的配置，建议回滚到上一份能正常解析的配置。" % msg)
+                f"⚠ 配置文件曾被抢救：{msg}\n"
+                "当前用的是抢救后的配置，建议回滚到上一份能正常解析的配置。")
             self.btn_restore_config.setVisible(True)
         box.setVisible(bool(msg))
 
@@ -797,10 +761,11 @@ QTabBar::tab:selected {{ color: {active}; border-bottom: 2px solid {accent}; }}
         s.ui_opacity = self.opacity_slider.value()
         s.bg_brightness = self.bright_slider.value()
         s.animations_enabled = not self.chk_animations.isChecked()
-        s.theme = self.theme_combo.currentData() or "glass"
+        # 动效总闸即时生效：勾上就立刻不做过渡，不用保存、不用重启
+        motion.set_enabled(s.animations_enabled)
+        s.theme = "glass"          # 只剩极光玻璃一套主题，旧配置里的 swiss/terminal 一并归一
         s.accent = self.accent_combo.currentData() or "default"
         s.glass_effect = self.glass_combo.currentData() or "default"
-        s.ui_color = self.btn_color.text().strip() or "#FFFFFF"
         s.nonebot_enabled = True  # NoneBot 是内置进程，不允许关闭
         s.ai_enabled = self.chk_ai_enabled.isChecked()
         ai_config.save_personality(s, self.personality_edit.toPlainText())
@@ -808,7 +773,6 @@ QTabBar::tab:selected {{ color: {active}; border-bottom: 2px solid {accent}; }}
         s.auto_launch_on_boot = self.chk_autostart_boot.isChecked()
         s.developer_mode = self.chk_developer_mode.isChecked()
         s.beginner_mode = self.chk_beginner_mode.isChecked()
-        self._update_ui_rows()
         self._style_tabs()          # 换主题/皮肤时页签配色跟着走
         self.ctx.apply_appearance()
 
@@ -865,32 +829,6 @@ QTabBar::tab:selected {{ color: {active}; border-bottom: 2px solid {accent}; }}
                 setter(bool(checked))
             except Exception:  # noqa: BLE001 —— 切换失败不崩溃 UI
                 pass
-
-    def _update_ui_rows(self):
-        """按 UI 主题类型显示/隐藏质感、透明度、颜色、强调色设置。"""
-        key = self.theme_combo.currentData() or "glass"
-        ui = UI_THEMES.get(key, UI_THEMES["glass"])
-        is_glass = ui["style"] == "glass"
-        self.glass_box.setVisible(is_glass)
-        self.accent_box.setVisible(is_glass)
-        self.opacity_box.setVisible(True)          # 两种主题都支持不透明度
-        self.color_box.setVisible(not is_glass)    # 颜色设置仅非玻璃主题
-
-    def _set_color_button(self, hexv: str):
-        c = QColor(hexv or "#FFFFFF")
-        text = c.name().upper()
-        fg = "#111111" if c.lightness() > 140 else "#FFFFFF"
-        self.btn_color.setText(text)
-        self.btn_color.setStyleSheet(
-            f"background:{text};color:{fg};border:1px solid #C9C9C5;"
-            "border-radius:0;font-weight:600;")
-
-    def _pick_color(self):
-        c = QColorDialog.getColor(
-            QColor(self.btn_color.text() or "#FFFFFF"), self, "选择 UI 框颜色")
-        if c.isValid():
-            self._set_color_button(c.name().upper())
-            self._apply_live()
 
     def _browse_bg(self):
         f, _ = QFileDialog.getOpenFileName(
@@ -996,10 +934,11 @@ QTabBar::tab:selected {{ color: {active}; border-bottom: 2px solid {accent}; }}
         s.ui_opacity = self.opacity_slider.value()
         s.bg_brightness = self.bright_slider.value()
         s.animations_enabled = not self.chk_animations.isChecked()
-        s.theme = self.theme_combo.currentData() or "glass"
+        # 动效总闸即时生效：勾上就立刻不做过渡，不用保存、不用重启
+        motion.set_enabled(s.animations_enabled)
+        s.theme = "glass"          # 只剩极光玻璃一套主题，旧配置里的 swiss/terminal 一并归一
         s.accent = self.accent_combo.currentData() or "default"
         s.glass_effect = self.glass_combo.currentData() or "default"
-        s.ui_color = self.btn_color.text().strip() or "#FFFFFF"
         s.nonebot_enabled = True  # NoneBot 是内置进程，不允许关闭
         s.ai_enabled = self.chk_ai_enabled.isChecked()
         s.auto_start_services = self.chk_auto_start_services.isChecked()
@@ -1010,7 +949,13 @@ QTabBar::tab:selected {{ color: {active}; border-bottom: 2px solid {accent}; }}
             self.ctx.show_toast("保存设置失败: " + str(e))
             return
         autostart_mod.set_enabled(s.auto_launch_on_boot)
+        # AI 总开关 / 平台开关 / 主人 QQ / 唤醒词改完**立即生效**（2026-10-11 热重载）
+        # —— 刷新机器人侧热配置（.env + 有效开关快照），机器人进程每条消息热读它。
+        # 所以设置类改动不需要重启机器人（改了代码才需要重启）。
+        bot.refresh_hot_config(s)
         if apply_ui:
             self.ctx.apply_appearance()
         if not silent:
-            self.ctx.show_toast("设置已保存")
+            self.ctx.show_toast("设置已保存（AI 开关 / 管理员 / 唤醒词改完立即生效，无需重启）")
+            # 「这次改动要不要重启」的唯一口径在 core/restart_policy.py：
+            # 设置类立即生效；插件代码 / 换通道 / MCP 才需要点一下重启。

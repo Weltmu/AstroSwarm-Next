@@ -1,11 +1,12 @@
 # -*- coding: utf-8 -*-
 """首页：总览仪表盘 —— 各平台服务状态 + 今日数据 + 最近消息预览 + 快速操作。"""
+import logging
 import time
 import webbrowser
 
 from PySide6.QtWidgets import (
-    QFrame, QHBoxLayout, QLabel, QListWidget, QListWidgetItem,
-    QPushButton, QVBoxLayout, QWidget,
+    QFrame, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem,
+    QPushButton, QScrollArea, QVBoxLayout, QWidget,
 )
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QColor
@@ -44,9 +45,17 @@ class HomePage(QWidget):
 
     # ------------------------------------------------------------ UI
     def _build_ui(self):
-        outer = QVBoxLayout(self)
+        # 首页内容比一屏略高：窗口一矮 Qt 就会去压自动换行的小字行数（表现：文字只显示上半截）。
+        # 按其它页面的做法套一层 QScrollArea —— 够高时和原来一模一样，不够高才出滚动条。
+        self.scroll = QScrollArea(self)
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setFrameShape(QFrame.NoFrame)
+        self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        content = QWidget()
+        outer = QVBoxLayout(content)
         outer.setContentsMargins(24, 20, 24, 20)
-        outer.setSpacing(16)
+        # 间距 14 而不是 16：正好让 1280x800 的默认窗口一屏放下（不留滚动条），再小才滚
+        outer.setSpacing(14)
 
         title_row = QHBoxLayout()
         left = QVBoxLayout()
@@ -64,6 +73,49 @@ class HomePage(QWidget):
         title_row.addWidget(self.last_update)
         title_row.addWidget(self.global_badge)
         outer.addLayout(title_row)
+
+        # ---- 三步开箱：① 连 AI → ② 接 QQ → ③ 启动（每步一个按钮，做完自动打勾）----
+        # 老板拍板的方向："极致的简化" —— 不砍功能，而是把主流程压成三步一眼看全。
+        self.steps_bar = QFrame()
+        self.steps_bar.setObjectName("stepsBar")
+        self.steps_bar.setStyleSheet(
+            "QFrame#stepsBar { background: rgba(255,255,255,0.035);"
+            " border: 1px solid rgba(255,255,255,0.09); border-radius: 10px; }"
+        )
+        sh = QHBoxLayout(self.steps_bar)
+        sh.setContentsMargins(14, 10, 14, 10)
+        sh.setSpacing(10)
+        self.step_labels = {}
+        self.step_btns = {}
+        for key, text, btn_text in (
+            ("ai", "1 连 AI", "去填 Key"),
+            ("qq", "2 接 QQ", "去接入"),
+            ("run", "3 启动", "启动"),
+        ):
+            lab = QLabel(f"{text} · 待办")
+            lab.setStyleSheet("font-size: 13px;")
+            self.step_labels[key] = lab
+            sh.addWidget(lab)
+            btn = QPushButton(btn_text)
+            btn.clicked.connect(lambda _=False, k=key: self._on_step_clicked(k))
+            self.step_btns[key] = btn
+            sh.addWidget(btn)
+            if key != "run":
+                sep = QLabel("→")
+                sep.setStyleSheet(f"color: {TEXT_3};")
+                sh.addWidget(sep)
+        sh.addStretch(1)
+        # "你想要什么功能" 大输入框：一步进工坊（工坊优先，别让人自己在侧栏里找）
+        self.wish_input = QLineEdit()
+        self.wish_input.setPlaceholderText("你想要什么功能？一句话，我让 AI 给你做一个插件")
+        self.wish_input.setMinimumWidth(260)
+        self.wish_input.returnPressed.connect(self._on_wish)
+        sh.addWidget(self.wish_input, 1)
+        btn_wish = QPushButton("去做插件")
+        btn_wish.setObjectName("primary")
+        btn_wish.clicked.connect(self._on_wish)
+        sh.addWidget(btn_wish)
+        outer.addWidget(self.steps_bar)
 
         # ---- 「下一步」引导：只显示当下最该做的那一件事 ----
         self.next_bar = QFrame()
@@ -168,7 +220,8 @@ class HomePage(QWidget):
         self.btn_toggle.clicked.connect(self._on_toggle_clicked)
         qv.addWidget(self.btn_toggle)
         # 一屏只留一个主操作；重启在「全局管理」、.env 在「设置 → 维护」，不再堆在首页
-        tip_op = QLabel("一键启停全部通道。重启在「全局管理」，.env 在「设置 → 维护」。")
+        tip_op = QLabel("一键启停全部通道。")
+        tip_op.setToolTip("重启在「全局管理」。")
         tip_op.setWordWrap(True)
         tip_op.setStyleSheet(f"color: {TEXT_3}; font-size: 11px;")
         qv.addWidget(tip_op)
@@ -193,6 +246,12 @@ class HomePage(QWidget):
         bottom.addWidget(task_glass, 6)
         outer.addLayout(bottom)
         self.set_beginner(bool(self.ctx.settings.beginner_mode))
+
+        self.scroll.setWidget(content)
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+        root.addWidget(self.scroll)
 
     def set_beginner(self, on: bool):
         """小白模式：首页只保留 QQ / 微信两张状态卡，隐藏飞书与纸飞机。"""
@@ -229,16 +288,13 @@ class HomePage(QWidget):
 
     def _build_wechat_card(self, cards):
         card, v, self.wx_badge = self._card(
-            cards, "微信 ClawBot", on_click=lambda: self.ctx.switch_page("接入"))
+            cards, "微信 iLink", on_click=lambda: self.ctx.switch_page("接入"))
         self.wx_info = QLabel("—")
         self.wx_info.setWordWrap(True)
         self.wx_info.setStyleSheet(f"color: {TEXT_3}; font-size: 12px;")
         v.addWidget(self.wx_info)
         row = QHBoxLayout()
-        self.wx_pay_btn = QPushButton("开通微信通道")
-        self.wx_pay_btn.setObjectName("ghost")
-        self.wx_pay_btn.clicked.connect(self._open_pay)
-        row.addWidget(self.wx_pay_btn)
+        # 微信通道已免费开放，不再需要「开通」按钮（2026-10-01 老板拍板）
         row.addStretch(1)
         v.addLayout(row)
         v.addStretch(1)
@@ -338,6 +394,67 @@ class HomePage(QWidget):
         else:
             self.ctx.switch_page("接入")
 
+    def _on_step_clicked(self, key: str):
+        """三步里的按钮：① 去 AI 大脑 ② 去接入 ③ 直接启动。"""
+        if key == "ai":
+            self.ctx.switch_page("AI 大脑")
+        elif key == "qq":
+            self.ctx.switch_page("接入")
+        else:
+            self._on_toggle_clicked()
+
+    def _on_wish(self):
+        """"你想要什么功能" → 带着这句话跳到插件工坊（工坊页 refresh 时自动填进需求框）。"""
+        text = self.wish_input.text().strip()
+        try:
+            self.ctx.pending_workshop_prompt = text
+            self.ctx.switch_page("插件工坊")
+            page = getattr(self.ctx, "page_by_name", None)
+            if callable(page):
+                target = page("插件工坊")
+                if target is not None and hasattr(target, "refresh_status"):
+                    target.refresh_status()
+        except Exception as e:  # noqa: BLE001 —— 跳页失败不能把首页弄崩
+            logging.getLogger("qbotmanager").warning("跳转插件工坊失败: %s", e)
+
+    def _refresh_steps(self):
+        """三步各自的状态：✓ 已配好 / · 现在做 / · 待办。"""
+        s = self.ctx.settings
+        m = self.ctx.manager
+        summary = message_store.brain_summary(s)
+        model = str(summary.get("model") or "").strip()
+        ai_ok = bool(model)
+        official = str(getattr(s, "qq_channel", "onebot")) == "official"
+        if official:
+            qq_ok = bool(str(getattr(s, "qq_official_appid", "") or "").strip())
+        else:
+            state = m.qq_login_state() or {}
+            qq_ok = bool(state.get("connected")) or bool(m.qq_running())
+        run_ok = bool(m.bot_running() or m.qq_running() or m.dsh_running())
+
+        def mark(label, text, ok, is_next):
+            if ok:
+                return f"{text} · ✓ 已配好"
+            if is_next:
+                return f"{text} · 现在做这个"
+            return f"{text} · 待办"
+
+        states = [(("ai"), "1 连 AI", ai_ok), (("qq"), "2 接 QQ", qq_ok),
+                  (("run"), "3 启动", run_ok)]
+        first_pending = next((k for k, _t, ok in states if not ok), "")
+        for key, text, ok in states:
+            lab = self.step_labels.get(key)
+            if lab is None:
+                continue
+            lab.setText(mark(lab, text, ok, key == first_pending))
+            color = "#34D399" if ok else ("#7FB0FF" if key == first_pending else TEXT_3)
+            lab.setStyleSheet(f"font-size: 13px; color: {color};")
+            btn = self.step_btns.get(key)
+            if btn is not None:
+                btn.setEnabled(not ok)
+                if key == "run" and not ok:
+                    btn.setText("启动")
+
     def _confirm(self, title: str, text: str) -> bool:
         from PySide6.QtWidgets import QMessageBox
 
@@ -349,6 +466,10 @@ class HomePage(QWidget):
     def refresh_status(self):
         s = self.ctx.settings
         m = self.ctx.manager
+        try:
+            self._refresh_steps()
+        except Exception as e:  # noqa: BLE001 —— 步骤条算不出来不能影响整页刷新
+            logging.getLogger("qbotmanager").warning("首页三步条刷新失败: %s", e)
         bot_on = m.bot_running()
         qq_on = m.qq_running() or m.dsh_running()
         qq_st = m.qq_login_state()
@@ -364,13 +485,11 @@ class HomePage(QWidget):
 
         gate = lic_mod.feature_gate()
         if not gate.get("member", True):
-            reason = gate.get("reason") or "QQ 通道可用；微信通道未开通"
-            self.wx_badge.set_status("stopped", "微信 · 未开通")
-            self.wx_info.setText(reason + "\n在账号中心开通后即可扫码登录")
-            self.wx_pay_btn.show()
+            # 只有把 WECHAT_FREE_FOR_ALL 改回 False 才会走到这里
+            self.wx_badge.set_status("stopped", "微信 · 通道已关闭")
+            self.wx_info.setText(gate.get("reason") or "微信通道当前不可用")
             wx = {"logged_in": False}
         else:
-            self.wx_pay_btn.hide()
             wx = m.wechat_status()
             if not wx["installed"]:
                 self.wx_badge.set_status("unknown", "微信 · 未安装适配器")
@@ -380,7 +499,7 @@ class HomePage(QWidget):
                 self.wx_badge.set_status("warning", "微信 · 未连接")
             else:
                 self.wx_badge.set_status("stopped", "微信 · 未登录")
-            self.wx_info.setText(str(wx["bot_id"] or "未登录") + "\nClawBot 私聊个人助手")
+            self.wx_info.setText(str(wx["bot_id"] or "未登录") + "\niLink 私聊个人助手")
 
         any_on = bot_on or qq_on or wx.get("logged_in")
         self.global_badge.set_status("running" if any_on else "stopped",

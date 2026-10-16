@@ -335,7 +335,8 @@ def test_build_pipeline_with_stub_model(tmp_path, monkeypatch):
     ws_config.save(s, {"provider": "deepseek", "api_key": "sk-x", "model": "deepseek-chat"})
     calls = {"n": 0}
 
-    def fake_call_model(settings, system, user, timeout=0):
+    def fake_call_model(settings, system, user, timeout=0, budget=0,
+                         usage=None):
         calls["n"] += 1
         if "规划师" in system:
             return json.dumps(_plan(), ensure_ascii=False)
@@ -366,7 +367,8 @@ def test_build_repairs_bad_code_once(tmp_path, monkeypatch):
     state = {"code_calls": 0}
     bad_code = "import os\n\n\ndef handle(ctx, args):\n    return '{}'\n"
 
-    def fake_call_model(settings, system, user, timeout=0):
+    def fake_call_model(settings, system, user, timeout=0, budget=0,
+                         usage=None):
         if "规划师" in system:
             return json.dumps(_plan(), ensure_ascii=False)
         if "修复" in system:
@@ -395,7 +397,7 @@ def test_ai_plugin_files_compile():
     """内置 AI 插件（含新桥接层）必须能编译（运行时环境有 nonebot）。"""
     ai_dir = Path(__file__).resolve().parents[1] / "src" / "qbotmanager" / "assets" / "plugins" / "ai"
     for path in ai_dir.rglob("*.py"):
-        compile(path.read_text(encoding="utf-8"), str(path), "exec")
+        compile(path.read_text(encoding="utf-8-sig"), str(path), "exec")
 
 
 def test_installed_pack_loads_and_runs_in_sandbox(tmp_path, monkeypatch):
@@ -405,7 +407,8 @@ def test_installed_pack_loads_and_runs_in_sandbox(tmp_path, monkeypatch):
     s = _settings(tmp_path)
     ws_config.save(s, {"provider": "deepseek", "api_key": "sk-x", "model": "deepseek-chat"})
 
-    def fake_call_model(settings, system, user, timeout=0):
+    def fake_call_model(settings, system, user, timeout=0, budget=0,
+                         usage=None):
         if "规划师" in system:
             return json.dumps(_plan(), ensure_ascii=False)
         return json.dumps({"manifest": json.loads(_good_files()["manifest.json"]),

@@ -95,17 +95,22 @@ def test_gate_only_permanent_unlocks_all_plugins():
 
 
 def test_gate_member_covers_paid_channels_but_not_trial():
-    """微信等付费通道看 member：月费/季费/年费/永久都算，3 天试用不算。"""
+    """微信通道已免费开放（2026-10-01 老板拍板）：member 一律 True。
+
+    `full` 仍然按签名档位算（永久/有效期内为 True），这是"老账号的档位展示"用的，
+    不再当功能开关 —— 所以试用/无档位也要能用通道。
+    """
     _trust_plan()
     for plan in ("permanent", "monthly", "quarterly", "yearly"):
         assert _gate(plan, FUTURE)["member"] is True, plan
     assert _gate("permanent", 0)["member"] is True
-    assert _gate("trial", FUTURE)["member"] is False
-    assert _gate("none", 0)["member"] is False
-    assert _gate("monthly", PAST)["member"] is False
+    assert _gate("trial", FUTURE)["member"] is True, "微信免费后，试用号也能用通道"
+    assert _gate("none", 0)["member"] is True
+    assert _gate("monthly", PAST)["member"] is True
 
 
 def test_gate_without_signature_is_free():
+    """没有签名（没登录/改过配置）也不影响用：member 恒 True，full 才是 False。"""
     import importlib
 
     importlib.reload(lic)
@@ -113,9 +118,10 @@ def test_gate_without_signature_is_free():
     try:
         lic.load_license = lambda: {"plan": "permanent"}
         gate = lic.feature_gate()
-        assert gate["full"] is False and gate["member"] is False
-        assert "签名" in gate["reason"]
+        assert gate["full"] is False, "没签名就不该算完整档位"
+        assert gate["member"] is True, "微信已免费开放，member 不看签名"
+        assert "免费" in gate["reason"] or "签名" in gate["reason"], gate["reason"]
         ent = lic.entitlements()
-        assert ent["full"] is False and ent["member"] is False
+        assert ent["full"] is False and ent["member"] is True
     finally:
         lic.load_license = orig

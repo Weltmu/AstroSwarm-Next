@@ -33,7 +33,15 @@ class SandboxTimeout(SandboxError):
     """沙箱执行超时（已强杀子进程）。"""
 
 
-def _ctx_payload(ctx) -> dict:
+def _ctx_payload(ctx, allowed_perms=None) -> dict:
+    """给子进程的上下文载荷。
+
+    `allowed_perms`（2026-10-15 安全修复）：**这个插件被允许用的权限** ——
+    由调用方按「manifest 声明的权限 ∪ 工具自己声明的权限」算好传进来。
+    以前这里是"通道给什么就给什么"：一个只声明 memory 的能力包，在 QQ 群通道里
+    照样拿到 group_admin，于是可以借 ctx.send("mute_user"/"recall_message") 禁言/
+    撤回别人 —— manifest 里那句"只有声明的权限"等于没写。
+    """
     extra = {}
     raw_extra = getattr(ctx, "extra", None) or {}
     if isinstance(raw_extra, dict):
@@ -43,6 +51,8 @@ def _ctx_payload(ctx) -> dict:
     perms = []
     for perm in ("send_message", "group_admin", "timer", "memory",
                  "network", "media"):
+        if allowed_perms is not None and perm not in allowed_perms:
+            continue
         try:
             if ctx.can(perm):
                 perms.append(perm)
@@ -55,6 +65,8 @@ def _ctx_payload(ctx) -> dict:
         "group_id": getattr(ctx, "group_id", "") or "",
         "nickname": getattr(ctx, "nickname", "") or "",
         "is_superuser": bool(getattr(ctx, "is_superuser", False)),
+        # 跨平台发送（send_to_platform）靠它认人：platform:user_id
+        "user_key": f"{getattr(ctx, 'platform', '') or ''}:{getattr(ctx, 'user_id', '') or ''}".strip(":"),
         "extra": extra,
         "permissions": perms,
     }
@@ -69,14 +81,14 @@ def _kill(proc) -> None:
 
 
 async def _run_async(pack_dir: Path, tool_name: str, args: dict, ctx,
-                     host, main_loop, timeout: float) -> str:
+                     host, main_loop, timeout: float, allowed_perms=None) -> str:
     if host is None:
         raise SandboxError("sandbox_host_missing：这次执行没有动作执行器")
     payload = {
         "pack_dir": str(pack_dir),
         "tool": tool_name,
         "args": args,
-        "ctx": _ctx_payload(ctx),
+        "ctx": _ctx_payload(ctx, allowed_perms),
     }
     raw = json.dumps(payload, ensure_ascii=False, default=str)
     if len(raw) > MAX_ARGS_CHARS * 4:
@@ -175,18 +187,22 @@ async def _run_async(pack_dir: Path, tool_name: str, args: dict, ctx,
 
 
 def _run_blocking(pack_dir: Path, tool_name: str, args: dict, ctx, host,
-                  main_loop, timeout: float) -> str:
+                  main_loop, timeout: float, allowed_perms=None) -> str:
     return asyncio.run(_run_async(pack_dir, tool_name, args, ctx, host,
-                                  main_loop, timeout))
+                                  main_loop, timeout, allowed_perms))
 
 
 async def run_tool(pack_dir, tool_name: str, args: dict, ctx, host,
-                   timeout: float | None = None) -> str:
-    """在沙箱子进程里执行一个插件工具，返回它给的 JSON 文本。"""
+                   timeout: float | None = None, allowed_perms=None) -> str:
+    """在沙箱子进程里执行一个插件工具，返回它给的 JSON 文本。
+
+    `allowed_perms`：这个插件**声明**要用的权限（manifest ∪ 工具自身），
+    子进程只拿得到这些（再与通道权限取交，见 `_ctx_payload`）。
+    """
     pack_dir = Path(pack_dir)
     if not (pack_dir / "tools" / f"{tool_name}.py").exists():
         raise SandboxError(f"sandbox_tool_missing：{tool_name}.py 不存在")
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(
         None, _run_blocking, pack_dir, tool_name, args or {}, ctx, host, loop,
-        float(timeout or DEFAULT_TIMEOUT))
+        float(timeout or DEFAULT_TIMEOUT), allowed_perms)

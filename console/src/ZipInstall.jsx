@@ -41,7 +41,7 @@ export default function ZipInstall() {
 
   const install = async () => {
     if (!b64) { setMsg('先选一个 zip。'); return; }
-    if (!window.confirm(`确定安装「${name}」？\n第三方能力包的兼容性、安全性与平台合规由你自负；装完需要重启机器人。`)) return;
+    if (!window.confirm(`确定安装「${name}」？\n第三方能力包风险自负；装完需要重启机器人。`)) return;
     setBusy(true);
     try {
       const r = await post('/api/tools/install-zip',
@@ -84,7 +84,7 @@ export default function ZipInstall() {
       </div>
       <p className="p-drop">
         {devMode
-          ? '⇩ 开发者模式已开启：可安装本机 zip 能力包（zip slip / 大小 / manifest 由后端校验）'
+          ? '⇩ 开发者模式已开启：可安装本机 zip 能力包。'
           : '⇩ 本地 zip 安装仅在开发者模式下可用（设置 → 开发者模式）'}
       </p>
       {msg ? <p className="card__note">{msg}</p> : null}

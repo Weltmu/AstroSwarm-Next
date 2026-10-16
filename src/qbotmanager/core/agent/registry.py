@@ -20,6 +20,14 @@ from .tool import (
 )
 
 
+def _sandbox_handler(name: str):
+    """沙箱工具的占位 handler：主进程里**永远不该被调用**（见 load_pack 的说明）。"""
+    def _handler(ctx, args):  # pragma: no cover —— 正常路径不会走到
+        raise ToolUnavailableError(
+            f"沙箱工具 {name} 必须走 execute_async（独立子进程 + 动作校验）")
+    return _handler
+
+
 class ToolRegistry:
     def __init__(self):
         self._tools: dict[str, ToolSpec] = {}
@@ -130,23 +138,32 @@ class ToolRegistry:
                         continue
         for tool in manifest.tools:
             name = tool["name"]
-            mod_path = pack_dir / "tools" / f"{name}.py"
-            spec = importlib.util.spec_from_file_location(
-                f"{manifest.id}_{name}", mod_path
-            )
-            module = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(module)
+            sandbox = bool(tool.get("sandbox", manifest.sandbox))
+            # 2026-10-15（安全）：**沙箱工具的代码不在主进程里 exec**。
+            # 以前无论沙箱与否都 `exec_module` —— 等于"市场里装一个包、重启时它的
+            # 模块顶层代码就在机器人主进程里跑一遍"（进程里的配置、密钥、文件、
+            # 网络全在手边），子进程 + 动作校验那套**只在执行期**成立，加载期被绕过。
+            # 现在主进程只登记元信息；真正的代码留给 sandbox_runner 子进程去加载。
+            handler = _sandbox_handler(name) if sandbox else None
+            if handler is None:
+                mod_path = pack_dir / "tools" / f"{name}.py"
+                spec = importlib.util.spec_from_file_location(
+                    f"{manifest.id}_{name}", mod_path
+                )
+                module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(module)
+                handler = getattr(module, "handle")
             self.register(
                 ToolSpec(
                     name=name,
                     description=tool["description"],
                     parameters=tool["parameters"],
                     permissions=tool.get("permissions") or [],
-                    handler=getattr(module, "handle"),
+                    handler=handler,
                     lifecycle=tool.get("lifecycle", "none"),
                     pack_id=manifest.id,
                     adapters=list(tool.get("adapters") or manifest.adapters or []),
-                    sandbox=bool(tool.get("sandbox", manifest.sandbox)),
+                    sandbox=sandbox,
                 )
             )
             count += 1

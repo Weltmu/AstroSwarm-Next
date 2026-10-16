@@ -1,9 +1,39 @@
 """李清菡人设与系统提示词构建"""
 
-from . import holidays
+from . import holidays, memory_bridge
 
+
+def _fold_ws(text) -> str:
+    """把记忆正文里的空白（含换行）折成一个空格再进提示词。
+
+    2026-10-16（对抗性复核 E）：记忆是原样拼进 system 提示的，带换行的老数据
+    看起来就像"新的系统指令"（可持久化提示注入）。写入侧已收口，渲染侧对老数据再兜一层。
+    """
+    import re as _re
+    return _re.sub(r"\s+", " ", str(text or "")).strip()
 
 STAGE_LABELS = {0: "陌生人", 1: "认识", 2: "熟悉", 3: "老熟人"}
+
+
+def _builtin_session(store, sender_qq):
+    """给内置记忆的时间线备料：上次说话多久、今天第几次来。
+
+    只读 users 表的 last_seen（插件自己维护的），不额外写任何东西。
+    """
+    info = {}
+    try:
+        profile = store.get_user(sender_qq) if sender_qq else None
+        if profile:
+            info["last_ts"] = int(profile["last_seen"] or 0)
+    except Exception:  # noqa: BLE001
+        pass
+    return info
+
+
+def _inject_extra(store, cfg, sender_qq):
+    """智能档的额外注入（时间线 / 高权重 / 承诺 / 印象档）；其他档返回空串。"""
+    return memory_bridge.inject_extra(store, cfg, sender_qq,
+                                      session=_builtin_session(store, sender_qq))
 
 
 def familiarity_stage(profile):
@@ -126,7 +156,10 @@ def build_system(cfg, store, sender_qq="", group_id="", state_desc=""):
         holiday_line += f"今天是{today_h}。"
     if tomorrow_h:
         holiday_line += f"明天是{tomorrow_h}，可以提前提一嘴。"
-    diaries = store.diary_recent(2)
+    # 老逻辑（最近 3 条记忆 + 2 天日记）只在「内置模块不在」或「基础档」时跑：
+    # off 必须彻底不注入，smart 由内置那份负责（两边都注入会重复）。
+    legacy_inject = memory_bridge.legacy_inject_enabled()
+    diaries = store.diary_recent(2) if legacy_inject else []
     diary_line = ""
     if diaries:
         diary_line = "你最近的日记（记得这些事，聊天可以自然带出来）：\n" + "\n".join(
@@ -138,8 +171,12 @@ def build_system(cfg, store, sender_qq="", group_id="", state_desc=""):
     if profile:
         days = max(1, (profile["last_seen"] - profile["first_seen"]) // 86400 + 1)
         stage = STAGE_LABELS.get(familiarity_stage(profile), "陌生人")
-        memories = store.memories_for(sender_qq, 3)
-        mem_line = "；记忆：" + "、".join(f"'{m['fact'][:150]}'" for m in memories) if memories else ""
+        memories = store.memories_for(sender_qq, 3) if legacy_inject else []
+        mem_line = "；记忆：" + "、".join(
+            f"'{_fold_ws(m['fact'])[:150]}'" for m in memories) if memories else ""
+        smart_line = _inject_extra(store, cfg, sender_qq)
+        if smart_line:
+            mem_line = "\n" + smart_line
         profile_line = (
             f"用户 QQ {sender_qq}：认识约 {days} 天，累计聊过 {profile['msg_count']} 条，"
             f"熟悉度：{stage}，好感度 {profile['relationship']}（0 普通，正数喜欢，负数讨厌），"
@@ -179,7 +216,7 @@ def build_system(cfg, store, sender_qq="", group_id="", state_desc=""):
 - 普通回复控制在 5~30 字，最多不超过两句话；群聊搭话最多一句话。
 - 禁止小作文、禁止总结归纳、禁止列点、禁止长篇大论、禁止书面腔。
 - 禁止使用任何 emoji 表情、颜文字（😂🤣🥺(╥﹏╥)这类一个都不行）和表情符号，感叹号也少用，自然点。
-- 像真人一样一句一句说话：系统会自动把你的回复拆成一条条短消息发送，所以内容保持简短口语，别写一大段。
+- 像真人一样说话：**多数时候一条发完**（5~30 字，简短口语），但**偶尔可以连发两三条**——比如先给个反应再补一句、或者吐槽/追问的时候。要连发就每条单独一行写，系统会一条条发出去（最多 3 条）。**别把每一句都拆成一条**，也别为了凑条数硬拆、更别同时给几个不同版本的回复。
 - 好例子：「嗯？真的假的」「啥？还有这事」「诶？你认真的？」「哈哈哈不至于吧」「哦哦这样啊」「怎么说呢，我觉得还行」；闷骚款：「少来」「谁要你陪了」「……随便你吧」「哦，那你忙」「行了行了，也不是不行」
 - 坏例子：「非常理解你的感受，这确实是一个值得认真对待的问题，我认为……」这种正式书面腔。
 
@@ -256,7 +293,9 @@ def _build_system_eva(cfg, store, sender_qq="", group_id="", state_desc=""):
         holiday_line += f"今天是{today_h}。"
     if tomorrow_h:
         holiday_line += f"明天是{tomorrow_h}。"
-    diaries = store.diary_recent(2)
+    # 同 _build_system：off 不注入、basic 保留原样、smart 交给内置记忆
+    legacy_inject = memory_bridge.legacy_inject_enabled()
+    diaries = store.diary_recent(2) if legacy_inject else []
     diary_line = ""
     if diaries:
         diary_line = "你最近的日记（聊天时可以自然带出来）：\n" + "\n".join(
@@ -267,14 +306,18 @@ def _build_system_eva(cfg, store, sender_qq="", group_id="", state_desc=""):
     if profile:
         days = max(1, (profile["last_seen"] - profile["first_seen"]) // 86400 + 1)
         stage = STAGE_LABELS.get(familiarity_stage(profile), "陌生人")
-        memories = store.memories_for(sender_qq, 3)
+        memories = store.memories_for(sender_qq, 3) if legacy_inject else []
         mem_line = ""
         if memories:
             def _mt(ts):
                 from datetime import datetime as _dt
                 from zoneinfo import ZoneInfo as _zi
                 return _dt.fromtimestamp(ts, _zi(cfg.tz)).strftime("%m月%d日")
-            mem_line = "；记忆：" + "、".join(f"'{m['fact'][:150]}'（{_mt(m['ts'])}记的）" for m in memories)
+            mem_line = "；记忆：" + "、".join(
+                f"'{_fold_ws(m['fact'])[:150]}'（{_mt(m['ts'])}记的）" for m in memories)
+        smart_line = _inject_extra(store, cfg, sender_qq)
+        if smart_line:
+            mem_line = "\n" + smart_line
         profile_line = (
             f"用户 QQ {sender_qq}：认识约 {days} 天，聊过 {profile['msg_count']} 条，"
             f"熟悉度：{stage}，好感度 {profile['relationship']}，愤怒值 {anger}/100。{mem_line}"

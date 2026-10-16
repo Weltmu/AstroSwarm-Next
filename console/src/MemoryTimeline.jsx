@@ -20,7 +20,7 @@ export default function MemoryTimeline() {
       const d = await get('/api/memory/list');
       setData(d);
       setSel(null);
-      setMsg(d.total ? '' : '还没有记忆：和机器人聊过天之后，这里会出现它记住的事。');
+      setMsg(d.total ? '' : '还没有记忆：聊过天之后这里会出现它记住的事。');
     } catch (e) {
       setMsg(`读取失败：${e.message}`);
     } finally {
@@ -33,7 +33,7 @@ export default function MemoryTimeline() {
   const removeOne = async () => {
     if (!sel) { setMsg('先在下面选一条要删除的记忆。'); return; }
     const label = sel.scope === 'global' ? '全局记忆' : `用户 ${sel.user} 的记忆`;
-    if (!window.confirm(`确定删除这条${label}？\n后端会自动留一份备份，但删除后机器人就记不得这件事了。`)) return;
+    if (!window.confirm(`确定删除这条${label}？\n删除后不可恢复。`)) return;
     setBusy(true);
     try {
       const r = await post('/api/memory/delete', sel);
@@ -49,7 +49,7 @@ export default function MemoryTimeline() {
   const clearAll = async () => {
     const total = data?.total ?? 0;
     if (!total) { setMsg('现在没有记忆可清空。'); return; }
-    if (!window.confirm(`确定清空全部 ${total} 条记忆？\n清空后不可恢复（后端会留一份 .bak 备份，但需要你自己去服务器上找回）。`)) return;
+    if (!window.confirm(`确定清空全部 ${total} 条记忆？\n清空后不可恢复。`)) return;
     setBusy(true);
     try {
       const r = await post('/api/memory/clear', { confirm: true });
@@ -82,7 +82,7 @@ export default function MemoryTimeline() {
   return (
     <>
       <p className="card__note">
-        记忆时间线（本地）：读取机器人记忆库，可导出 / 单条删除 / 清空。
+        记忆时间线：可导出、删除、清空。
         {data ? ` 当前共 ${data.total} 条（全局 ${data.global_count || 0} 条，用户分组 ${(data.users || []).length} 个）。` : ''}
       </p>
       <div className="brain-list brain-list--130">

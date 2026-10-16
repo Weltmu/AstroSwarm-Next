@@ -1,5 +1,5 @@
-#!/usr/bin/env bash
-# AstroSwarm（星群）Linux 无头版 · 客户自助安装脚本
+﻿#!/usr/bin/env bash
+# 星巢 Nest（AstroSwarm 无头端）· 客户自助安装脚本
 #
 # 用法：sudo bash install.sh [选项]
 #   --port N            控制台端口（默认 7860）
@@ -79,7 +79,7 @@ for cand in "$HERE/console-dist" "$HERE/app/console-dist" "$SRC_APP/console-dist
   if [ -f "$cand/index.html" ]; then CONSOLE_SRC="$cand"; break; fi
 done
 
-say "安装目录：$ROOT"
+say "星巢 Nest 安装目录：$ROOT"
 say "Python：$PY ($PYVER)　监听：$BIND_HOST:$PORT"
 [ -n "$CONSOLE_SRC" ] || warn "没找到 console-dist（控制台前端产物）——装完浏览器打开会是 404，请把 console-dist 放进安装目录"
 
@@ -180,6 +180,8 @@ export XDG_CONFIG_HOME="\$ROOT/data"
 exec "\$ROOT/venv/bin/python" -m astroswarm_linux.cli "\$@"
 WRAPPER
 chmod +x "$ROOT/bin/astroswarm"
+# 放到 PATH 里，用户照着密码屏的提示敲 `astroswarm console-reset-password` 就能用
+ln -sf "$ROOT/bin/astroswarm" /usr/local/bin/astroswarm 2>/dev/null || true
 
 # ---------- 4. 初始化配置 ----------
 say "初始化配置（端口 $PORT）"
@@ -212,7 +214,7 @@ if [ "$SYSTEMD" = "1" ]; then
   chown -R "$RUN_USER":"$RUN_USER" "$ROOT/data" 2>/dev/null || true
   cat > /etc/systemd/system/astroswarm.service <<UNIT
 [Unit]
-Description=AstroSwarm (astroswarm-headless) port $PORT
+Description=星巢 Nest（AstroSwarm 无头端）port $PORT
 After=network-online.target
 Wants=network-online.target
 
@@ -241,9 +243,22 @@ UNIT
   systemctl daemon-reload
   systemctl enable astroswarm.service >/dev/null 2>&1 || true
   systemctl restart astroswarm.service || warn "服务启动失败，看 journalctl -u astroswarm -n 50"
-  sleep 3
-  systemctl is-active astroswarm.service >/dev/null && say "服务已启动：systemctl status astroswarm" \
-    || warn "服务没起来，看 journalctl -u astroswarm -n 50"
+  # 2026-10-04 修：以前只 sleep 3 就判活，restart 常要 1~2 秒才 bind 完，
+  # 结果好好的服务被误报"没起来"（老板实测踩到）。现在轮询最多 15 秒，
+  # 真失败时把 journal 里的错误行一并打出来，不用用户自己去翻日志。
+  SERVICE_OK=0
+  for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+    if systemctl is-active astroswarm.service >/dev/null 2>&1; then SERVICE_OK=1; break; fi
+    sleep 1
+  done
+  if [ "$SERVICE_OK" = "1" ]; then
+    say "服务已启动：systemctl status astroswarm"
+  else
+    warn "服务没起来，下面是日志里的原因："
+    journalctl -u astroswarm --no-pager -n 40 2>/dev/null \
+      | grep -iE 'error|address already in use|traceback|failed' | tail -5 || true
+    warn "看完整日志：journalctl -u astroswarm -n 50"
+  fi
 fi
 
 # ---------- 6. 机器人运行时（可选）----------
@@ -255,10 +270,21 @@ fi
 
 # ---------- 7. 收尾 ----------
 echo ""
-say "完成！"
+say "星巢 Nest 安装完成！"
 echo "  启动控制台：$ROOT/bin/astroswarm serve --host $BIND_HOST --port $PORT"
-echo "  浏览器打开：http://<服务器IP>:$PORT/（本机：http://127.0.0.1:$PORT/）"
-[ "$BIND_HOST" = "127.0.0.1" ] && echo "  注意：当前只监听 127.0.0.1，公网访问请用 nginx 反代（别直接绑 0.0.0.0）。"
+if [ "$BIND_HOST" = "127.0.0.1" ]; then
+  # 2026-10-04 修：以前这里写"浏览器打开 http://<服务器IP>:$PORT/"，但服务只监听
+  # 127.0.0.1，公网 IP 那个地址**永远打不开**（老板实测当成故障来问）。
+  # 现在按实际情况给两种能用的办法，不再给打不开的地址。
+  echo "  打开控制台（二选一）："
+  echo "    ① 本地开隧道（推荐，安全、不开公网端口）："
+  echo "         ssh -L $PORT:127.0.0.1:$PORT root@<服务器IP>"
+  echo "       然后浏览器打开 http://127.0.0.1:$PORT/"
+  echo "    ② 要直接用公网地址访问：重装时加 --host 0.0.0.0，再放行防火墙端口"
+  echo "         （安全组 + ufw/firewalld 都要开；明文 HTTP，建议前面套 nginx + HTTPS）"
+else
+  echo "  浏览器打开：http://<服务器IP>:$PORT/（已监听 $BIND_HOST）"
+fi
 [ "$SYSTEMD" = "1" ] && echo "  服务管理：systemctl {start|stop|restart|status} astroswarm"
 [ "$WITH_BOT" = "1" ] || echo "  还没装机器人运行时：$ROOT/bin/astroswarm deploy（或重跑 install.sh --bot）"
 echo "  数据目录：$ROOT/data（备份它就等于备份了配置与登录态）"

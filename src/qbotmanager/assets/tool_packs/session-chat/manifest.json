@@ -1,0 +1,63 @@
+{
+  "id": "session-chat",
+  "name": "连续对话能力包",
+  "version": "1.0.0",
+  "kind": "behavior-pack",
+  "description": "群里 @ 过它之后，一段时间内不用再 @ 也能接着聊；也可以改成让 AI 读群聊天记录判断要不要接话，或者干脆关掉。",
+  "adapters": ["qq_official", "wechat_ilink"],
+  "min_version": "0.4.0",
+  "permissions": [],
+  "tools": [],
+  "behavior": {
+    "session": {
+      "enabled": true,
+      "mode": "timeout",
+      "expire_seconds": 180,
+      "unrelated_limit": 5
+    }
+  },
+  "config": {
+    "fields": [
+      {
+        "key": "enabled",
+        "label": "开启免 @ 连续对话",
+        "type": "bool",
+        "default": true,
+        "help": "关掉后：群里只有 @ 它才回，其余消息一律不理（适合不想让它插话的群）。"
+      },
+      {
+        "key": "mode",
+        "label": "怎么判断该不该接话",
+        "type": "enum",
+        "default": "timeout",
+        "options": [
+          {"value": "timeout", "label": "超时断开（推荐：说一会儿自动停）"},
+          {"value": "api", "label": "读群聊天记录判断（每条都问一次 AI，费 token）"}
+        ],
+        "help": "超时断开：被打招呼后的一段时间内接着聊，到点或连着几句无关就断开；读群记录判断：不看时间，群里每条消息都让 AI 看一眼要不要接。"
+      },
+      {
+        "key": "expire_seconds",
+        "label": "连续对话有效期",
+        "unit": "秒",
+        "type": "number",
+        "default": 180,
+        "min": 30,
+        "max": 300,
+        "step": 10,
+        "help": "只在「超时断开」模式下有用：填 30~300 秒，说得越久它记得越久。"
+      },
+      {
+        "key": "unrelated_limit",
+        "label": "连着几句无关就停",
+        "unit": "句",
+        "type": "number",
+        "default": 5,
+        "min": 1,
+        "max": 20,
+        "step": 1,
+        "help": "你在群里连着说了这么多句都没提到它，它就当这段对话结束了，下次要重新 @。"
+      }
+    ]
+  }
+}

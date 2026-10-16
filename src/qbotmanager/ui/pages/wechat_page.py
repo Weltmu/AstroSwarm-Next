@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""微信页：ClawBot 通道状态、扫码登录、最近会话。"""
+"""微信页：iLink 通道状态、扫码登录、最近会话。"""
 import time
 import webbrowser
 
@@ -22,7 +22,6 @@ class WechatPage(QWidget):
         self.ctx = ctx
         self._qr_url_cache = ""
         self._qr_shown_at = 0.0
-        self._qr_auto_at = 0.0
         self._build_ui()
         self.refresh_status()
 
@@ -33,7 +32,7 @@ class WechatPage(QWidget):
 
         title = QLabel("微信")
         title.setObjectName("pageTitle")
-        sub = QLabel("微信 ClawBot 通道：个人私聊 AI 助手（扫码后微信出现 ClawBot 会话）")
+        sub = QLabel("微信 iLink：扫码后微信里出现会话。")
         sub.setObjectName("pageSub")
         outer.addWidget(title)
         outer.addWidget(sub)
@@ -82,6 +81,11 @@ class WechatPage(QWidget):
         self.recent_label.setWordWrap(True)
         self.recent_label.setStyleSheet(f"color: {TEXT_3}; font-size: 12px;")
         rv.addWidget(self.recent_label)
+        # 官方限制：微信的主动消息只在"对方 30 分钟内说过话"时发得出去
+        wx_tip = QLabel("微信限制：对方 30 分钟内说过话才能主动发。")
+        wx_tip.setWordWrap(True)
+        wx_tip.setStyleSheet(f"color: {TEXT_3}; font-size: 12px;")
+        rv.addWidget(wx_tip)
         btn_center = QPushButton("打开消息中心")
         btn_center.clicked.connect(lambda: self.ctx.switch_page("消息中心"))
         rv.addWidget(btn_center)
@@ -98,15 +102,13 @@ class WechatPage(QWidget):
         gate = lic_mod.feature_gate()
         locked = not gate.get("member", True)
         if locked:
-            reason = gate.get("reason") or "QQ 通道可用；微信通道未开通"
             self.gate_lock.setText(
-                reason + "。在账号中心开通微信通道后即可扫码登录；适配器源码随仓库开源"
-                "（Apache-2.0），你也可以自己接入，只是不含官方支持。")
+                (gate.get("reason") or "微信通道当前不可用")
+                + "。适配器源码随仓库开源（Apache-2.0），也可以自己接入。")
             self.gate_lock.show()
-            self.btn_pay.show()
         else:
             self.gate_lock.hide()
-            self.btn_pay.hide()
+        self.btn_pay.setVisible(locked)      # 已免费开放：不再出现「开通」按钮
         # 登录卡（状态徽标 / 二维码 / 按钮可用性）在共用面板里，接入页用的是同一份
         self.wx_panel.refresh_status()
 

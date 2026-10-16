@@ -193,7 +193,7 @@ html[data-ui-theme='terminal'] .card__title { font-size: 14px; line-height: 18px
 html[data-ui-theme='terminal'] .card__note,
 html[data-ui-theme='terminal'] .card__info { line-height: 15px; }
 html[data-ui-theme='terminal'] .page-head h1 { font-size: 21px; line-height: 27px; letter-spacing: 1px; }
-html[data-ui-theme='terminal'] .page-head p { font-size: 12px; line-height: 16px; }
+html[data-ui-theme='terminal'] .page-head p, html[data-ui-theme='terminal'] .page-head h2.page-head__sub { font-size: 12px; line-height: 16px; }
 html[data-ui-theme='terminal'] .btn {
   height: 30px; padding: 0 13px; font-size: 12px; border-radius: 4px;
   background: rgba(255, 255, 255, 0.05); border: 1px solid rgba(255, 255, 255, 0.14);
@@ -359,6 +359,14 @@ html[data-glass='frosted'] .group {
 .page-head { display: flex; align-items: flex-start; gap: 12px; }
 .page-head h1 { margin: 0; font-size: 22px; font-weight: 600; line-height: 28px; letter-spacing: 0.5px; }
 .page-head p { margin: 14px 0 0; color: var(--as-text-2); font-size: 13px; line-height: 17px; }
+/* 页头那句说明：桌面端是标题下面另起一行的小字。用 h2 承载时外观与 <p> 完全一致
+   （字号/颜色/间距都在这里对齐），语义上是「页面名 → 一句话说明」的下级标题。 */
+.page-head h2.page-head__sub {
+  margin: 14px 0 0; color: var(--as-text-2);
+  font-size: 13px; font-weight: 400; line-height: 17px; letter-spacing: 0;
+}
+/* 页头第二行说明（桌面端是标题下另起一行的 QLabel 提示）：和第一行贴紧 */
+.page-head p.page-head__sub2 { margin-top: 4px; color: var(--as-text-3); font-size: 12px; line-height: 16px; }
 /* 页头右侧整块也要拉满头部高度，里面的徽标才能跟着到 59（桌面端就是这样） */
 .page-head__right { margin-left: auto; align-self: stretch; display: flex; align-items: stretch; gap: 8px; }
 .page-head__time { color: var(--as-text-3); font-size: 12px; }
@@ -404,6 +412,24 @@ html[data-ui-theme='terminal'] .home-body { grid-template-rows: 129px minmax(0, 
 html[data-ui-theme='terminal'] .home-row--mid { grid-template-columns: 445fr 1039fr; }
 html[data-ui-theme='terminal'] .home-row--bottom { grid-template-columns: 594fr 890fr; }
 .home-time { color: var(--as-text-3); font-size: 12px; line-height: 17px; }
+
+/* 平台四卡（QQ / 微信 / 飞书 / 纸飞机）：和桌面端首页一样横排四张，窄屏折成两行。
+   整张卡是一个 <button>，但外观仍是 .card —— 所以要把按钮自带的字体/对齐压回去。 */
+.plat-cards { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 14px; }
+.plat-card {
+  text-align: left; font: inherit; color: inherit; cursor: pointer;
+  align-items: flex-start; gap: 6px;
+}
+.plat-card:hover { border-color: var(--as-border-strong); }
+.plat-card__line {
+  color: var(--as-text-3); font-size: 12px; line-height: 16px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 100%;
+}
+@media (max-width: 1100px) { .plat-cards { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@media (max-width: 560px) { .plat-cards { grid-template-columns: 1fr; } }
+
+/* 「下一步」引导条：一块卡里只放一句话 + 一个动作 */
+.hp-next { border-color: rgba(127, 176, 255, 0.35); background: rgba(127, 176, 255, 0.08); }
 
 /* 今日数据：12px 行、行距 22（行高 16 + 间距 6），值右对齐 */
 .stat-rows { display: flex; flex-direction: column; gap: 6px; }
@@ -480,11 +506,14 @@ html[data-ui-theme='terminal'] .home-row--bottom { grid-template-columns: 594fr 
 .stack { display: flex; flex-direction: column; gap: 6px; }
 
 /* ------------------------------------------------------------ 按钮体系
-   桌面端 QPushButton：33 高、8 圆角、13px、padding 7·14、bg rgba(255,255,255,.06) */
+   2026-10-12 老板要求「按钮弄成胶囊按钮」：圆角从 8/12 改成 999（= 高度一半）。
+   桌面端 QPushButton 原来对齐的是「33 高、8 圆角」—— 这一处**故意不再 1:1**，
+   等桌面端（Qt）那套也换成胶囊后再对齐；控制台先按老板的话走。
+   高低三档保持原样：33（默认）/ 28（--sm，补出 --lg 40）。 */
 .btn {
   display: inline-flex; align-items: center; justify-content: center; gap: 6px;
   height: 33px; padding: 0 14px;
-  border-radius: var(--as-radius-sm);
+  border-radius: 999px;
   border: 1px solid var(--as-border-light);
   background: rgba(255, 255, 255, 0.06);
   color: var(--as-text); font: inherit; font-size: 13px; line-height: 17px; cursor: pointer;
@@ -493,19 +522,26 @@ html[data-ui-theme='terminal'] .home-row--bottom { grid-template-columns: 594fr 
 .btn:hover { background: rgba(255, 255, 255, 0.10); border-color: var(--as-border-strong); }
 .btn:active { background: rgba(255, 255, 255, 0.05); }
 .btn:disabled { color: var(--as-text-3); background: rgba(255, 255, 255, 0.02); border-color: rgba(255, 255, 255, 0.04); cursor: not-allowed; }
-/* 主按钮：桌面端是 ACCENT → ACCENT_ACTIVE 的横向渐变 */
+/* 键盘焦点环：以前按钮没有焦点样式（Tab 走到看不出来），2026-10-12 补上 */
+.btn:focus { outline: 2px solid transparent; outline-offset: 2px; }
+.btn:focus-visible { outline: 2px solid var(--as-focus, #8AB4FF); outline-offset: 2px; }
+/* 主按钮：品牌强调色的深一档（白字 5.50:1；滑过再深一档 7.3:1）。
+   2026-10-12：原来是 #3D6BFF → #2F5CE8 的渐变，白字在亮的那端只有 4.43:1，
+   差 0.07 不达标 —— 改成"静止就是合格的那一档"（详见 components.css 的令牌说明）。 */
 .btn--primary {
-  background: linear-gradient(90deg, var(--as-accent) 0%, var(--as-accent-active) 100%);
+  background: var(--as-btn-primary-bg, var(--as-accent-active, #2F5CE8));
   border: none; color: #fff; font-weight: 600;
   padding: 0 18px;
 }
-.btn--primary:hover { background: linear-gradient(90deg, var(--as-accent-hover) 0%, var(--as-accent) 100%); }
+.btn--primary:hover { background: var(--as-btn-primary-hover, #244BC9); }
 .btn--danger { background: rgba(248, 113, 113, 0.12); border-color: rgba(248, 113, 113, 0.35); color: #FCA5A5; }
 .btn--danger:hover { background: rgba(248, 113, 113, 0.22); border-color: rgba(248, 113, 113, 0.35); }
 .btn--ghost { background: transparent; }
 .btn--ghost:hover { background: rgba(255, 255, 255, 0.06); }
 .stack > .btn, .btn--block { width: 100%; }
 .btn--sm { height: 28px; padding: 0 12px; font-size: 12.5px; }
+/* 大号（2026-10-12 补齐三档，和 .pillbtn--lg 同尺寸） */
+.btn--lg { height: 40px; padding: 0 20px; font-size: 13.5px; }
 .toolbar, .actions, .savebar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 
 /* Toast：桌面端 QLabel#toast（rgba(19,26,40,.92) + 16 圆角 + 8·18 内边距） */
@@ -890,6 +926,10 @@ html[data-ui-theme='terminal'] .log-select { height: 30px; }
 .set-row--slider > b { justify-content: flex-end; }
 /* Chrome 的 13px 中日韩字比 Qt 窄 0.5px/字：这一对复选框宽度要跟桌面端一致（78） */
 .p-row--chk .check { letter-spacing: 0.5px; }
+/* 同一行的开关 + 文字（外观页的「自动播放 / 循环播放」）：
+   开关自己带 aria-label，这里的文字只作视觉标签，点它也能切换。 */
+.p-row--chk .tgl { margin-right: -6px; }
+.p-row--chk > span { color: var(--as-text-2); font-size: 13px; line-height: 18px; }
 /* 信息行：高度按桌面端实测钉死（值换行导致 32/48 的行），标签与值都拉满行高、内容垂直居中 */
 .set-row--kv { height: 16px; }
 .set-row--kv-2 { height: 32px; }
@@ -922,23 +962,10 @@ html[data-ui-theme='terminal'] .log-select { height: 30px; }
 }
 .set-row input[type='range']:focus { outline: none; }
 
-/* 自定义 ToggleSwitch：左侧文字 + 右侧 40×20 药丸（开=强调色、关 #3A4354，白色 14px 圆点） */
-.toggle {
-  position: relative; display: flex; align-items: center; height: 24px;
-  color: var(--as-text-2); font-size: 13px; line-height: 24px; cursor: pointer;
-}
-.toggle > input { position: absolute; opacity: 0; width: 0; height: 0; }
-.toggle__pill {
-  margin-left: auto; margin-right: 8px; width: 40px; height: 20px; border-radius: 10px;
-  background: #3A4354; position: relative; transition: background 0.15s ease;
-}
-.toggle__pill::after {
-  content: ''; position: absolute; top: 3px; left: 3px;
-  width: 14px; height: 14px; border-radius: 7px; background: #FFFFFF;
-  transition: transform 0.15s ease;
-}
-.toggle > input:checked + .toggle__pill { background: var(--as-accent); }
-.toggle > input:checked + .toggle__pill::after { transform: translateX(20px); }
+/* 自定义 ToggleSwitch 的旧样式（.toggle / .toggle__pill）已删除 ——
+   2026-10-12 换成 src/components/Toggle.jsx（.tgl / .tgl__track / .tgl__thumb，
+   44×24 轨道 + 20 滑块 + role="switch" + 焦点环）。旧类名在 JSX 里已经没有调用点，
+   留着只会让下一个人以为还有两套开关。 */
 .set-account { margin-top: 2px; }
 
 /* ===== 自动钉死（gen_pins.py 生成，勿手改；重跑会整段替换） ===== */
@@ -1147,6 +1174,8 @@ html[data-page='settings'] .set-box > .set-row--slider > input[type='range'] { m
   .stat-row b, .stat-row span { white-space: normal !important; word-break: break-all; }
   .page-head h1 { font-size: clamp(18px, 5vw, 24px); }
   .btn, .btn--block { width: 100%; }
+  /* 统一控件库的按钮同一口径（2026-10-12）：窄屏一律整宽，别挤成一条 */
+  .pillbtn:not(.pillbtn--link) { width: 100%; }
   .btn-row, .p-row, .pkg__foot { flex-wrap: wrap !important; }
   .card, .panel { padding: 14px 12px !important; }
   img, .qr-box img, .pkg__ava { max-width: 100%; height: auto; }
@@ -1154,6 +1183,26 @@ html[data-page='settings'] .set-box > .set-row--slider > input[type='range'] { m
 @media (max-width: 520px) {
   .nav .links { display: none; }
   .stat-rows { grid-template-columns: 1fr !important; }
+}
+
+/* ===== 默认主题（极光玻璃）的窄屏导航：收侧栏、改走顶栏 =====================
+   2026-10-12 截图时发现的**既有缺陷**（不是本轮控件引入的）：上面那条 860px 规则
+   只把多列布局摊平，默认主题的侧栏却照旧占着 180px —— 在 375 宽上留给正文只剩
+   195px，任何一行「标签 + 一句说明」的开关都会被压成竖排单字（中文一个字符一行），
+   而 swiss / terminal 两套主题的导航本来就在顶栏上，375 下是好好的。
+
+   这里不是新做一套导航：`.topnav` 三套主题**都渲染在 DOM 里**（见本文件开头那段
+   说明），只是默认主题把它 display:none 了。窄屏下换成顶栏即可，一行 CSS，
+   不新增组件、不动任何页面。860 与上面那条窄屏断点同一个口径。 */
+@media (max-width: 860px) {
+  html[data-ui-theme='glass'] .sidebar-wrap { display: none; }
+  html[data-ui-theme='glass'] .topnav { display: flex; }
+  /* 顶栏在默认主题下原本没有任何配色规则（它是给瑞士极简写的），
+     `--as-text-2` 用在浅底/深底都要有对比 —— 这两条照抄主题文字变量，
+     别写死颜色。当前项（顶栏被选中那一个）用品牌色加粗，
+     否则"我在哪一页"在窄屏上看不出来（截图审计里那条 1.02:1 就是它）。 */
+  html[data-ui-theme='glass'] .topnav__item { color: var(--as-text-2); }
+  html[data-ui-theme='glass'] .topnav__item--on { color: var(--as-text); }
 }
 
 /* ==== UI v2 新页面专用（2026-09 追加；只作用于 data-page 为 v2 的页面，
@@ -1368,7 +1417,7 @@ html[data-page] .icon { display: block; align-self: center; flex: 0 0 auto; }
   display: inline-flex; align-items: center; justify-content: center;
   height: 32px; padding: 0 14px;
   border: 1px solid var(--as-border-light);
-  border-radius: var(--as-radius-sm);
+  border-radius: 999px;             /* 2026-10-12：与胶囊按钮统一 */
   background: transparent;
   color: var(--as-text-2);
   /* font: inherit 必须有：<button> 默认不继承字体，不写这两个字就是系统 UI 字体 */
@@ -1382,7 +1431,7 @@ html[data-page] .icon { display: block; align-self: center; flex: 0 0 auto; }
 .tabbar__item:hover {
   background: var(--as-panel); border-color: var(--as-border-strong); color: var(--as-text);
 }
-.tabbar__item:focus-visible { outline: 2px solid var(--as-accent); outline-offset: 2px; }
+.tabbar__item:focus-visible { outline: 2px solid var(--as-focus, #8AB4FF); outline-offset: 2px; }
 .tabbar__item--on {
   background: var(--as-accent-soft); border-color: var(--as-accent-soft);
   color: var(--as-text); font-weight: 600;
@@ -1575,3 +1624,691 @@ html[data-page] .icon { display: block; align-self: center; flex: 0 0 auto; }
 /* 6) 插件管理底部「安装任务」原来是一张只有标题、钉死 48px 的空卡片。
    现在里面填了真实的任务状态文字，高度跟着内容走（最小保持原来的 48px）。 */
 [data-page='plugins-v2'] .pl-tasks { height: auto; min-height: 48px; }
+
+/* ===== 2026-10-01：机器人 AI（群聊）块 + QQ 群消息/体检 + 插件商店卡片 =====
+   新增三块界面都用这里的类：全中文、大白话；颜色一律走 tokens.css 的变量，
+   三套主题（默认/深空/浅色）里都不会跑偏。 */
+
+/* 「机器人 AI（群聊）」：小节标题 + 群名单 + 数字输入 */
+.card__subtitle {
+  margin: 10px 0 2px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--as-text);
+}
+.group-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-height: 190px;
+  overflow: auto;
+  padding: 8px 10px;
+  border: 1px solid var(--as-border-light);
+  border-radius: 12px;              /* 2026-10-12：容器也是圆角矩形，和胶囊控件同一族 */
+  background: var(--as-panel);
+}
+/* 一行 = 开关 + 群号 + 元信息；整行可点（2026-10-12 从勾选框换成开关后补的对齐） */
+.group-list__row { display: flex; align-items: center; gap: 8px; border-radius: 10px; }
+.group-list__row:hover { background: rgba(255, 255, 255, 0.04); }
+.group-list__meta { color: var(--as-text-3); font-size: 12px; margin-left: auto; }
+.p-input--num { width: 88px; text-align: center; }
+
+/* QQ 官方通道体检：每条一行，✗ 的用红色显眼，• 的是提示 */
+.diag-list { display: flex; flex-direction: column; gap: 6px; }
+.diag-row {
+  display: flex;
+  gap: 8px;
+  padding: 8px 10px;
+  border: 1px solid var(--as-border-light);
+  border-left-width: 3px;
+  border-radius: var(--as-radius-sm);
+  background: var(--as-panel);
+}
+.diag-row--ok { border-left-color: var(--as-success); }
+.diag-row--bad { border-left-color: var(--as-danger); background: rgba(248,113,113,0.08); }
+.diag-row--info { border-left-color: var(--as-info); }
+.diag-row__mark { flex: 0 0 auto; font-weight: 700; }
+.diag-row__mark--ok { color: var(--as-success); }
+.diag-row__mark--bad { color: var(--as-danger); }
+.diag-row__mark--info { color: var(--as-info); }
+.diag-row__body { min-width: 0; }
+.diag-row__title { color: var(--as-text); font-size: 13px; line-height: 18px; }
+.diag-row__hint { color: var(--as-text-3); font-size: 12px; line-height: 16px; margin-top: 2px; }
+
+/* 插件商店：搜索框 + 分类标签 + 卡片 */
+.mkt-search { flex: 1 1 auto; min-width: 0; }
+.mkt-tags { display: flex; flex-wrap: wrap; gap: 6px; }
+.mkt-tag {
+  height: 28px;
+  padding: 0 12px;
+  border-radius: 999px;
+  border: 1px solid var(--as-border-light);
+  background: var(--as-panel);
+  color: var(--as-text-2);
+  font-size: 12px;
+  cursor: pointer;
+}
+.mkt-tag:hover { border-color: var(--as-border-strong); color: var(--as-text); }
+.mkt-tag--on {
+  background: var(--as-accent-soft);
+  border-color: var(--as-accent);
+  color: var(--as-text);
+}
+.mkt-group { display: flex; flex-direction: column; gap: 6px; }
+.mkt-group__title { margin: 6px 0 0; color: var(--as-text-3); font-size: 12px; }
+.mkt-cards { display: flex; flex-direction: column; gap: 8px; }
+.mkt-card {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--as-border-light);
+  border-radius: var(--as-radius);
+  background: var(--as-panel-strong);
+  cursor: pointer;
+}
+.mkt-card:hover { border-color: var(--as-border-strong); }
+.mkt-card--on { border-color: var(--as-accent); box-shadow: 0 0 0 1px var(--as-accent-soft) inset; }
+.mkt-card__icon {
+  flex: 0 0 auto;
+  width: 34px;
+  height: 34px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: var(--as-radius-sm);
+  background: var(--as-accent-soft);
+  color: var(--as-text);
+  font-size: 15px;
+  font-weight: 600;
+}
+.mkt-card__body { flex: 1 1 auto; min-width: 0; }
+.mkt-card__head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.mkt-card__name { font-size: 13.5px; color: var(--as-text); }
+.mkt-card__ver { color: var(--as-text-3); font-size: 11.5px; }
+.mkt-card__desc {
+  margin-top: 3px;
+  color: var(--as-text-3);
+  font-size: 12px;
+  line-height: 16px;
+}
+.mkt-badge {
+  padding: 0 6px;
+  border-radius: 999px;
+  border: 1px solid var(--as-border-strong);
+  color: var(--as-text-2);
+  font-size: 11px;
+  line-height: 16px;
+}
+.mkt-badge--free { border-color: var(--as-success); color: var(--as-success); }
+.mkt-card__actions { display: flex; align-items: center; gap: 6px; flex: 0 0 auto; }
+.mkt-installed { color: var(--as-success); font-size: 12.5px; font-weight: 600; }
+
+/* ===== 账号头像与昵称（2026-10-01）=====
+   圆形头像用在四个地方：侧栏 / 瑞士顶栏 / 深空图标栏 / 设置页账号卡；
+   它们都吃同一份数据（profile.js），所以这里只描述"长什么样"，不管数据。 */
+.acct-avatar {
+  border-radius: 50%;
+  object-fit: cover;
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--as-panel-strong);
+  border: 1px solid var(--as-border-light);
+  overflow: hidden;
+}
+.acct-avatar--fallback {
+  /* 没上传头像时走官网同款的渐变底（颜色在 AccountAvatar.jsx 里按名字算）：
+     字必须是纯白、行高压死，和官网那张图一个样。 */
+  color: #fff;
+  font-weight: 600;
+  letter-spacing: 0;
+  line-height: 1;
+  text-shadow: none;
+}
+.acct-card {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  padding: 10px 0 4px;
+}
+.acct-card__body { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.acct-card__name { font-size: 15px; color: var(--as-text); }
+.acct-card__mail { color: var(--as-text-3); font-size: 12px; }
+.acct-card__sign { color: var(--as-text-2); font-size: 12px; }
+.acct-card__err { color: var(--as-danger); font-size: 12px; }
+.acct-card__actions { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-left: auto; }
+/* 侧栏/顶栏/图标栏的账号按钮：头像与文字垂直居中，头像不被压扁 */
+.sidebar-account, .topnav__account, .rail__account { align-items: center; }
+.sidebar-account > span, .topnav__account > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 免@连续对话的三种模式说明：手写三行小字，比下拉里的括号更好读 */
+.mode-help {
+  margin: 2px 0 2px 18px;
+  padding: 0;
+  color: var(--as-text-3);
+  font-size: 12px;
+  line-height: 17px;
+}
+.mode-help > li { margin: 2px 0; }
+.mode-help b { color: var(--as-text-2); font-weight: 600; }
+
+/* 插件主动发送白名单（留空 = 一个都不许发）：安全默认值要显眼，别让人当成普通说明 */
+.send-warn {
+  margin: 4px 0;
+  padding: 8px 10px;
+  border-radius: var(--as-radius-sm);
+  border-left: 3px solid var(--as-warn);
+  background: rgba(251,191,36,0.10);
+  color: var(--as-text-2);
+  font-size: 12px;
+  line-height: 17px;
+}
+.send-warn b { color: var(--as-text); }
+.send-list { display: flex; flex-direction: column; gap: 6px; }
+.send-row { display: flex; align-items: center; gap: 6px; }
+.send-row > .p-input { flex: 1 1 auto; min-width: 0; }
+
+/* 概览页「三步开箱」：完成绿 / 当前蓝 / 待办灰；每步一个按钮 */
+.hp-steps { gap: 10px; }
+.steps { display: flex; flex-direction: column; gap: 8px; }
+.step {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--as-border-light);
+  border-left-width: 3px;
+  border-radius: var(--as-radius);
+  background: var(--as-panel);
+}
+.step--done { border-left-color: var(--as-success); }
+.step--current { border-left-color: var(--as-accent); background: var(--as-accent-soft); }
+.step--todo { border-left-color: var(--as-border-strong); }
+.step__no {
+  flex: 0 0 auto;
+  width: 26px;
+  height: 26px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  border: 1px solid var(--as-border-strong);
+  color: var(--as-text-2);
+  font-size: 13px;
+  font-weight: 600;
+}
+.step--done .step__no { border-color: var(--as-success); color: var(--as-success); }
+.step--current .step__no { border-color: var(--as-accent); color: var(--as-accent); }
+.step__body { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.step__title { color: var(--as-text); font-size: 13.5px; }
+.step__hint { color: var(--as-text-3); font-size: 12px; }
+.step__status { font-size: 12px; font-weight: 600; }
+.step__status--done { color: var(--as-success); }
+.step__status--current { color: var(--as-accent); }
+.step__status--todo { color: var(--as-text-3); }
+.p-input--wide { flex: 1 1 auto; min-width: 0; }
+
+/* ===== 导航合并成 4 组（2026-10-02）：组标题可点、子项收在组里 =====
+   .navgrp__title 原来是 div，现在是 button —— 视觉保持不变，只补可点与箭头。 */
+.navgrp__title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--as-text-3);
+  font-size: 12px;
+  line-height: 18px;
+  letter-spacing: 0.4px;
+  cursor: pointer;
+  text-align: left;
+}
+.navgrp__title:hover { color: var(--as-text-2); }
+.navgrp__title--open { color: var(--as-text-2); }
+.navgrp__now {
+  margin-left: 2px;
+  padding: 0 6px;
+  border-radius: 999px;
+  background: var(--as-accent-soft);
+  color: var(--as-text);
+  font-size: 11px;
+}
+.navgrp__chev { margin-left: auto; font-size: 10px; opacity: 0.8; }
+
+/* 插件工坊页：工坊插件列表 / 历史 / 投稿表单 */
+.ws-list { display: flex; flex-direction: column; gap: 10px; }
+.ws-item {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px 12px;
+  border: 1px solid var(--as-border-light);
+  border-radius: var(--as-radius);
+  background: var(--as-panel);
+}
+.ws-item__head { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+.ws-history, .ws-upload {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px 10px;
+  border-left: 2px solid var(--as-border-light);
+}
+.ws-history__row { display: flex; align-items: baseline; gap: 8px; }
+
+/* 官网下载卡（.prod-cards / .prod-card / .prod-row / .prod-self）的样式已随
+   「设置 → 账号 → 官网现在能下载的东西」整块删除（2026-10-10 老板："这些东西意义何在"）。
+   那几张卡在服务器端控制台里没意义（安装包是官网给访客看的），删掉后没有引用者。 */
+
+/* 生成进度区（异步生成：stage + 已用时间 + 可折叠过程日志）与投稿列表 */
+.ws-progress {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px 12px;
+  border: 1px solid var(--as-border-light);
+  border-left: 3px solid var(--as-accent);
+  border-radius: var(--as-radius);
+  background: var(--as-panel);
+}
+.ws-progress__head { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+.ws-progress__head > b { color: var(--as-text); font-size: 13.5px; }
+.ws-progress__head > .btn { margin-left: auto; }
+.ws-logs {
+  max-height: 220px;
+  overflow: auto;
+  margin: 0;
+  padding: 8px 10px;
+  border-radius: var(--as-radius-sm);
+  background: rgba(8,11,18,0.72);
+  border: 1px solid var(--as-border-light);
+  color: #C6D0E0;
+  font-family: var(--as-font-mono);
+  font-size: 12px;
+  line-height: 17px;
+  white-space: pre-wrap;
+}
+
+/* ================================================================ 本轮新增（界面补齐）
+   只加下面这几块，别的规则一个字节都没动。 */
+
+/* —— 折叠区：原来只有 [data-page='home-v2'] 作用域里有 .fold 的规则，
+   服务 / 插件 / 日志页用 <details className="fold"> 时是裸的（没有边框和内边距）。
+   这里补一份通用的；首页那份作用域规则更具体，仍然优先，首页版式不变。 */
+.fold {
+  margin-top: 10px; padding: 12px 16px;
+  background: var(--as-panel); border: 1px solid var(--as-border-light);
+  border-radius: var(--as-radius);
+}
+.fold__summary {
+  cursor: pointer; color: var(--as-text-2); font-size: 13px; font-weight: 600; line-height: 20px;
+}
+.fold__body { display: flex; flex-direction: column; gap: 12px; margin-top: 12px; }
+.fold .card { margin-bottom: 0; }
+
+/* —— 未登录提示条：挂在标题栏下面，第一眼就能看到「去登录」 */
+.loginbar {
+  flex: 0 0 auto; display: flex; align-items: center; gap: 10px;
+  padding: 8px 16px; font-size: 13px; line-height: 18px; color: var(--as-text);
+  background: rgba(255, 176, 64, 0.12);
+  border-bottom: 1px solid rgba(255, 176, 64, 0.35);
+}
+.loginbar__dot {
+  flex: 0 0 auto; width: 8px; height: 8px; border-radius: 50%;
+  background: #FFB040; box-shadow: 0 0 8px rgba(255, 176, 64, 0.8);
+}
+.loginbar__text { flex: 1 1 auto; }
+.loginbar .btn { margin-left: auto; }
+
+/* —— 安装 / 依赖任务的原始输出（飞书适配器安装、依赖安装都用它） */
+.install-log {
+  max-height: 220px; overflow: auto; margin: 0; padding: 8px 10px;
+  border-radius: var(--as-radius-sm);
+  background: rgba(8, 11, 18, 0.72); border: 1px solid var(--as-border-light);
+  color: #C6D0E0; font-family: var(--as-font-mono); font-size: 12px; line-height: 17px;
+  white-space: pre-wrap;
+}
+.dep-log { flex: 0 0 auto; }
+
+/* —— 消息中心：会话行可点（看内容），选中态一行高亮 */
+.msg-item { cursor: pointer; }
+.msg-item:hover { background: rgba(88, 152, 255, 0.10); }
+.msg-item--on { background: rgba(88, 152, 255, 0.18); }
+.msg-detail { flex: 0 0 auto; gap: 8px; }
+
+/* —— 日志页：关键字过滤 + 实时跟随 */
+.log-kw { width: 170px; }
+.log-follow { color: var(--as-text-3); font-size: 12px; }
+
+/* —— 「绑定状态」那一行是长文本，右上角右对齐换行 */
+.stat-row--bind { align-items: flex-start; }
+.stat-row--bind b { text-align: right; }
+
+/* —— 首页平台四卡（版式对齐 2026-10-06）：桌面端首页那四张，一行四列，
+      每张点一下进「接入」；窄屏折成两列，不横向溢出。 */
+.hp-cards {
+  display: grid; grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px; margin: 4px 0 10px;
+}
+.hp-card {
+  display: flex; flex-direction: column; align-items: flex-start; gap: 6px;
+  padding: 10px 12px; text-align: left; cursor: pointer;
+  background: var(--as-panel); border: 1px solid var(--as-border-light);
+  border-radius: var(--as-radius); color: var(--as-text);
+}
+.hp-card:hover { border-color: var(--as-border-strong); }
+.hp-card__line { color: var(--as-text-3); font-size: 12px; line-height: 16px; }
+@media (max-width: 1100px) {
+  .hp-cards { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+
+/* —— 首页横排三步条（版式对齐 2026-10-06）：
+      左起「1 连 AI → 2 接 QQ → 3 启动」，每步 = 短名 + 状态 chip + 一个小按钮；
+      同一行最右侧是「你想要什么功能」输入框 + 去做插件。窄屏折成竖排。 */
+.steps-bar {
+  display: flex; flex-direction: row; align-items: center; flex-wrap: wrap;
+  gap: 8px; padding: 12px 16px;
+}
+.steps-bar__seg { display: flex; align-items: center; gap: 6px; }
+.steps-bar__arrow { color: var(--as-text-3); font-size: 13px; }
+.steps-bar__name { font-size: 13px; white-space: nowrap; }
+.steps-bar__name--done { color: var(--as-success); }
+.steps-bar__name--current { color: var(--as-accent); }
+.steps-bar__name--todo { color: var(--as-text-3); }
+.steps-bar__chip {
+  padding: 1px 8px; border-radius: 999px; font-size: 11.5px; white-space: nowrap;
+  border: 1px solid var(--as-border-light); color: var(--as-text-3);
+}
+.steps-bar__chip--done { border-color: var(--as-success); color: var(--as-success); }
+.steps-bar__chip--current { border-color: var(--as-accent); color: var(--as-accent); }
+.steps-bar__gap { flex: 1 1 40px; }
+.steps-bar__wish { flex: 1 1 260px; min-width: 200px; }
+@media (max-width: 900px) {
+  .steps-bar { flex-direction: column; align-items: stretch; }
+  .steps-bar__seg { flex-wrap: wrap; }
+}
+
+/* —— 登录弹窗（2026-10-06）：未登录提示条的「去登录」与侧栏「星群账号」点开的就是它。
+      不另造一套皮肤：面板直接挂 .card .card--strong（三套 UI 主题的底色/描边它自己会跟），
+      按钮与输入框用现成的 .btn / .p-input，圆角与文字色取 --as-radius / --as-text-3。
+      弹窗一层只有遮罩 + 面板两个盒子，层级压过 .toast(40)，盖住标题栏与侧栏。 */
+.loginmodal {
+  position: fixed; inset: 0; z-index: 60;
+  display: flex; align-items: center; justify-content: center;
+  padding: 24px;
+}
+.loginmodal__mask { position: absolute; inset: 0; background: rgba(6, 9, 15, 0.62); }
+.loginmodal__box {
+  position: relative;                 /* 压在遮罩上面，点面板不关窗 */
+  width: 100%; max-width: 460px;
+  padding: 16px 18px 18px; gap: 12px;
+  border: 1px solid var(--as-border-strong); border-radius: var(--as-radius);
+  box-shadow: 0 18px 48px rgba(0, 0, 0, 0.5);
+}
+.loginmodal__head { display: flex; align-items: center; gap: 8px; }
+.loginmodal__head .card__title { flex: 1 1 auto; }
+.loginmodal__close {
+  flex: 0 0 auto; width: 24px; height: 24px; padding: 0;
+  display: inline-flex; align-items: center; justify-content: center;
+  background: transparent; border: 1px solid var(--as-border-light);
+  border-radius: 6px; color: var(--as-text-3);
+  font-size: 15px; line-height: 1; cursor: pointer;
+}
+.loginmodal__close:hover { background: rgba(255, 255, 255, 0.06); color: var(--as-text); }
+
+/* 表单：两步分流（2026-10-10 老板改的）。
+   第一步只有邮箱 +「下一步」；后端查完注册状态才进第二步：
+     · 注册过 → 密码框 +「登录」；
+     · 没注册过 → 密码 + 6 位验证码 +「获取验证码」+「注册并登录」。
+   窄屏靠 flex-wrap 换行，不横向溢出。 */
+.loginform { display: flex; flex-direction: column; gap: 8px; }
+.loginform .p-row { flex-wrap: wrap; }
+.loginform__mail { flex: 1 1 150px; min-width: 0; }
+.loginform__pw { flex: 1 1 110px; min-width: 0; }
+.loginform__code { flex: 1 1 120px; min-width: 0; letter-spacing: 2px; }
+.loginform__send { flex: 0 0 auto; }
+.loginform__msg { margin: 0; color: var(--as-danger); font-size: 12px; line-height: 16px; }
+.loginform__hint, .loginform__note { margin: 0; color: var(--as-text-3); font-size: 12px; line-height: 16px; }
+/* 第二步顶部那行：这次的邮箱 +「改邮箱」（低强调，别抢下面那个主按钮）。 */
+.loginform__who { margin: 0; display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  color: var(--as-text-3); font-size: 12px; line-height: 16px; }
+.loginform__mailtext { color: var(--as-text); font-weight: 600; word-break: break-all; }
+.loginform__whohint { color: var(--as-text-3); }
+/* 登录弹窗里指向官网重置密码的链接（2026-10-10）：控制台不做重置表单，
+   只把人送去官网，所以这里只要一个认得出是链接、又不抢主按钮的样式。
+   「改邮箱」是个 <button>，所以要把按钮的默认外观清掉，长得跟这个链接一样。 */
+.loginform__link { color: var(--as-accent); text-decoration: underline; text-underline-offset: 2px;
+  background: none; border: none; padding: 0; font: inherit; cursor: pointer; }
+.loginform__link:hover { color: var(--as-accent-hover, var(--as-accent)); }
+
+/* —— 换头像前的方形裁剪框（2026-10-07）：照片**整张完整显示**（contain，最多 80vw × 70vh，
+      深色留白），在照片上拖一个方框选要保留的部分 —— 拖框内=移动，拖四角=等比缩放（恒为正方形），
+      框外压暗。面板沿用 .card .card--strong，按钮沿用 .btn / .btn--primary，不另造皮肤。 */
+.cropmodal {
+  position: fixed; inset: 0; z-index: 70;
+  display: flex; align-items: center; justify-content: center;
+  padding: 24px; outline: none;
+}
+.cropmodal__mask { position: absolute; inset: 0; background: rgba(6, 9, 15, 0.72); }
+.cropmodal__box {
+  position: relative; width: auto; max-width: 92vw; max-height: 92vh;
+  padding: 16px 18px 18px; gap: 12px;
+  border: 1px solid var(--as-border-strong); border-radius: var(--as-radius);
+  box-shadow: 0 18px 48px rgba(0, 0, 0, 0.5);
+}
+.cropmodal__stage {
+  position: relative;                 /* 照片 + 方框的坐标系：宽高由 JS 按 contain 算好 */
+  display: block; margin: 0 auto;
+  border-radius: 12px;
+  touch-action: none;                 /* 触屏拖动不被页面滚动抢走 */
+  user-select: none;
+}
+.cropmodal__stage--wait { width: 260px; height: 260px; }   /* 照片还没读出来的那一小会儿 */
+.cropmodal__photo {
+  position: absolute; inset: 0;
+  overflow: hidden;                   /* 压暗层只在照片里，圆角跟着照片走 */
+  border-radius: 12px;
+  background: #0A0D13;
+}
+.cropmodal__img {
+  display: block;
+  max-width: 80vw; max-height: 70vh;  /* 上限：整张照片都看得见，任何一边都不会被裁掉 */
+  object-fit: contain;
+  border-radius: 12px;
+  -webkit-user-drag: none;
+}
+.cropmodal__wait {
+  position: absolute; inset: 0;
+  display: flex; align-items: center; justify-content: center;
+  color: var(--as-text-3); font-size: 12.5px;
+}
+.cropmodal__dim { position: absolute; background: rgba(6, 9, 15, 0.62); pointer-events: none; }
+.cropmodal__rect {
+  position: absolute; box-sizing: border-box;
+  border: 1.5px solid rgba(255, 255, 255, 0.95);
+  border-radius: 3px;
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.35);
+  cursor: move;
+  touch-action: none;
+}
+.cropmodal__rect:active { cursor: grabbing; }
+.cropmodal__dot {
+  position: absolute; width: 12px; height: 12px; margin: -6px;   /* 圆点骑在四个角上 */
+  border-radius: 50%;
+  background: #FFFFFF; border: 1px solid rgba(6, 9, 15, 0.42);
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.5);
+  touch-action: none;
+}
+.cropmodal__bar { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.cropmodal__hint { flex: 1 1 auto; color: var(--as-text-3); font-size: 12.5px; }
+.cropmodal__acts { display: flex; gap: 8px; margin-left: auto; }
+.cropmodal__err { color: var(--as-danger); font-size: 12px; }
+
+
+
+/* ── 人设卡片的胶囊分段控件（预设 / 自定义）──────────────────────────────
+   底是胶囊，选中项是一个圆形滑块滑动过去（transition 120ms~）。零新依赖，纯 CSS。 */
+.seg {
+  position: relative;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  align-items: center;
+  width: max-content;
+  min-width: 216px;
+  margin: 12px 0 8px;
+  padding: 4px;
+  border-radius: 999px;
+  background: rgba(127, 149, 190, 0.16);
+  border: 1px solid var(--as-border);
+  gap: 0;
+  user-select: none;
+}
+.seg__thumb {
+  position: absolute;
+  top: 4px;
+  left: 4px;
+  width: calc(50% - 4px);
+  height: calc(100% - 8px);
+  border-radius: 999px;
+  background: var(--as-accent, #5898ff);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.22);
+  transition: transform 160ms cubic-bezier(0.22, 0.65, 0.25, 1);
+  will-change: transform;
+}
+.seg__thumb[data-pos='preset'] { transform: translateX(0); }
+.seg__thumb[data-pos='custom'] { transform: translateX(100%); }
+.seg__btn {
+  position: relative;
+  z-index: 1;
+  border: 0;
+  background: transparent;
+  color: var(--as-text-2, #93a1bb);
+  font: inherit;
+  font-size: 13px;
+  line-height: 1;
+  padding: 8px 18px;
+  border-radius: 999px;
+  cursor: pointer;
+  transition: color 140ms ease;
+}
+.seg__btn--on { color: #fff; font-weight: 600; }
+.seg__btn:focus-visible { outline: 2px solid var(--as-focus, #8ab4ff); outline-offset: 2px; }
+
+/* 三档胶囊（记忆档位：无 / 基础 / 智能）。复用上面那套 .seg 的外观，
+   只把两列改成三列、滑块宽度改成 1/3。单独一个修饰类，不动人设那个两态胶囊。 */
+.seg--3 {
+  grid-template-columns: 1fr 1fr 1fr;
+  min-width: 240px;
+}
+.seg--3 .seg__thumb { width: calc((100% - 8px) / 3); }
+.seg--3 .seg__btn { padding: 8px 12px; }
+
+/* 「谁在生效」那一行：两态都看得见 */
+.brain-status {
+  margin: 4px 0 10px;
+  padding: 8px 12px;
+  border-radius: 10px;
+  font-size: 13px;
+  background: rgba(127, 149, 190, 0.12);
+  border-left: 3px solid var(--as-border);
+}
+.brain-status--local { border-left-color: #38b26a; }
+.brain-status--profile { border-left-color: var(--as-accent, #5898ff); }
+.brain-pill-hint { color: var(--as-accent, #5898ff); margin: 0 0 10px; }
+.persona-pane { margin-top: 2px; }
+.card__note--gap { margin-top: 14px; padding-top: 10px; border-top: 1px solid var(--as-border); }
+
+/* 系统设置里关掉动效时不要滑 */
+@media (prefers-reduced-motion: reduce) {
+  .seg__thumb { transition: none; }
+}
+
+/* ==========================================================================
+   控制台密码屏（2026-10-07 老板要的"密码登录 + 15 天免密码"）
+   为什么单独做一整屏：控制台跑在 http://IP:7860 上，同一个局域网谁打开都能改配置。
+   密码屏是**进入控制台之前**的唯一关口，所以要占满整屏、居中、只有一件事可做。
+   前缀统一 cl-（console lock），不和现有 class 抢名字。
+   ========================================================================== */
+.cl-screen {
+  position: fixed; inset: 0; z-index: 50;
+  display: flex; align-items: center; justify-content: center;
+  padding: 24px;
+  background: var(--as-bg, #0b0f17);
+}
+.cl-card {
+  width: 100%; max-width: 380px;
+  display: flex; flex-direction: column; gap: 12px;
+  padding: 22px 22px 18px;
+  background: var(--as-panel-strong, rgba(19, 26, 40, 0.9));
+  border: 1px solid var(--as-border, rgba(127, 149, 190, 0.25));
+  border-radius: 14px;
+  box-shadow: 0 18px 50px rgba(0, 0, 0, 0.45);
+}
+.cl-head { display: flex; align-items: center; gap: 10px; }
+.cl-logo {
+  width: 34px; height: 34px; flex: 0 0 34px;
+  display: flex; align-items: center; justify-content: center;
+  border-radius: 10px;
+  background: linear-gradient(135deg, #4f7cff, #8b5cf6);
+  color: #fff; font-size: 16px; font-weight: 600;
+}
+.cl-title { margin: 0; font-size: 16px; line-height: 22px; color: var(--as-text, #e8eefc); }
+.cl-sub { margin: 2px 0 0; font-size: 12px; line-height: 16px; color: var(--as-text-3, #8b9ab5); }
+.cl-hint { margin: 0; font-size: 12px; line-height: 18px; color: var(--as-text-3, #8b9ab5); }
+/* 默认勾上的「记住这台设备 15 天」：文案要写清是多少天，别让人猜 */
+.cl-remember {
+  display: flex; align-items: center; gap: 8px;
+  font-size: 12px; line-height: 16px; color: var(--as-text-3, #8b9ab5);
+  cursor: pointer;
+}
+.cl-remember > input[type='checkbox'] { flex: 0 0 auto; cursor: pointer; }
+.cl-err {
+  margin: 0; padding: 6px 8px;
+  background: rgba(239, 68, 68, 0.12);
+  border-radius: 6px;
+  color: #F87171; font-size: 12px; line-height: 16px;
+}
+.cl-go { width: 100%; }
+.cl-note {
+  margin: 0; font-size: 11px; line-height: 16px;
+  color: var(--as-text-3, #8b9ab5); white-space: pre-line;
+}
+
+/* 「设置 → 账号 → 控制台密码」卡片（ConsolePasswordCard.jsx）。
+   三个密码框复用 .field/.p-input（和密码屏同一套控件），这里只补三段： */
+.cp-form { display: flex; flex-direction: column; max-width: 420px; }
+.cp-form__title { color: var(--as-text); font-size: 13px; font-weight: 600; margin-bottom: 8px; }
+.cp-form code {
+  padding: 0 4px; border-radius: 4px;
+  background: var(--as-panel-strong); color: var(--as-text-2);
+  font-size: 11.5px;
+}
+.cp-ok {
+  margin: 0; padding: 6px 8px;
+  background: rgba(34, 197, 94, 0.12);
+  border-radius: 6px;
+  color: #4ADE80; font-size: 12px; line-height: 16px;
+}
+
+/* 忘记控制台密码时给的那条服务器命令（等宽、可选中复制） */
+.cl-cmd {
+  margin: 6px 0 0;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.05);
+  color: var(--as-text-2, #9aa4b2);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11.5px;
+  line-height: 1.6;
+  word-break: break-all;
+  user-select: all;
+}

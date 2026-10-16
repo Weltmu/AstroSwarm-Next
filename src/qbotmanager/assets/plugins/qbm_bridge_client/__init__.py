@@ -7,6 +7,7 @@
 import httpx
 from pydantic import BaseModel
 from nonebot import get_plugin_config, logger, on_message
+import time
 from nonebot.adapters import Bot as BaseBot
 from nonebot.plugin import PluginMetadata
 
@@ -16,6 +17,10 @@ __plugin_meta__ = PluginMetadata(
     usage="无需手动调用：微信消息会自动转发到 dsh 统一大脑。",
     type="application",
 )
+
+
+_LAST_FAIL_AT = 0.0
+_FAIL_LOG_GAP = 600.0      # 桥没起来时，这条提醒每 10 分钟最多一次
 
 
 class PluginConfig(BaseModel):
@@ -72,7 +77,15 @@ if config.qbm_bridge_enabled:
         try:
             reply = await _bridge_reply(raw, user_id, is_group)
         except Exception as e:  # noqa: BLE001
-            logger.error(f"[qbm-bridge-client] 转发失败: {e}")
+            # dsh 通道没开时（设置里 dsh_enabled=False），桥根本不在 18650 上，
+            # 以前每条微信消息都刷一次 ERROR，日志全是"转发失败: All connection attempts failed"。
+            # 现在降级为静默：每 10 分钟最多记一条 info，正文照常由 AI 大脑处理。
+            global _LAST_FAIL_AT
+            now = time.time()
+            if now - _LAST_FAIL_AT > _FAIL_LOG_GAP:
+                _LAST_FAIL_AT = now
+                logger.info("[qbm-bridge-client] dsh 桥未运行，已跳过转发（每 10 分钟最多提醒一次）：%s", e)
+            return
             return
         if not reply:
             return

@@ -13,6 +13,7 @@ from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDialog, QDoubleSpinBox, QFileDialog, QFormLayout,
     QFrame, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem,
     QMessageBox, QPlainTextEdit, QPushButton, QScrollArea, QSpinBox,
+    QStyledItemDelegate,
     QVBoxLayout, QWidget,
 )
 
@@ -31,13 +32,29 @@ from ...tasks.workers import (
     InstallPluginTask, RestartBotTask,
 )
 from ..theme import TEXT_3
-from ..widgets import GlassPanel
+from ..widgets import GlassPanel, set_busy
+from ..widgets_switch import iOSSwitchRow
+from ...core import ai_config
 from .common import DepsConfirmDialog, PageContext, TaskPanel, Worker
 
 INSTALL_TASK_NAMES = ("安装插件", "安装市场插件", "安装依赖", "检查插件依赖")
 
 # 「高级（开发者）」折叠区标题（收起 / 展开两态）
 _ADVANCED_TITLE = "高级（开发者）　▾"
+
+
+class _NoTextRowDelegate(QStyledItemDelegate):
+    """只画背景 / 选中态，不画文字。
+
+    市场列表每行都用 setItemWidget 塞了整行控件（文字 + 安装按钮），
+    列表项自己再画一遍文字就会两层错位叠在一起（糊字）。文字统一交给行内 QLabel。
+    """
+
+    def initStyleOption(self, option, index):
+        super().initStyleOption(option, index)
+        option.text = ""
+
+
 _ADVANCED_OPEN = "收起高级（开发者）　▴"
 
 _PERM_LABELS = {
@@ -84,6 +101,89 @@ class PluginsPage(QWidget):
         lbl.setStyleSheet(f"color: {TEXT_3}; font-size: 12px;")
         return lbl
 
+    # ------------------------------------------------------------ 本机能力清单
+    def _build_capability_panel(self):
+        """本机能调用的能力：可搜索 + 每个一个开关（关掉 = 模型看不见它）。
+
+        2026-10-12 老板：「插件页面看不见好友申请那个功能」「加一个能搜索还带开关的」。
+        —— 插件页只管可安装的插件/能力包，而"加好友"这种是**内置插件里的工具**，
+        所以另开这一节，把"本机能调什么"摊开给他看。
+        """
+        panel = GlassPanel()
+        v = QVBoxLayout(panel)
+        v.setContentsMargins(16, 16, 16, 16)
+        v.setSpacing(12)
+
+        title = QLabel("本机能力（可搜索 · 可开关）")
+        title.setObjectName("sectionTitle")
+        v.addWidget(title)
+        v.addWidget(self._note(
+            "这是机器**现在真的能调**的能力（内置工具 + 内置插件里的动作 + 已装能力包）。"
+            "关掉某个开关，机器人就不再用它——模型那边直接看不见。"))
+
+        self.cap_search = QLineEdit()
+        self.cap_search.setPlaceholderText("搜索能力：输名字、说明或来源里的字都行")
+        self.cap_search.setClearButtonEnabled(True)
+        self.cap_search.textChanged.connect(lambda _t: self._refresh_capability_list())
+        v.addWidget(self.cap_search)
+
+        self.cap_count = QLabel("")
+        self.cap_count.setObjectName("pageSub")
+        v.addWidget(self.cap_count)
+
+        self.cap_box = QWidget()
+        self.cap_rows = QVBoxLayout(self.cap_box)
+        self.cap_rows.setContentsMargins(0, 0, 0, 0)
+        self.cap_rows.setSpacing(2)
+        v.addWidget(self.cap_box)
+
+        self._refresh_capability_list()
+        return panel
+
+    def _refresh_capability_list(self):
+        """按搜索词重画能力行（能力不多，直接重建最省事也最不容易出状态错）。"""
+        if not hasattr(self, "cap_rows"):
+            return
+        while self.cap_rows.count():
+            item = self.cap_rows.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.setParent(None)
+                w.deleteLater()
+        keyword = (self.cap_search.text() if hasattr(self, "cap_search") else "").strip().lower()
+        try:
+            items = ai_config.list_capabilities(self.ctx.settings)
+        except Exception as e:  # noqa: BLE001 —— 清单取不到不能让这一页崩
+            items = []
+            self.cap_count.setText(f"能力清单读取失败：{e}")
+        if keyword:
+            items = [it for it in items
+                     if keyword in it["name"].lower()
+                     or keyword in str(it.get("desc") or "").lower()
+                     or keyword in str(it.get("source") or "").lower()]
+        on = sum(1 for it in items if it.get("enabled"))
+        self.cap_count.setText(f"共 {len(items)} 项，开启 {on} 项"
+                              + ("（已按搜索词过滤）" if keyword else ""))
+        for it in items:
+            chk = QCheckBox(it["name"])
+            chk.setChecked(bool(it.get("enabled")))
+            bits = [str(it.get("desc") or "")]
+            if it.get("source"):
+                bits.append(f"来源：{it['source']}")
+            if it.get("permission"):
+                bits.append(f"需要权限：{it['permission']}")
+            chk.toggled.connect(
+                lambda on_, name=it["name"]: self._on_capability_toggled(name, on_))
+            self.cap_rows.addWidget(iOSSwitchRow(chk, description=" · ".join(b for b in bits if b)))
+
+    def _on_capability_toggled(self, name: str, enabled: bool):
+        try:
+            ai_config.set_tool_enabled(self.ctx.settings, name, enabled)
+            self.ctx.show_toast(("已开启：" if enabled else "已关闭：") + name)
+        except Exception as e:  # noqa: BLE001
+            self.ctx.show_toast(f"保存失败：{e}")
+        self._refresh_capability_list()
+
     def _build_ui(self):
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
@@ -106,13 +206,13 @@ class PluginsPage(QWidget):
         hv.setSpacing(8)
         title = QLabel("插件管理")
         title.setObjectName("pageTitle")
-        sub = QLabel("插件商店（直连星群服务器）与本地插件管理；"
-                     "第三方安装等开发者入口收在页面下方「高级（开发者）」里。")
+        sub = QLabel("装插件、管插件都在这里。")
         sub.setObjectName("pageSub")
         sub.setWordWrap(True)
         hv.addWidget(title)
         hv.addWidget(sub)
         outer.addWidget(head)
+        outer.addWidget(self._build_capability_panel())
 
         # ---- 插件商店：列表 + 一行操作（本页唯一主按钮「安装」）----
         store = GlassPanel()
@@ -123,29 +223,44 @@ class PluginsPage(QWidget):
         sl.setObjectName("sectionTitle")
         sv.addWidget(sl)
         sv.addWidget(self._note(
-            "直连星群服务器拉取插件清单；安装前自动校验协议端兼容性与 SHA256。"
-            "插件全部免费（随主仓库开源），选中后点「安装」即可。"))
+            "插件全部免费、开源（随主仓库），点卡片上的「安装」即可。"
+            "只有代部署、后续维护这类服务才收费，不用也不影响。"))
+        # 搜索：名字或说明里的字都能搜（插件一多，靠翻列表找太慢）
+        self.market_search = QLineEdit()
+        self.market_search.setPlaceholderText("搜索插件：输名字或说明里的字都行")
+        self.market_search.setClearButtonEnabled(True)
+        self.market_search.textChanged.connect(lambda _t: self._refresh_market_list())
+        sv.addWidget(self.market_search)
+        # 分类用横排小标签（比下拉直观：一共有哪几类一眼看全）
+        self.market_tag_box = QWidget()
+        self.market_tags_row = QHBoxLayout(self.market_tag_box)
+        self.market_tags_row.setContentsMargins(0, 0, 0, 0)
+        self.market_tags_row.setSpacing(6)
+        self._market_category = ""          # 当前选中的分类（"" = 全部）
+        self._market_tags = {}              # 分类名 -> 按钮（测试与回填用）
+        sv.addWidget(self.market_tag_box)
         self.market_list = QListWidget()
         self.market_list.setMinimumHeight(260)
-        self.market_list.itemDoubleClicked.connect(lambda _i: self._install_market_plugin())
+        # 行内已有整行控件（卡片），列表项不要再画一遍文字
+        self.market_list.setItemDelegate(_NoTextRowDelegate(self.market_list))
+        # 主题给列表项留了 padding，行控件会被内缩（行变矮）→ 行内按钮底部被裁。
+        # 这一列是自己画行的，所以把上下 padding 归零，左右留 4px 不贴边。
+        self.market_list.setStyleSheet(
+            "QListWidget::item { padding: 0px; margin: 0px 4px 4px 4px; }")
         sv.addWidget(self.market_list, 1)
         m_row = QHBoxLayout()
         m_row.setSpacing(8)
-        m_lbl = self._note("分类")
-        self.market_combo = QComboBox()
-        self.market_combo.addItem("全部分类", "")
-        self.market_combo.currentIndexChanged.connect(self._refresh_market_list)
+        m_row.addStretch(1)
         self.btn_market_refresh = QPushButton("刷新")
         self.btn_market_refresh.setObjectName("ghost")
         self.btn_market_refresh.clicked.connect(self._load_market)
         self.btn_market_install = QPushButton("安装")
         self.btn_market_install.setObjectName("primary")
         self.btn_market_install.clicked.connect(lambda: self._install_market_plugin())
-        m_row.addWidget(m_lbl)
-        m_row.addWidget(self.market_combo, 1)
         m_row.addWidget(self.btn_market_refresh)
         m_row.addWidget(self.btn_market_install)
         sv.addLayout(m_row)
+        self._refresh_market_tags()          # 先摆上「全部」，拉回清单再补上各分类
         self.market_status = self._note("正在加载插件商店...")
         sv.addWidget(self.market_status)
 
@@ -161,9 +276,7 @@ class PluginsPage(QWidget):
         self.btn_redeem.clicked.connect(self._redeem_code)
         self.btn_ent_refresh = QPushButton("刷新权益")
         self.btn_ent_refresh.setObjectName("ghost")
-        self.btn_ent_refresh.setToolTip(
-            "登录 / 兑换之后点这里：去星群账号重新拉一次账号档位。\n"
-            "插件已全部免费，装插件不依赖账号权益。")
+        self.btn_ent_refresh.setToolTip("登录后点这里同步账号档位。")
         self.btn_ent_refresh.clicked.connect(self._refresh_entitlement)
         r_row.addWidget(self.redeem_edit, 1)
         r_row.addWidget(self.btn_redeem)
@@ -206,7 +319,9 @@ class PluginsPage(QWidget):
         pv.addLayout(pack_row)
         self.pack_status = self._note("正在读取已装能力包...")
         pv.addWidget(self.pack_status)
-        outer.addWidget(pack)
+        # 「已装能力包」提到「插件商店」上面：装完一个包最常干的事是看它 / 调参数，
+        # 别让人往下滚。插在标题之后（index 1），保留 2 份弹性，别被商店挤扁。
+        outer.insertWidget(1, pack, 2)
 
         # ---- 高级（开发者）：默认收起，点标题才展开 ----
         outer.addWidget(self._build_advanced_section())
@@ -229,7 +344,7 @@ class PluginsPage(QWidget):
         btns.setSpacing(8)
         btn_reinstall = QPushButton("重装缺失依赖")
         btn_reinstall.setObjectName("ghost")
-        btn_reinstall.setToolTip("后台扫描所选插件声明的依赖，发现缺失后确认安装（清华镜像，失败自动切官方源）")
+        btn_reinstall.setToolTip("扫描缺失依赖并安装（清华镜像）。")
         btn_reinstall.clicked.connect(self._reinstall_deps)
         btn_refresh = QPushButton("刷新列表")
         btn_refresh.setObjectName("ghost")
@@ -237,7 +352,7 @@ class PluginsPage(QWidget):
         btn_open_dir = QPushButton("打开插件目录")
         btn_open_dir.setObjectName("ghost")
         btn_open_dir.clicked.connect(lambda: os.startfile(str(self.ctx.settings.plugins_dir)))
-        self.btn_restart = QPushButton("重启 NoneBot 生效")
+        self.btn_restart = QPushButton("重启机器人生效")
         self.btn_restart.setObjectName("ghost")
         self.btn_restart.clicked.connect(self._restart_bot)
         btns.addWidget(btn_reinstall)
@@ -340,7 +455,7 @@ class PluginsPage(QWidget):
         p_row.addWidget(self.store_edit, 1)
         p_row.addWidget(self.btn_store)
         pb.addLayout(p_row)
-        pb.addWidget(self._note("不推荐：任意 NoneBot 插件都能装，兼容与合规由用户自负。"))
+        pb.addWidget(self._note("不推荐：第三方插件兼容与合规自负。"))
         bv.addWidget(pypi_block)
 
         # NoneBot 官方插件市场（在线搜索，仅开发者模式可见）
@@ -348,7 +463,7 @@ class PluginsPage(QWidget):
         nv = QVBoxLayout(nb)
         nv.setContentsMargins(0, 0, 0, 0)
         nv.setSpacing(12)
-        nl = QLabel("NoneBot 在线市场")
+        nl = QLabel("在线插件市场")
         nl.setObjectName("sectionTitle")
         nv.addWidget(nl)
         nv.addWidget(self._note(
@@ -376,7 +491,7 @@ class PluginsPage(QWidget):
         self.nb_list.currentItemChanged.connect(
             lambda *_: self._update_nonebot_buttons())
         nv.addWidget(self.nb_list)
-        self.nb_status = self._note("进入「开发者模式」后可搜索 NoneBot 插件")
+        self.nb_status = self._note("进入「开发者模式」后可搜索插件")
         nv.addWidget(self.nb_status)
         nb_bottom = QHBoxLayout()
         nb_bottom.setSpacing(8)
@@ -436,10 +551,15 @@ class PluginsPage(QWidget):
             self._task_tid = tid
             self.task_panel.bind(tid)
             self.task_panel.setVisible(True)
+            # 几十秒的安装过程给个"在跑"的信号，别让用户以为点空了
+            set_busy(self.btn_market_install, True)
+            set_busy(self.market_status, True)
 
     def _on_task_finished(self, tid, status, result):
         if tid != self._task_tid:
             return
+        set_busy(self.btn_market_install, False)
+        set_busy(self.market_status, False)
         self.task_panel.bind(tid)
         self.refresh_lists()
         st = self.ctx.tasks.get(tid)
@@ -548,6 +668,8 @@ class PluginsPage(QWidget):
             return
         self.btn_redeem.setEnabled(False)
         self.ent_status.setText("正在兑换…")
+        set_busy(self.btn_redeem, True)
+        set_busy(self.ent_status, True)
         worker = Worker(self)
         worker.finished.connect(self._on_redeemed)
         threading.Thread(
@@ -556,7 +678,9 @@ class PluginsPage(QWidget):
 
     def _on_redeemed(self, res):
         self.btn_redeem.setEnabled(True)
+        set_busy(self.btn_redeem, False)
         if not isinstance(res, dict) or res.get("ok") is False:
+            set_busy(self.ent_status, False)
             self.ent_status.setText("兑换失败：" + _detail_of(res))
             return
         self.redeem_edit.clear()
@@ -570,20 +694,24 @@ class PluginsPage(QWidget):
             self.ent_status.setText("本机还没登录星群账号：先去「账号」里登录")
             return
         self.btn_ent_refresh.setEnabled(False)
+        set_busy(self.btn_ent_refresh, True)
         if not silent:
             self.ent_status.setText("正在刷新权益…")
+        set_busy(self.ent_status, True)
         worker = Worker(self)
         worker.finished.connect(self._on_entitlement_refreshed)
         threading.Thread(target=lambda: worker.run(lambda: account.me(token)), daemon=True).start()
 
     def _on_entitlement_refreshed(self, res):
         self.btn_ent_refresh.setEnabled(True)
+        set_busy(self.btn_ent_refresh, False)
+        set_busy(self.ent_status, False)
         if not isinstance(res, dict) or res.get("ok") is False:
             self.ent_status.setText("权益刷新失败：" + _detail_of(res))
             return
         if not lic_mod.save_entitlements_from_account(res):
             # 服务器这次没下发签名：保持本机现有权益（以前会把签名写成空 -> 掉回未开通）
-            self.ent_status.setText("权益已同步，但服务器没下发签名（本机现有权益保持不变）")
+            self.ent_status.setText("权益已同步，本机权益不变。")
             return
         ent = lic_mod.entitlements()
         owned = ent.get("owned_plugins") or []
@@ -594,6 +722,7 @@ class PluginsPage(QWidget):
     # ------------------------------------------------------------ 官方市场
     def _load_market(self):
         self.market_status.setText("正在加载插件商店...")
+        set_busy(self.market_status, True)
         worker = Worker(self)
         worker.finished.connect(self._on_market_loaded)
 
@@ -618,6 +747,7 @@ class PluginsPage(QWidget):
         threading.Thread(target=lambda: worker.run(_run), daemon=True).start()
 
     def _on_market_loaded(self, res):
+        set_busy(self.market_status, False)
         plugins = res.get("plugins") or [] if isinstance(res, dict) else []
         self._entitlements = (
             res.get("entitlements") if isinstance(res, dict)
@@ -633,12 +763,10 @@ class PluginsPage(QWidget):
             entries[str(e["id"])] = e
             categories.add(str(e.get("category") or "未分类"))
         self._market_entries = entries
-        self.market_combo.blockSignals(True)
-        self.market_combo.clear()
-        self.market_combo.addItem("全部分类", "")
-        for c in sorted(categories):
-            self.market_combo.addItem(c, c)
-        self.market_combo.blockSignals(False)
+        # 分类可能变了（市场新上架一类），标签行跟着重建；已选分类若不存在就回到「全部」
+        if self._market_category and self._market_category not in categories:
+            self._market_category = ""
+        self._refresh_market_tags()
         self._refresh_market_list()
         if not entries:
             # 把失败原因（验签失败/不在白名单/网络不通）直说，别只显示"暂不可用"
@@ -658,38 +786,251 @@ class PluginsPage(QWidget):
             f"插件商店已加载：{len(entries)} 个（全部免费）· {plan_label}"
             + (f"（{skipped} 个条目校验未通过已跳过）" if skipped else ""))
 
-    def _refresh_market_list(self):
-        cat = str(self.market_combo.currentData() or "")
-        self.market_list.clear()
-        for eid, e in self._market_entries.items():
-            if cat and str(e.get("category") or "") != cat:
-                continue
-            access = plugin_market.plugin_access(e, self._entitlements)
-            item = QListWidgetItem(
-                f"[{access['label']}] {e.get('name')}  v{e.get('version')}"
-                f"  [{e.get('category') or '未分类'}]")
-            item.setData(Qt.UserRole, eid)
-            tip = str(e.get("description") or "")
-            tip += "\n\n可安装：" + access["reason"]
-            item.setToolTip(tip)
-            item.setForeground(QColor("#34D399"))
-            self.market_list.addItem(item)
-            # 每行一个「安装」按钮：不用先选中再点下面的安装（小白最容易卡的一步）
-            row = QWidget()
-            rl = QHBoxLayout(row)
-            rl.setContentsMargins(6, 2, 6, 2)
-            rl.setSpacing(8)
-            lbl = QLabel(item.text())
-            lbl.setToolTip(tip)
-            lbl.setStyleSheet("color: #34D399; font-size: 12.5px;")
-            rl.addWidget(lbl, 1)
+    def _installed_ids(self) -> set:
+        """已装的能力包 / 插件标识（市场条目按 id 或名字匹配，宽松一点）。"""
+        out = set()
+        try:
+            for item in tool_packs.installed(self.ctx.settings):
+                for key in (item.get("id"), item.get("name")):
+                    if key:
+                        out.add(str(key).strip().lower())
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            for name in list_local_plugins(self.ctx.settings):
+                out.add(str(name).strip().lower())
+        except Exception:  # noqa: BLE001
+            pass
+        return out
+
+    # 分类配色：同一个分类永远同一个颜色，用户扫一眼就能分堆
+    CATEGORY_COLORS = {
+        "官方能力包": "#7C9CFF",
+        "智能体": "#C084FC",
+        "工具包": "#34D399",
+        "功能扩展": "#F59E0B",
+    }
+
+    def _category_color(self, category: str) -> str:
+        key = str(category or "").strip() or "未分类"
+        if key in self.CATEGORY_COLORS:
+            return self.CATEGORY_COLORS[key]
+        palette = ("#7C9CFF", "#C084FC", "#34D399", "#F59E0B", "#F472B6", "#38BDF8")
+        return palette[sum(ord(ch) for ch in key) % len(palette)]
+
+    def _badge(self, text: str, color: str) -> QLabel:
+        lbl = QLabel(text)
+        lbl.setStyleSheet(
+            f"color: {color}; border: 1px solid {color}; border-radius: 8px;"
+            "padding: 0px 6px; font-size: 11px;")
+        return lbl
+
+    def _market_card(self, eid: str, e: dict, installed: bool) -> QWidget:
+        """一张插件卡片：分类色块 + 名称/版本/徽章 + 一句人话说明 + 右侧按钮。
+
+        说明直接显示出来（以前藏在悬停提示里，等于没有）。
+        """
+        entry_id = str(eid)
+        category = str(e.get("category") or "未分类")
+        color = self._category_color(category)
+        card = GlassPanel()
+        lay = QHBoxLayout(card)
+        lay.setContentsMargins(14, 10, 14, 10)
+        lay.setSpacing(12)
+
+        icon = QLabel(category[:1] or "包")
+        icon.setFixedSize(34, 34)
+        icon.setAlignment(Qt.AlignCenter)
+        icon.setStyleSheet(
+            f"background: {color}22; color: {color}; border-radius: 8px;"
+            "font-size: 15px; font-weight: 600;")
+        lay.addWidget(icon)
+
+        col = QVBoxLayout()
+        col.setSpacing(3)
+        top = QHBoxLayout()
+        top.setSpacing(8)
+        name = QLabel(str(e.get("name") or entry_id))
+        name.setStyleSheet("font-size: 13.5px; font-weight: 600;")
+        top.addWidget(name)
+        version = QLabel("v" + str(e.get("version") or ""))
+        version.setStyleSheet(f"color: {TEXT_3}; font-size: 11.5px;")
+        top.addWidget(version)
+        top.addWidget(self._badge(category, color))
+        top.addWidget(self._badge("免费", "#34D399"))
+        top.addStretch(1)
+        col.addLayout(top)
+
+        desc = str(e.get("description") or "").strip() or f"{category}：装进机器人就能用"
+        desc_lbl = QLabel(desc)
+        # 必须换行：不换行时这句说明会把卡片撑到一千多像素宽，整列出现横向滚动条，
+        # 用户得拖底下的条才能看到右边的「安装」按钮（2026-10-06 用户反馈）。
+        desc_lbl.setWordWrap(True)
+        desc_lbl.setStyleSheet(f"color: {TEXT_3}; font-size: 12px;")
+        col.addWidget(desc_lbl)
+        lay.addLayout(col, 1)
+        card.setToolTip(str(e.get("description") or ""))
+
+        detail = QPushButton("详情")
+        detail.setObjectName("ghost")
+        detail.setMinimumHeight(26)
+        detail.clicked.connect(lambda _=False, _id=entry_id: self._show_market_detail(_id))
+        lay.addWidget(detail)
+        if installed:
+            mark = QLabel("✓ 已装")
+            mark.setStyleSheet("color: #34D399; font-size: 12.5px; font-weight: 600;")
+            lay.addWidget(mark)
+            cfg = QPushButton("配置")
+            cfg.setObjectName("ghost")
+            cfg.setMinimumHeight(26)
+            cfg.clicked.connect(lambda _=False, _id=entry_id: self._open_pack_config(_id))
+            lay.addWidget(cfg)
+        else:
             btn = QPushButton("安装")
             btn.setObjectName("primary")
             btn.setMinimumHeight(26)
-            btn.setToolTip(tip)
-            btn.clicked.connect(lambda _=False, _id=eid: self._install_market_plugin(_id))
-            rl.addWidget(btn)
-            self.market_list.setItemWidget(item, row)
+            btn.clicked.connect(lambda _=False, _id=entry_id: self._install_market_plugin(_id))
+            lay.addWidget(btn)
+        return card
+
+    def _show_market_detail(self, eid: str):
+        """插件详情：说明、版本、分类、适配通道、权限、装完要不要重启。"""
+        e = self._market_entries.get(str(eid or "")) or {}
+        if not e:
+            self.ctx.show_toast("插件信息已失效，请点「刷新」")
+            return
+        category = str(e.get("category") or "未分类")
+        dlg = QDialog(self)
+        dlg.setWindowTitle("插件详情 · " + str(e.get("name") or eid))
+        dlg.resize(560, 380)
+        outer = QVBoxLayout(dlg)
+        outer.setContentsMargins(18, 16, 18, 16)
+        outer.setSpacing(10)
+
+        head = QLabel(str(e.get("name") or eid))
+        head.setStyleSheet("font-size: 15px; font-weight: 600;")
+        outer.addWidget(head)
+        meta = QLabel(f"{category} · v{e.get('version') or ''} · 免费")
+        meta.setStyleSheet(f"color: {TEXT_3}; font-size: 12px;")
+        outer.addWidget(meta)
+        desc = QLabel(str(e.get("description") or "").strip() or "（这个插件没写说明）")
+        desc.setWordWrap(True)
+        desc.setStyleSheet("font-size: 12.5px;")
+        outer.addWidget(desc)
+
+        adapters = e.get("adapters") or []
+        if adapters:
+            label = QLabel("适配通道：" + "、".join(str(a) for a in adapters))
+            label.setWordWrap(True)
+            label.setStyleSheet(f"color: {TEXT_3}; font-size: 12px;")
+            outer.addWidget(label)
+        perms = e.get("permissions") or []
+        if perms:
+            plabel = QLabel("需要权限：\n" + "\n".join(
+                "• " + _PERM_LABELS.get(str(p), str(p)) for p in perms if str(p)))
+            plabel.setWordWrap(True)
+            plabel.setStyleSheet(f"color: {TEXT_3}; font-size: 12px;")
+            outer.addWidget(plabel)
+        restart = QLabel("装完要重启一次机器人才生效（装完软件会提示你）。")
+        restart.setWordWrap(True)
+        restart.setStyleSheet(f"color: {TEXT_3}; font-size: 12px;")
+        outer.addWidget(restart)
+        outer.addStretch(1)
+
+        row = QHBoxLayout()
+        row.addStretch(1)
+        if str(eid).strip().lower() in self._installed_ids() or \
+                str(e.get("name") or "").strip().lower() in self._installed_ids():
+            row.addWidget(QLabel("这个插件已经装好了"))
+        else:
+            btn_install = QPushButton("安装")
+            btn_install.setObjectName("primary")
+            btn_install.clicked.connect(
+                lambda _=False, _id=str(eid): (dlg.accept(), self._install_market_plugin(_id)))
+            row.addWidget(btn_install)
+        btn_close = QPushButton("关闭")
+        btn_close.setObjectName("ghost")
+        btn_close.clicked.connect(dlg.accept)
+        row.addWidget(btn_close)
+        outer.addLayout(row)
+        dlg.exec()
+
+    def _refresh_market_list(self):
+        """按搜索词 + 分类过滤，渲染成一排卡片（默认按分类分组）。"""
+        keyword = str(self.market_search.text() if hasattr(self, "market_search") else "").strip().lower()
+        category = str(getattr(self, "_market_category", "") or "")
+        entries = []
+        for eid, e in self._market_entries.items():
+            if category and str(e.get("category") or "") != category:
+                continue
+            if keyword:
+                haystack = f"{e.get('name') or ''} {e.get('description') or ''} {e.get('id') or ''}".lower()
+                if keyword not in haystack:
+                    continue
+            entries.append((str(eid), e))
+        entries.sort(key=lambda kv: (str(kv[1].get("category") or "未分类"), str(kv[1].get("name") or "")))
+
+        installed = self._installed_ids()
+        self.market_list.clear()
+        grouped = not category and not keyword
+        last_category = None
+        for eid, e in entries:
+            cat = str(e.get("category") or "未分类")
+            if grouped and cat != last_category:
+                last_category = cat
+                header = QWidget()
+                hl = QHBoxLayout(header)
+                hl.setContentsMargins(6, 6, 6, 2)
+                lbl = QLabel(f"{cat} · {sum(1 for _, x in entries if str(x.get('category') or '未分类') == cat)} 个")
+                lbl.setStyleSheet(f"color: {TEXT_3}; font-size: 11.5px;")
+                hl.addWidget(lbl)
+                hl.addStretch(1)
+                hitem = QListWidgetItem()
+                hitem.setFlags(Qt.NoItemFlags)
+                hitem.setSizeHint(header.sizeHint())
+                self.market_list.addItem(hitem)
+                self.market_list.setItemWidget(hitem, header)
+
+            entry_id = str(eid)
+            is_installed = (entry_id.lower() in installed
+                            or str(e.get("name") or "").strip().lower() in installed)
+            item = QListWidgetItem(
+                f"[免费] {e.get('name')}  v{e.get('version')}"
+                f"  [{e.get('category') or '未分类'}]")
+            item.setData(Qt.UserRole, entry_id)
+            tip = str(e.get("description") or "")
+            tip += "\n\n可安装：" + plugin_market.plugin_access(e, self._entitlements)["reason"]
+            item.setToolTip(tip)
+            card = self._market_card(entry_id, e, is_installed)
+            item.setSizeHint(card.sizeHint())
+            self.market_list.addItem(item)
+            self.market_list.setItemWidget(item, card)
+
+    def _refresh_market_tags(self):
+        """把分类做成横排小标签（全部 + 实际存在的分类）。"""
+        while self.market_tags_row.count():
+            item = self.market_tags_row.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        self._market_tags = {}
+        categories = sorted({str(e.get("category") or "未分类")
+                             for e in self._market_entries.values()})
+        for name in [""] + categories:
+            label = "全部" if not name else name
+            btn = QPushButton(label)
+            btn.setObjectName("primary" if name == getattr(self, "_market_category", "") else "ghost")
+            btn.setMinimumHeight(26)
+            btn.clicked.connect(lambda _=False, _c=name: self._pick_market_category(_c))
+            self.market_tags_row.addWidget(btn)
+            self._market_tags[name] = btn
+        self.market_tags_row.addStretch(1)
+
+    def _pick_market_category(self, category: str):
+        self._market_category = str(category or "")
+        self._refresh_market_tags()
+        self._refresh_market_list()
+
 
     def _install_market_plugin(self, eid=None):
         """eid 为空时取列表当前选中项；行内「安装」按钮直接把它自己那条传进来。"""
@@ -782,6 +1123,21 @@ class PluginsPage(QWidget):
         if dlg.changed:
             self.refresh_lists()
 
+    def _open_pack_config(self, pid: str = ""):
+        """插件商店卡片上的「配置」：找到对应的已装包选中，再打开它的配置窗口。"""
+        pid = str(pid or "").strip()
+        if pid:
+            for attempt in range(2):
+                for i in range(self.pack_list.count()):
+                    item = self.pack_list.item(i)
+                    if str(item.data(Qt.UserRole) or "") == pid:
+                        self.pack_list.setCurrentRow(i)
+                        self._config_pack()
+                        return
+                if attempt == 0:
+                    self.refresh_lists()      # 刚装完列表可能还没刷新，刷一次再找
+        self.ctx.show_toast("没找到这个已装插件，点「刷新」看看")
+
     def _config_pack(self):
         pid = self._selected_pack_id()
         if not pid:
@@ -845,7 +1201,7 @@ class PluginsPage(QWidget):
     def _load_nonebot_market(self):
         if not bool(getattr(self.ctx.settings, "developer_mode", False)):
             return
-        self.nb_status.setText("正在连接 NoneBot 官方商店...")
+        self.nb_status.setText("正在连接插件商店...")
         self.btn_nb_search.setEnabled(False)
         self.btn_nb_refresh.setEnabled(False)
         worker = Worker(self)
@@ -868,8 +1224,8 @@ class PluginsPage(QWidget):
             self._nb_loaded = True
         if not self._nb_entries:
             self.nb_status.setText(
-                ("NoneBot 官方商店拉取失败: " + err) if err
-                else "NoneBot 官方商店不可用或暂无内容，可点「刷新」重试")
+                ("插件商店拉取失败: " + err) if err
+                else "插件商店不可用或暂无内容，可点「刷新」重试")
             self.nb_list.clear()
             self._update_nonebot_buttons()
             return
@@ -878,15 +1234,29 @@ class PluginsPage(QWidget):
     def _refresh_nonebot_list(self):
         q = self.nb_search.text().strip()
         entries = nonebot_registry.search_plugins(self._nb_entries, q)
+        # 已装标记：pyproject 记录的商店插件 + src/plugins 目录都算
+        # （2026-10-12：老板装完发现列表里看不出哪个已经装过）。
+        installed = set()
+        try:
+            for name in list_store_plugins(self.ctx.settings):
+                installed.add(str(name).strip().lower())
+            for name in list_local_plugins(self.ctx.settings):
+                installed.add(str(name).strip().lower())
+        except Exception:  # noqa: BLE001
+            pass
         self.nb_list.clear()
         for e in entries:
             ok, hint = nonebot_registry.adapter_compat(e)
             badge = "官方" if e.get("is_official") else "社区"
+            is_installed = str(e.get("module_name") or "").strip().lower() in installed
             item = QListWidgetItem(
                 f"「{e.get('name')}」 v{e.get('version')}  [{badge}] "
-                f"{e.get('project_link')}")
+                f"{e.get('project_link')}"
+                + ("  ✅已安装" if is_installed else ""))
             item.setData(Qt.UserRole, e.get("module_name"))
             tip = str(e.get("desc") or "（无简介）")
+            if is_installed:
+                tip += "\n状态: 已安装（再点「安装」= 覆盖更新）"
             tip += f"\n\n作者: {e.get('author') or '未知'}"
             tip += f"\n主页: {e.get('homepage') or '未提供'}"
             tip += "\n兼容性: " + hint
@@ -913,7 +1283,7 @@ class PluginsPage(QWidget):
     def _install_nonebot_plugin(self):
         item = self.nb_list.currentItem()
         if item is None:
-            QMessageBox.information(self, "提示", "请先选择一个 NoneBot 插件")
+            QMessageBox.information(self, "提示", "请先选择一个插件")
             return
         mod = str(item.data(Qt.UserRole) or "")
         e = next(
@@ -929,13 +1299,13 @@ class PluginsPage(QWidget):
             f"模块名: {mod}",
             "",
             "安装声明：",
-            "· 该插件来自 NoneBot 官方/社区开源商店，未经星群校验。",
+            "· 该插件来自第三方开源商店，未经星群校验。",
             "· 源码、可用性与许可协议（如 MIT / AGPL / GPL）由各自作者负责。",
             "· 星群默认不安装 GPL/AGPL 类插件；商业使用前请自行核对许可证。",
             "· 若协议不兼容或插件未通过官方测试，风险由用户自行承担。",
             "",
             "兼容性: " + hint,
-            "安装后需重启 NoneBot 才生效。是否继续？",
+            "安装后需重启机器人才生效。是否继续？",
         ]
         ret = QMessageBox.warning(
             self, "安装声明", "\n".join(lines),
@@ -1005,6 +1375,13 @@ class PluginsPage(QWidget):
         self.pack_status.setText(
             f"共 {count} 个能力包" if count
             else "还没有装能力包；可在上面的插件商店里挑一个装上。")
+        # 商店卡片上的「✓ 已装」跟着一起刷新（2026-10-12 老板报："装完商店里
+        # 还显示可以安装"）—— 以前装完只刷了下面三个列表，商店卡片要离开页面
+        # 再进来才会变，看起来就像"没装上"。
+        self._refresh_market_list()
+        if getattr(self, "_nb_loaded", False):
+            # NoneBot 商店列表也要跟着标「✅已安装」（装完立刻能看到）
+            self._refresh_nonebot_list()
 
 
 class PackDetailDialog(QDialog):
@@ -1021,14 +1398,25 @@ class PackDetailDialog(QDialog):
         self.detail = detail or {}
         self.changed = False
         self._widgets = {}      # key -> (field, 取值函数)
+        self.range_boxes = {}   # key -> (最小框, 最大框)，区间参数专用
         self.setWindowTitle("能力包详情")
-        self.setMinimumWidth(520)
+        self.setMinimumSize(560, 420)
+        self.resize(680, 640)
         self._build_ui()
 
     def _build_ui(self):
         d = self.detail
-        lay = QVBoxLayout(self)
-        lay.setContentsMargins(24, 24, 24, 24)
+        # 内容放进滚动区：参数多的时候窗口装不下，Qt 会把自动换行的说明文字压扁
+        # （历史反复踩过：文字只显示上半截）。按钮留在下面不跟着滚。
+        root = QVBoxLayout(self)
+        root.setContentsMargins(16, 16, 16, 16)
+        root.setSpacing(10)
+        self.scroll = QScrollArea(self)
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setFrameShape(QFrame.NoFrame)
+        content = QWidget()
+        lay = QVBoxLayout(content)
+        lay.setContentsMargins(8, 8, 8, 8)
         lay.setSpacing(16)
 
         head = QHBoxLayout()
@@ -1064,35 +1452,63 @@ class PackDetailDialog(QDialog):
                 lay.addWidget(line)
 
         fields = d.get("fields") or []
-        pl = QLabel("参数")
-        pl.setObjectName("sectionTitle")
-        lay.addWidget(pl)
         if not fields:
+            pl = QLabel("参数")
+            pl.setObjectName("sectionTitle")
+            lay.addWidget(pl)
             none = QLabel("这个能力包没有可调参数，装上即用。")
             none.setWordWrap(True)
             none.setStyleSheet(f"color: {TEXT_3}; font-size: 12px;")
             lay.addWidget(none)
         else:
-            form = QFormLayout()
-            form.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
-            form.setHorizontalSpacing(12)
-            form.setVerticalSpacing(8)
+            # 参数区做成一张玻璃卡片：和页面里的卡片同一套边距/间距，弹窗里也不出戏
+            card = GlassPanel(strong=True)
+            cv = QVBoxLayout(card)
+            cv.setContentsMargins(16, 14, 16, 16)
+            cv.setSpacing(10)
+            pl = QLabel("参数")
+            pl.setObjectName("sectionTitle")
+            cv.addWidget(pl)
+            cv.addWidget(self._param_note())
+            # 参数一块一块竖着排：名字独占一行（自动换行、要多少高给多少高），
+            # 下面才是输入框，再下面是那句说明。
+            # 以前用 QFormLayout 把名字塞在左列：中文名一换行就被压成一行高，
+            # 直接和输入框叠在一起（2026-10-01 老板截图：文字/数字糊成一团）。
+            rows = QVBoxLayout()
+            rows.setSpacing(14)
             values = d.get("values") or {}
             for field in fields:
                 key = str(field.get("key") or "")
                 if not key:
                     continue
+                block = QWidget()
+                bv = QVBoxLayout(block)
+                bv.setContentsMargins(0, 0, 0, 0)
+                bv.setSpacing(4)
+                name = QLabel(self._field_label(field))
+                name.setWordWrap(True)
+                name.setStyleSheet("font-size: 12.5px;")
+                # 英文 key 只留给排查用：鼠标停在参数名上就能看到，界面正文不出现
+                name.setToolTip(f"参数 key（内部标识）：{key}")
+                bv.addWidget(name)
+
+                value_row = QHBoxLayout()
+                value_row.setContentsMargins(0, 0, 0, 0)
+                value_row.setSpacing(8)
                 widget = self._make_widget(field, values.get(key, field.get("default")))
-                label = str(field.get("label") or key)
-                if field.get("unit"):
-                    label += f"（{field['unit']}）"
-                form.addRow(QLabel(label), widget)
-                if field.get("help"):
-                    hint = QLabel(str(field["help"]))
-                    hint.setWordWrap(True)
-                    hint.setStyleSheet(f"color: {TEXT_3}; font-size: 12px;")
-                    form.addRow(QLabel(""), hint)
-            lay.addLayout(form)
+                value_row.addWidget(widget)
+                value_row.addStretch(1)
+                bv.addLayout(value_row)
+
+                hint = self._field_hint(field)
+                if hint:
+                    hint_lbl = QLabel(hint)
+                    hint_lbl.setWordWrap(True)
+                    hint_lbl.setStyleSheet(f"color: {TEXT_3}; font-size: 12px;")
+                    bv.addWidget(hint_lbl)
+                rows.addWidget(block)
+            cv.addLayout(rows)
+            lay.addWidget(card)
 
         row = QHBoxLayout()
         row.addStretch(1)
@@ -1105,7 +1521,35 @@ class PackDetailDialog(QDialog):
         self.btn_save.setEnabled(bool(fields))
         self.btn_save.clicked.connect(self._save)
         row.addWidget(self.btn_save)
-        lay.addLayout(row)
+        self.scroll.setWidget(content)
+        root.addWidget(self.scroll, 1)
+        root.addLayout(row)
+
+    @staticmethod
+    def _param_note() -> QLabel:
+        """参数区顶部那句说明：中文名 + 范围，英文 key 只在悬停提示里。"""
+        note = QLabel("中文名后面括号是单位，按范围填写即可。")
+        note.setWordWrap(True)
+        note.setStyleSheet(f"color: {TEXT_3}; font-size: 12px;")
+        return note
+
+    @staticmethod
+    def _field_label(field: dict) -> str:
+        """参数名：中文名 +（单位）+，可填范围 a–b（都跟着 schema 走，界面不写死）。"""
+        key = str(field.get("key") or "")
+        label = str(field.get("label") or key)
+        unit = str(field.get("unit") or "")
+        if unit and unit not in label:
+            label += f"（{unit}）"
+        hint = tool_packs.range_hint(field)
+        if hint:
+            label += f"，{hint}"
+        return label
+
+    @staticmethod
+    def _field_hint(field: dict) -> str:
+        """参数下面那行人话说明（映射表里带的）。"""
+        return str(field.get("help") or "").strip()
 
     def _make_widget(self, field: dict, value):
         """按 schema 的 type 造控件，并记住「怎么取值」。"""
@@ -1116,6 +1560,8 @@ class PackDetailDialog(QDialog):
             box.setChecked(bool(value))
             self._widgets[key] = (field, box.isChecked)
             return box
+        if ftype == "range":
+            return self._make_range_widget(field, value)
         if ftype == "number":
             step = float(field.get("step") or 1)
             integer = step >= 1 and float(value or 0) == int(float(value or 0))
@@ -1144,6 +1590,42 @@ class PackDetailDialog(QDialog):
         self._widgets[key] = (field, edit.text)
         return edit
 
+    def _make_range_widget(self, field: dict, value):
+        """区间参数（例如「忙很久的回复间隔 180~900 秒」）：两个数字框 + 中间一个 ~。
+
+        取值给回 [最小, 最大] 这种列表 —— 和能力包 manifest 里的默认值同一种写法；
+        校验（不能反着填、不能超出范围）交给 core.tool_packs.coerce_field 统一做。
+        """
+        key = str(field.get("key"))
+        lo, hi = tool_packs.split_range(value, field)
+        step = float(field.get("step") or 1)
+        integer = step >= 1
+        low = float(field.get("min", 0))
+        high = float(field.get("max", 10 ** 9))
+
+        def make_box(v):
+            box = QSpinBox() if integer else QDoubleSpinBox()
+            box.setRange(int(low) if integer else low, int(high) if integer else high)
+            box.setSingleStep(int(step) if integer else step)
+            box.setValue(int(v) if integer else float(v))
+            box.setMinimumWidth(84)
+            return box
+
+        wrap = QWidget()
+        row = QHBoxLayout(wrap)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(6)
+        box_lo, box_hi = make_box(lo), make_box(hi)
+        row.addWidget(box_lo)
+        sep = QLabel("~")
+        sep.setStyleSheet(f"color: {TEXT_3}; font-size: 12px;")
+        row.addWidget(sep)
+        row.addWidget(box_hi)
+        row.addStretch(1)
+        self._widgets[key] = (field, lambda: [box_lo.value(), box_hi.value()])
+        self.range_boxes[key] = (box_lo, box_hi)   # 测试/后续联动要用到这两个框
+        return wrap
+
     def _save(self):
         patch = {key: getter() for key, (_f, getter) in self._widgets.items()}
         try:
@@ -1170,8 +1652,7 @@ class QWeatherConfigDialog(QDialog):
         lay = QVBoxLayout(self)
         lay.setContentsMargins(24, 24, 24, 24)
         lay.setSpacing(12)
-        tip = QLabel("步骤：① 生成密钥对 → ② 把公钥粘贴到和风控制台创建 JWT 凭据 → "
-                     "③ 填项目ID/凭据ID → ④ 保存并重启机器人。")
+        tip = QLabel("按下方的 6 步在控制台操作。")
         tip.setWordWrap(True)
         tip.setStyleSheet(f"color: {TEXT_3}; font-size: 12px;")
         lay.addWidget(tip)
@@ -1179,7 +1660,7 @@ class QWeatherConfigDialog(QDialog):
         r0 = QHBoxLayout()
         r0.addWidget(QLabel("API Host"))
         self.edit_host = QLineEdit(str(cfg.get("api_host") or ""))
-        self.edit_host.setPlaceholderText("控制台-设置里的专属 API Host，如 xxx.qweatherapi.com")
+        self.edit_host.setPlaceholderText("如 xxx.qweatherapi.com")
         r0.addWidget(self.edit_host, 1)
         lay.addLayout(r0)
 
@@ -1213,11 +1694,10 @@ class QWeatherConfigDialog(QDialog):
         lay.addWidget(self.pub_box)
 
         steps = QLabel(
-            "控制台操作：\n"
-            "1. 控制台 → 设置 → 复制「API Host」填到最上面（如 xxx.qweatherapi.com）\n"
-            "2. 控制台 → 项目管理 → 点进你的项目，记下项目ID\n"
-            "3. 添加凭据 → 身份认证方式选「JSON Web Token」\n"
-            "4. 把上面公钥整段（含 BEGIN/END 行）粘贴进去 → 保存\n"
+            "1. 控制台 → 设置 → 复制「API Host」填到最上面\n"
+            "2. 控制台 → 项目管理 → 记下项目ID\n"
+            "3. 添加凭据 → 身份认证选「JSON Web Token」\n"
+            "4. 公钥整段（含 BEGIN/END 行）粘贴进去 → 保存\n"
             "5. 保存后显示的「凭据 ID」填到凭据ID框\n"
             "6. 点「保存配置」，然后重启机器人")
         steps.setWordWrap(True)

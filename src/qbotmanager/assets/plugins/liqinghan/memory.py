@@ -103,20 +103,71 @@ class Store:
         self.db = sqlite3.connect(path, check_same_thread=False)
         self.db.row_factory = sqlite3.Row
         self.db.executescript(SCHEMA)
+        self._ensure_columns()
         self.db.commit()
 
+    def _ensure_columns(self):
+        """老库补列（2026-10-15 加的 `users.source`）。
+
+        为什么要记这个人来自哪条通道：内置记忆库的 key 形态是 `平台:ID`
+        （和 ai 插件 / 身份绑定同一套），而李清菡这边通道信息只在消息里出现。
+        以前一律按 QQ 号补 `qq:` 前缀 —— 官方通道给的是 **openid**、微信给的是
+        **微信 id**，于是全被写成 `qq:<那串 id>`，和 ai 插件的
+        `qq_official:<openid>` / `wechat:<id>` 对不上：同一个人的记忆在两个框架里
+        各存一份，绑定身份也串不起来。
+        """
+        try:
+            cols = {r["name"] for r in self.db.execute("PRAGMA table_info(users)")}
+        except sqlite3.Error:
+            self._has_source = False
+            return
+        self._has_source = "source" in cols
+        if not self._has_source:
+            try:
+                self.db.execute("ALTER TABLE users ADD COLUMN source TEXT DEFAULT ''")
+                self._has_source = True
+            except sqlite3.Error:
+                self._has_source = False   # 补列失败就照老写法走，别把消息处理拖崩
+
     # ---- 用户档案 ----
-    def touch_user(self, qq, nickname=""):
+    def touch_user(self, qq, nickname="", source=""):
         now = int(time.time())
+        if not getattr(self, "_has_source", False):
+            self.db.execute(
+                "INSERT INTO users(qq, nickname, first_seen, last_seen, msg_count) "
+                "VALUES(?,?,?,?,1) "
+                "ON CONFLICT(qq) DO UPDATE SET last_seen=excluded.last_seen, "
+                "msg_count=msg_count+1, "
+                "nickname=CASE WHEN ?<>'' THEN ? ELSE nickname END",
+                (qq, nickname, now, now, nickname, nickname),
+            )
+            self.db.commit()
+            return
         self.db.execute(
-            "INSERT INTO users(qq, nickname, first_seen, last_seen, msg_count) "
-            "VALUES(?,?,?,?,1) "
+            "INSERT INTO users(qq, nickname, first_seen, last_seen, msg_count, source) "
+            "VALUES(?,?,?,?,1,?) "
             "ON CONFLICT(qq) DO UPDATE SET last_seen=excluded.last_seen, "
             "msg_count=msg_count+1, "
-            "nickname=CASE WHEN ?<>'' THEN ? ELSE nickname END",
-            (qq, nickname, now, now, nickname, nickname),
+            "nickname=CASE WHEN ?<>'' THEN ? ELSE nickname END, "
+            "source=CASE WHEN ?<>'' THEN ? ELSE source END",
+            (qq, nickname, now, now, source, nickname, nickname, source, source),
         )
         self.db.commit()
+
+    def user_source(self, qq):
+        """这个人最近一次说话来自哪条通道（`qq:group` / `qq_official:c2c` / `wechat:private`）。"""
+        if not getattr(self, "_has_source", False):
+            return ""
+        try:
+            row = self.db.execute("SELECT source FROM users WHERE qq=?", (qq,)).fetchone()
+        except sqlite3.Error:
+            return ""
+        if not row:
+            return ""
+        try:
+            return str(row["source"] or "")
+        except (IndexError, KeyError, TypeError):
+            return ""
 
     def get_user(self, qq):
         return self.db.execute("SELECT * FROM users WHERE qq=?", (qq,)).fetchone()
@@ -325,7 +376,10 @@ class Store:
 
     def remember_if_new(self, qq, fact):
         """去重后写入记忆：与已有记忆高度重复就跳过。返回是否写入"""
-        fact = fact.strip().strip("。.!！~～")
+        # 2026-10-16（对抗性复核 E）：写得进库的东西都会**原样进系统提示** ——
+        # 先把空白（含换行）折成一个空格，别给提示注入留后门（老装机回退路径）。
+        import re as _re
+        fact = _re.sub(r"\s+", " ", str(fact or "")).strip().strip("。.!！~～")
         fact = fact[:200]
         if len(fact) < 4:
             return False

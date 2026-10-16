@@ -38,7 +38,9 @@ PRIVATE_RE = re.compile(
     r"tools/verify_recovered\.py|"
     r"tools/server_brand_rename\.sh|tools/spawn_deploy\.py|tools/video_patch\.py|"
     r"tools/strip_meta\.py|tools/rebuild_zips\.py|tools/assemble_dist\.py|"
-    r"tools/build_linux_package\.py|tools/build_nuitka_linux\.sh"
+    r"tools/build_linux_package\.py|tools/build_nuitka_linux\.sh|"
+    # 2026-10-16：本机一次性脚本（内含真实 API key / 个人目录），不进公开树
+    r"tools/apply_deepseek_key_and_codex_window\.py|tools/scan_api_keys\.py"
     r")"
 )
 
@@ -83,13 +85,15 @@ def guard_patterns():
 
 
 CONSOLE_KEEP_TOP = ("index.html", "vite.config.js", "package.json")
-CONSOLE_SKIP_NAME = ("node_modules", "__pycache__", ".vite")
+# `_shots` 是老板本机拍界面截图的辅助脚本（里面写着本机个人目录路径），
+# 2026-10-16 起从公开树里排除。
+CONSOLE_SKIP_NAME = ("node_modules", "__pycache__", ".vite", "_shots")
 
 
 def copy_console(src: Path, out: Path) -> int:
     """把网页控制台前端源码（Linux 无头版的网页界面）拷进公开树。
 
-    控制台的规范源码在官网仓库（QBotManager_website/console），这里只做同步，
+    控制台的规范源码在 D:/ai/AstroSwarm-public/console（官网仓库里 9/30 那份旧副本已删，别再往回找），这里只做同步，
     不改变它的归属；没找到就跳过并提示，不阻塞导出。
     """
     if not src.is_dir():
@@ -123,7 +127,7 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="导出可以公开的源码树")
     ap.add_argument("out", nargs="?", default=str(REPO / "build" / "public-src"))
     ap.add_argument("--console-src", default=str(REPO.parent / "QBotManager_website" / "console"),
-                    help="网页控制台前端源码目录（默认取仓库同级的 QBotManager_website/console）")
+                    help="网页控制台前端源码目录（默认 D:/ai/AstroSwarm-public/console）")
     args = ap.parse_args()
     out = Path(args.out).resolve()
     if out.exists():

@@ -20,6 +20,7 @@ failed = False
 for script in ("test_core.py", "test_agent_profile.py", "test_plugin_market.py",
                "test_tool_packs.py", "test_cleanup.py",
                "test_liqinghan_plugin.py", "test_chat_archive.py",
+               "test_updater.py",
                "test_persona_workshop.py", "test_knowledge_base.py",
                "test_ui_smoke.py", "test_press_scale.py"):
     path = root / "tests" / script

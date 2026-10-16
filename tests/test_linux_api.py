@@ -89,8 +89,10 @@ def test_auth_login_and_feature_gate(tmp_path, monkeypatch):
     gate = client.get("/api/auth/status", headers=hdr).json()
     # 关键回归：光有 plan 字符串**不算**付费权益 —— feature_gate 现在必须验签名。
     # 这个假登录没有服务器签名，所以 full 必须是 False（以前只看本地 JSON，改一行 plan 就解锁）。
+    # 微信通道自 2026-10-01 起免费开放，所以 member 恒为 True（与签名无关）。
     assert gate["full"] is False, gate
-    assert "签名" in str(gate.get("reason") or ""), gate
+    assert gate["member"] is True, gate
+    assert "免费开放" in str(gate.get("reason") or ""), gate
     # 补一个真签名后应当解锁（用账号服务的同一套规范文本）
     from qbotmanager.core.license import entitlement_payload
     from nacl.signing import SigningKey
@@ -229,8 +231,16 @@ def test_ai_personality_get_and_put(monkeypatch):
     res = client.put("/api/ai/personality", headers=headers, json={"personality": "新人格"})
     assert res.status_code == 200 and res.json()["needs_restart"] is True
     assert calls["text"] == "新人格"
-    res = client.put("/api/ai/personality", headers=headers, json={"personality": "x" * 2001})
+    # 上限 20000（旧值 2000 会把长人设卡死：EVA 那类人设正文接近 2300 字，
+    # 桌面端与插件侧 tools_bridge._TEXT_LIMIT 都是 20000，控制台必须对齐）。
+    res = client.put("/api/ai/personality", headers=headers, json={"personality": "x" * 19999})
+    assert res.status_code == 200, res.text
+    assert calls["text"] == "x" * 19999
+    res = client.put("/api/ai/personality", headers=headers, json={"personality": "x" * 20000})
+    assert res.status_code == 200, res.text
+    res = client.put("/api/ai/personality", headers=headers, json={"personality": "x" * 20001})
     assert res.status_code == 400
+    assert "20000" in res.json()["detail"], res.json()["detail"]
 
 
 def test_logs_tail(tmp_path):
@@ -323,7 +333,8 @@ def test_auth_status_exposes_member_and_all_plugins(tmp_path, monkeypatch):
     body = res.json()
     assert body["member"] is True
     assert body["full"] is False and body["all_plugins"] is False
-    assert body["reason"] == ""                    # 是会员，不该给「免费版」的理由
+    # 微信免费开放后，reason 统一是一句说明（不再是空的"是会员"分支）
+    assert "免费开放" in body["reason"], body
 
     # 永久档：三个字段全 True（生产库现有 4 个 permanent 账号必须完全不受影响）
     cfg = headless_config.load()
@@ -341,7 +352,8 @@ def test_auth_status_anonymous_has_the_same_fields(tmp_path, monkeypatch):
     assert body["logged_in"] is False
 
 
-def test_feature_gate_never_claims_member_for_free_or_trial(tmp_path, monkeypatch):
+def test_feature_gate_never_claims_full_for_free_or_trial(tmp_path, monkeypatch):
+    """免费/试用/过期档：full 一律 False；微信通道已免费开放，member 恒为 True。"""
     headers = _auth(monkeypatch, tmp_path)
     monkeypatch.setattr(auth, "verify_entitlement", lambda c=None: True)
     for plan in ("none", "", "trial", "bogus"):
@@ -349,13 +361,15 @@ def test_feature_gate_never_claims_member_for_free_or_trial(tmp_path, monkeypatc
         cfg.update({"plan": plan, "plan_expires_at": 9999999999})
         headless_config.save(cfg)
         body = client.get("/api/auth/status", headers=headers).json()
-        assert body["member"] is False, (plan, body)
+        assert body["full"] is False, (plan, body)
+        assert body["member"] is True, (plan, body)
         assert body["reason"], (plan, body)
-    # 过期的月费档同样不算会员
+    # 过期的月费档同样只有 full 掉，微信通道不受影响
     cfg = headless_config.load()
     cfg.update({"plan": "monthly", "plan_expires_at": 1000})
     headless_config.save(cfg)
-    assert client.get("/api/auth/status", headers=headers).json()["member"] is False
+    body = client.get("/api/auth/status", headers=headers).json()
+    assert body["full"] is False and body["member"] is True, body
 
 
 def test_plugins_list(monkeypatch):

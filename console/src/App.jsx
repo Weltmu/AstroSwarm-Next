@@ -1,12 +1,41 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { apiUrl, authUrl, get, post, put } from './api.js';
+import { apiErrText, apiUrl, authUrl, get, post, put,
+  clearConsoleToken, isConsoleLocked, setConsoleLockedHandler } from './api.js';
 import MemoryTimeline from './MemoryTimeline.jsx';
 import KnowledgeBase from './KnowledgeBase.jsx';
-import { RecentMessages, StatsPanel } from './BrainStats.jsx';
+import { RecentMessages, StatsPanel, TodayStats } from './BrainStats.jsx';
+import AccountAvatar from './AccountAvatar.jsx';
+import AccountProfileBlock from './AccountProfileBlock.jsx';
+import BotAiCard from './BotAiCard.jsx';
+import WorkshopPage from './WorkshopPage.jsx';
+import ConsolePasswordCard from './ConsolePasswordCard.jsx';
+import { setupSteps } from './SetupSteps.jsx';
+import { ADVANCED_PAGES, NAV_GROUPS } from './nav.js';
+import { versionLabel } from './version.js';
+import { setIdea } from './workshopIdea.js';
+import { ensureProfile, setAccountExpiredHandler, useProfile, useProfileAutoSync } from './profile.js';
+import QqChannelCard from './QqChannelCard.jsx';
+import QqOfficialCard from './QqOfficialCard.jsx';
+import FeishuCard, { feishuBadge } from './FeishuCard.jsx';
+import TelegramCard from './TelegramCard.jsx';
+import LogRetention from './LogRetention.jsx';
+import LoginBanner from './LoginBanner.jsx';
+import ConsoleLogin from './ConsoleLogin.jsx';
+import LoginModal, { LoginForm } from './LoginModal.jsx';
+/* 统一控件库（2026-10-12 老板要求：开关不像 iOS、数值太乱、按钮要胶囊）
+   —— 全部零依赖，纯 React + 原生 CSS，见 src/components/ 与 src/components.css */
+import Toggle, { ToggleRow } from './components/Toggle.jsx';
+import PillButton from './components/PillButton.jsx';
+import Collapse from './components/Collapse.jsx';
+import NumberField from './components/NumberField.jsx';
+import MarketPanel from './MarketPanel.jsx';
+import MachineCapabilities from './MachineCapabilities.jsx';
 import ZipInstall from './ZipInstall.jsx';
 import {
   APPEARANCE_DEFAULTS,
   applyAppearance,
+  appearanceFromServer,
+  appearanceToServer,
   isVideoPath,
   loadAppearance,
   saveAppearance,
@@ -61,6 +90,12 @@ const ICONS = {
   puzzle: [
     'M9.6 4a2.4 2.4 0 0 1 4.8 0H19a1 1 0 0 1 1 1v4.6a2.4 2.4 0 0 0 0 4.8V19a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1v-4.6a2.4 2.4 0 0 0 0-4.8V5a1 1 0 0 1 1-1h4.6Z',
   ],
+  /* sparkle：四角星 + 一颗小星（工坊：让 AI 生成东西）。与其它图标同规格：
+     24×24、stroke 1.5、round、fill:none、currentColor。 */
+  sparkle: [
+    'M11 3.5 12.6 8.4 17.5 10 12.6 11.6 11 16.5 9.4 11.6 4.5 10 9.4 8.4 11 3.5Z',
+    'M17.6 15.2 18.4 17.6 20.8 18.4 18.4 19.2 17.6 21.6 16.8 19.2 14.4 18.4 16.8 17.6 17.6 15.2Z',
+  ],
   server: [
     'M5 4.5h14A1.5 1.5 0 0 1 20.5 6v2.5a1.5 1.5 0 0 1-1.5 1.5H5A1.5 1.5 0 0 1 3.5 8.5V6A1.5 1.5 0 0 1 5 4.5Z',
     'M5 14.5h14a1.5 1.5 0 0 1 1.5 1.5v2.5a1.5 1.5 0 0 1-1.5 1.5H5A1.5 1.5 0 0 1 3.5 18.5V16A1.5 1.5 0 0 1 5 14.5Z',
@@ -77,14 +112,6 @@ const ICONS = {
     'M20 8.4 12 4 4 8.4v7.2L12 20l8-4.4V8.4Z',
     'M4 8.4 12 12.8l8-4.4',
     'M12 12.8V20',
-  ],
-  wand: [
-    'M4.5 19.5 14.5 9.5',
-    'M14 5.5 18.5 10',
-    'M18 2.6 18 5.4',
-    'M20.7 4 17.9 4',
-    'M9 2.6 9 5.4',
-    'M10.4 4 7.6 4',
   ],
   terminal: [
     'M5 4h14a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2Z',
@@ -117,7 +144,9 @@ const ICONS = {
   check: ['M4.5 12.5 9.6 17.6 19.5 6.6'],
 };
 
-const APP_VERSION = '1.1.0';
+/* 页面右上角的版本号：从 GET /api/status 现取（Linux 无头端自己的版本，0.x 那一串），
+   取不到再看 /api/config，两处都没有就写「版本读取中」。
+   逻辑在 version.js 里（冒烟要直接 import 它，见 _smoke/smoke.jsx）。 */
 
 /* ---------------------------------------------------------------- 依赖任务
    后台扫描 / 安装由无头端的 console_ext 跑在子线程里（一个请求挂几十秒会被 nginx 掐），
@@ -162,21 +191,46 @@ async function runDeps(kind, onStatus) {
   }
   throw new Error('依赖任务超时（超过 6 分钟）');
 }
-const ACTIVATE_URL = 'https://astroswarm.cn/account.html';
+/* ── 权益字段（后端 /api/auth/status 与 /api/plugins/entitlement）────
+     member      = 账号档位（月费 / 季费 / 年费 / 永久都算）
+     all_plugins = 历史字段（能力包已全部免费，运行时不再按它放行）
+     full        = 旧字段，语义已收窄成「解锁全部付费包」= all_plugins，保留兼容旧后端
 
-/* ── 权益判定的唯一口径────────
-   后端 /api/auth/status 与 /api/plugins/entitlement 回三个字段：
-     member      = 档位有效且未过期（微信通道看它）
-     all_plugins = 历史字段（能力包已全部免费开源，运行时不再按它放行）
-     full        = 旧字段 = all_plugins，保留兼容旧后端
-
-   判定集中在下面两个小函数里，别在页面里直接读 auth.full，
-   否则会出现「后端已经开通、界面显示未开通」的显示错。 */
+   2026-10-01 起：**插件、能力包、微信通道全部免费**，前端不再用这些字段决定
+   "某个功能能不能用"，只拿 plan 在账号卡片上显示一个档位名字。
+   判「登录了没有」一律看 auth.email —— 不要再用 member / full 当功能开关。 */
 const isMember = (a) => Boolean(a?.member) || Boolean(a?.all_plugins) || Boolean(a?.full);
 const isFull = (a) => Boolean(a?.all_plugins) || Boolean(a?.full);
 
-/** 写剪贴板：clipboard API 在非安全上下文（http 且非 localhost）不可用，兜底用 execCommand。 */
-async function copyToClipboard(text) {
+/* ── 「登录后才有真值」的两个显示助手（2026-10-07 老板报的 bug）─────────────
+   老板原话："换浏览器会出现先前配置归 0……有的页面甚至把默认值当成已配置，属于误导"。
+   机理：/api/config 要登录才给，未登录时 config 是 null，而这些地方原来写的是
+   `config?.bot_port || health?.bot_port || 12113` —— 于是**未登录的界面顶着
+   一个像模像样的端口号**，用户以为那就是他的配置。
+
+   规矩（两条）：能读到服务器值 → 显示真值；读不到 → 显示「登录后显示」，
+   绝不摆一个默认值冒充真值。端口这种"看起来像真的"的数字尤其不能编。 */
+const NEED_LOGIN = '登录后显示';
+
+/** 端口：只有拿到 config/health 里的值才显示数字，否则如实说"登录后显示"。 */
+function portText(config, health) {
+  const p = config?.bot_port ?? health?.bot_port;
+  return (p === 0 || p) ? String(p) : NEED_LOGIN;
+}
+
+/** 某个配置项是"已配置 / 未配置"：没登录就没有资格下这个结论 —— 说"登录后显示"。 */
+function configuredText(loggedIn, value) {
+  if (!loggedIn) return NEED_LOGIN;
+  return String(value || '').trim() ? '已配置' : '未配置';
+}
+
+/** 某个配置项的字面值；没登录时同样不摆空值（空值会被读成"我没填"）。 */
+function configText(loggedIn, value, fallback = '未填') {
+  if (!loggedIn) return NEED_LOGIN;
+  return String(value || '').trim() || fallback;
+}
+
+/** 写剪贴板：clipboard API 在非安全上下文（http 且非 localhost）不可用，兜底用 execCommand。 */async function copyToClipboard(text) {
   if (navigator.clipboard && navigator.clipboard.writeText) {
     await navigator.clipboard.writeText(text);
     return;
@@ -227,38 +281,7 @@ async function pluginsDirPath() {
    图标语义一一对应、互不重复：首页 home / 接入 plug（多通道合并页，不再用微信图标）
    / AI 大脑 brain / 插件管理 puzzle / 全局管理 server（服务与进程）/ 消息中心 chat
    / 日志 file-text（文档，不再和全局管理共用 terminal）/ 依赖 package / 设置 gear。 */
-const NAV_GROUPS = [
-  {
-    id: 'run',
-    title: '运行',
-    items: [
-      ['home', '首页', 'home'],
-      ['access', '接入', 'plug'],
-    ],
-  },
-  {
-    id: 'skill',
-    title: '能力',
-    items: [
-      ['brain', 'AI 大脑', 'brain'],
-      ['plugins', '插件管理', 'puzzle'],
-      ['workshop', '插件工坊', 'wand'],
-    ],
-  },
-  {
-    id: 'sys',
-    title: '系统',
-    items: [
-      ['services', '全局管理', 'server'],
-      ['messages', '消息中心', 'chat'],
-      ['logs', '日志', 'file-text'],
-      ['deps', '依赖', 'package'],
-      ['settings', '设置', 'gear'],
-    ],
-  },
-];
-// 桌面端 ADVANCED_PAGES：小白模式（默认开启）下隐藏这些入口，可在「设置」里关掉
-const ADVANCED_PAGES = ['messages', 'plugins', 'workshop', 'logs', 'deps'];
+/* 导航结构（4 组）在 nav.js 里 —— 与桌面端一一对应，测试直接读那份。 */
 const BEGINNER_KEY = 'as_beginner_mode';
 
 /* UI v2 重排后，styles.css 自动区那批「按页钉死」的定位规则（.page > section:nth-child(n) …）
@@ -269,6 +292,7 @@ const PAGE_KEY = {
   access: 'access-v2',
   services: 'services-v2',
   plugins: 'plugins-v2',
+  workshop: 'workshop-v2',
   settings: 'settings-v2',
 };
 
@@ -335,245 +359,11 @@ function Field({ label, children }) {
   );
 }
 
-/* 插件工坊：说需求 → AI 写插件 → 自动检查 + 沙箱试跑 → 装进机器人。
-   还能导出 / 导入插件包、按运行期真实报错让 AI 修一版、上传到官网等站长审核。
-   后台接口都在 /api/workshop/*；生成模型必须是强模型，跟「AI 大脑」完全分开。 */
-function Workshop() {
-  const [status, setStatus] = useState(null);
-  const [errors, setErrors] = useState([]);
-  const [account, setAccount] = useState({ email: '', logged_in: false });
-  const [subs, setSubs] = useState([]);
-  const [need, setNeed] = useState('');
-  const [busy, setBusy] = useState('');
-  const [msg, setMsg] = useState('');
-  const [plan, setPlan] = useState(null);
-  const [result, setResult] = useState(null);
-  const [built, setBuilt] = useState(null);
-  const [cfg, setCfg] = useState({ provider: 'deepseek', api_key: '', model: '', api_url: '' });
-  const [login, setLogin] = useState({ email: '', password: '' });
-  const fileRef = useRef(null);
-
-  const load = useCallback(async () => {
-    try {
-      const st = await get('/api/workshop/status');
-      setStatus(st);
-      setCfg((c) => ({ ...c, provider: st.provider || c.provider, model: st.model || c.model }));
-    } catch (e) {
-      setMsg(e.message);
-    }
-    try { setErrors((await get('/api/workshop/errors')).errors || []); } catch (e) { /* 忽略 */ }
-    try { setAccount(await get('/api/workshop/account')); } catch (e) { /* 忽略 */ }
-    try { setSubs((await get('/api/workshop/submissions')).submissions || []); } catch (e) { /* 忽略 */ }
-  }, []);
-
-  useEffect(() => { load(); }, [load]);
-
-  const run = async (tag, fn) => {
-    setBusy(tag);
-    setMsg('');
-    try {
-      return await fn();
-    } catch (e) {
-      setMsg(e.message);
-      return null;
-    } finally {
-      setBusy('');
-    }
-  };
-
-  const saveCfg = () => run('cfg', async () => {
-    const st = await put('/api/workshop/config', cfg);
-    setStatus(st);
-    setCfg((c) => ({ ...c, api_key: '' }));
-    setMsg('生成模型存好了：' + (st.provider_name || '') + ' · ' + (st.model || ''));
-  });
-
-  const doBuild = () => run('build', async () => {
-    if (!need.trim()) { setMsg('先说说你想要什么功能。'); return; }
-    const out = await post('/api/workshop/build', { need: need.trim() });
-    setPlan(out.plan || null);
-    setResult(out);
-    setBuilt(out.ok ? out : null);
-    setMsg(out.ok ? '写好了，检查 + 沙箱试跑全过，点「安装到机器人」。'
-      : '这次没过检查，看下面的问题，改改需求描述再试。');
-    await load();
-  });
-
-  const doInstall = () => run('install', async () => {
-    if (!built || !built.build_id) return;
-    const out = await post('/api/workshop/install', { build_id: built.build_id });
-    setBuilt(null);
-    setMsg('装好了：' + out.id + '。重启一下机器人就生效。');
-    await load();
-  });
-
-  const doRepair = (pid) => run('repair:' + pid, async () => {
-    const out = await post('/api/workshop/repair', { id: pid });
-    setPlan(out.plan || null);
-    setResult(out);
-    setBuilt(out.ok ? out : null);
-    setMsg(out.ok ? '按真实报错改好了一版，点「安装到机器人」换上（旧版本留着，可换回来）。'
-      : '改完还是没过检查。');
-    await load();
-  });
-
-  const doExport = (pid) => run('export:' + pid, async () => {
-    const out = await post('/api/workshop/export', { id: pid });
-    setMsg('导出好了：' + out.path + '（' + out.files + ' 个文件）');
-  });
-
-  const doUpload = (pid) => run('upload:' + pid, async () => {
-    const out = await post('/api/workshop/upload', { id: pid, note: '' });
-    setMsg('已交给站长审核（编号 #' + out.id + '）。通过后会进插件市场。');
-    await load();
-  });
-
-  const doImport = () => run('import', async () => {
-    const file = fileRef.current && fileRef.current.files && fileRef.current.files[0];
-    if (!file) { setMsg('先选一个插件 zip。'); return; }
-    const b64 = await new Promise((resolve, reject) => {
-      const reader = new FileReader();
-      reader.onload = () => resolve(String(reader.result).split(',', 2)[1] || '');
-      reader.onerror = () => reject(new Error('读文件失败'));
-      reader.readAsDataURL(file);
-    });
-    const out = await post('/api/workshop/import', { zip_b64: b64, filename: file.name });
-    setMsg('插件包装好了：' + (out.name || out.id) + '。重启机器人后生效。');
-    if (fileRef.current) fileRef.current.value = '';
-    await load();
-  });
-
-  const doLogin = () => run('login', async () => {
-    if (!login.email || !login.password) { setMsg('邮箱和密码都要填。'); return; }
-    await post('/api/workshop/account', login);
-    setLogin({ email: '', password: '' });
-    setMsg('星群账号登录成功，现在可以上传插件了。');
-    await load();
-  });
-
-  const errOf = (pid) => errors.find((e) => e.id === pid);
-  const installed = (status && status.installed) || [];
-
-  return (
-    <>
-      <div className="page-head">
-        <h1>插件工坊</h1>
-        <p>
-          用大白话给机器人加功能：AI 写插件 → 自动检查 → 沙箱试跑 → 一键安装。
-          生成用的模型必须是有编码能力的强模型，跟「AI 大脑」分开配。
-        </p>
-      </div>
-
-      {msg && <p className="card__note" style={{ marginBottom: 12 }}>{msg}</p>}
-
-      <Group title="生成模型" desc={status ? (status.why || '') : '读取中…'}>
-        <div className="field">
-          <label>服务商</label>
-          <select
-            className="p-select"
-            value={cfg.provider}
-            onChange={(e) => {
-              const p = (status?.providers || []).find((x) => x.key === e.target.value);
-              setCfg((c) => ({ ...c, provider: e.target.value, model: p ? p.model : c.model, api_url: p ? p.url : c.api_url }));
-            }}
-          >
-            {((status && status.providers) || [{ key: 'deepseek', name: 'DeepSeek' }]).map((p) => (
-              <option key={p.key} value={p.key}>{p.name}</option>
-            ))}
-          </select>
-        </div>
-        <div className="field">
-          <label>模型名</label>
-          <input value={cfg.model} onChange={(e) => setCfg((c) => ({ ...c, model: e.target.value }))} />
-        </div>
-        <div className="field">
-          <label>API Key{status && status.api_key_masked ? `（已存 ${status.api_key_masked}，要改就重填）` : ''}</label>
-          <input
-            type="password"
-            value={cfg.api_key}
-            placeholder="填了才会覆盖已存的"
-            onChange={(e) => setCfg((c) => ({ ...c, api_key: e.target.value }))}
-          />
-        </div>
-        <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginTop: 8, alignItems: 'center' }}>
-          <button type="button" className="btn btn--primary" disabled={Boolean(busy)} onClick={saveCfg}>保存</button>
-          <span className="card__note">{status ? status.hint : ''}</span>
-        </div>
-      </Group>
-
-      <Group title="说需求，AI 写插件" desc="一句话就行，写得越具体越好用。">
-        <textarea
-          value={need}
-          rows={3}
-          placeholder="例如：群里谁签到就记一次，能查每个人有多少金币"
-          onChange={(e) => setNeed(e.target.value)}
-        />
-        <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginTop: 8, alignItems: 'center' }}>
-          <button type="button" className="btn btn--primary" disabled={Boolean(busy)} onClick={doBuild}>
-            {busy === 'build' ? '正在写…' : '生成插件（自动检查 + 试跑）'}
-          </button>
-          <button type="button" className="btn" disabled={!built || Boolean(busy)} onClick={doInstall}>安装到机器人</button>
-        </div>
-        {plan && (
-          <p className="card__note">
-            方案：{plan.what || plan.name} · 工具 {(plan.tools || []).map((t) => t.name).join('、') || '—'}
-            {result && result.issues && result.issues.length ? ` · 问题 ${result.issues.length} 条` : ''}
-          </p>
-        )}
-        {result && !result.ok && (
-          <ul className="card__note">
-            {(result.issues || []).filter((i) => i.level === 'error').slice(0, 5).map((i, ix) => (
-              <li key={ix}>{i.plain}</li>
-            ))}
-          </ul>
-        )}
-      </Group>
-
-      <Group title="已装的插件" desc="AI 生成的插件跑挂了会自动记下来，可以按报错修一版。">
-        {installed.length === 0 && <p className="card__note">还没有装任何插件。</p>}
-        {installed.map((p) => {
-          const err = errOf(p.id);
-          return (
-            <div key={p.id} className="row-item" style={{ marginBottom: 6 }}>
-              <span style={{ flex: 1 }}>
-                {p.name}（{p.id}）· 工具 {(p.tools || []).join('、') || '—'}
-                {err ? <b style={{ color: '#e8c07a' }}> · 跑出过 {err.count} 次错</b> : null}
-              </span>
-              <button type="button" className="btn btn--sm" disabled={Boolean(busy)} onClick={() => doExport(p.id)}>导出 zip</button>
-              <button type="button" className="btn btn--sm" disabled={Boolean(busy)} onClick={() => doUpload(p.id)}>上传审核</button>
-              <button type="button" className="btn btn--primary btn--sm" disabled={!err || Boolean(busy)} onClick={() => doRepair(p.id)}>让 AI 修一版</button>
-            </div>
-          );
-        })}
-        <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginTop: 8, alignItems: 'center' }}>
-          <input type="file" accept=".zip" ref={fileRef} style={{ maxWidth: 240 }} />
-          <button type="button" className="btn" disabled={Boolean(busy)} onClick={doImport}>导入插件包</button>
-        </div>
-      </Group>
-
-      <Group title="投稿与账号" desc="上传插件要用星群账号；站长在官网审核台点通过才会进插件市场。">
-        <p className="card__note">
-          {account.logged_in ? `已登录：${account.email}` : '还没登录星群账号（只用来看审核状态、上传插件）。'}
-        </p>
-        {!account.logged_in && (
-          <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
-            <input placeholder="星群账号邮箱" value={login.email} onChange={(e) => setLogin((s) => ({ ...s, email: e.target.value }))} />
-            <input type="password" placeholder="密码" value={login.password} onChange={(e) => setLogin((s) => ({ ...s, password: e.target.value }))} />
-            <button type="button" className="btn btn--primary" disabled={Boolean(busy)} onClick={doLogin}>登录</button>
-          </div>
-        )}
-        {subs.length > 0 && (
-          <ul className="card__note">
-            {subs.map((s) => <li key={s.id}>{s.text}</li>)}
-          </ul>
-        )}
-      </Group>
-    </>
-  );
-}
-
 export default function App() {
   const [view, setView] = useState('home');
+  // 导航 4 组的展开状态：默认全收起（子项收在组里，点标题才展开）；
+  // 当前页所在的组永远展开，见 groupOpen()。
+  const [openGroups, setOpenGroups] = useState({});
   const [detailPid, setDetailPid] = useState('');
   const [detailEntry, setDetailEntry] = useState(null);
   const [beginner, setBeginner] = useState(() => localStorage.getItem(BEGINNER_KEY) !== '0');
@@ -584,8 +374,61 @@ export default function App() {
   const [auth, setAuth] = useState(null);
   const [services, setServices] = useState(null);
   const [config, setConfig] = useState(null);
-  // 外观（背景/遮罩/不透明度/主题/强调色/质感）：存在浏览器本地，改动即时生效
+  /* 无头端版本号（GET /api/status）。未登录也回 {ok, version}，所以这个请求不用鉴权、
+     失败也不影响别的：读不到就显示「版本读取中」，绝不退回某个写死的数字。 */
+  const [statusInfo, setStatusInfo] = useState(null);
+  // 设置页当前页签由 App 拿着（「设置 → 账号」页签仍在：有人习惯从那里登录）
+  const [settingsTab, setSettingsTab] = useState('appearance');
+  /* 登录弹窗（2026-10-06 老板要求）：账号入口一律开它，不再跳「设置 → 账号」页签。
+     loginReturnRef 记住是哪个按钮点开的 —— 关掉之后焦点要还回去。 */
+  const [loginOpen, setLoginOpen] = useState(false);
+  const loginReturnRef = useRef(null);
+  /* 顶层提示：插件工坊自己不带提示条，它把结果交给 App 显示。
+     ⚠ 这里以前传的是 setMsg，而 App 里根本没有 setMsg —— 一点「插件工坊」整页就
+     被 ErrorBoundary 接住显示「页面出错了：setMsg is not defined」。现在补上真状态。 */
+  const [shellMsg, setShellMsg] = useState('');
+  // 外观（背景/遮罩/不透明度/主题/强调色/质感）：改完写服务器，本地只留镜像
   const [appearance, setAppearance] = useState(loadAppearance);
+
+  /* ── 控制台密码会话（2026-10-07 老板要求）──────────────────────────────
+     控制台是 http://IP:7860 上的网页，同一局域网谁打开都能改配置 —— 所以在
+     星群账号之外再加一道只属于这台服务器的密码。
+     状态机（consoleGate）：
+       'checking' —— 刚打开，正在问 /api/console/session（这一屏什么都别显示，别闪）
+       'setup'    —— 这台服务器还没设过密码 → 显示「设置控制台密码」
+       'locked'   —— 设过了但本浏览器没会话 → 显示「输入控制台密码」
+       'open'     —— 会话有效 → 正常显示控制台
+     会话过期由**服务端**判定：api.js 收到 console_locked 时会喊一声，这里切回 'locked'。
+
+     ⚠ 这两个 state 必须**声明在下面那些 useEffect 之前**：拉数据的 effect 会读
+     consoleGate 做判断，声明晚了就是 TDZ（编译后 "Cannot access before initialization"，
+     整页被 ErrorBoundary 接住显示「页面出错了」—— 2026-10-07 踩过这一次）。 */
+  const [consoleGate, setConsoleGate] = useState('checking');
+  const [consoleNeedSetup, setConsoleNeedSetup] = useState(false);
+
+  useEffect(() => {
+    // 会话被服务端拒了（过期/被别处改密码作废）：立刻退回密码屏
+    setConsoleLockedHandler(() => {
+      clearConsoleToken();
+      setConsoleGate((prev) => (prev === 'open' ? 'locked' : prev));
+    });
+    (async () => {
+      try {
+        const s = await get('/api/console/session');
+        if (s && s.authed) {
+          setConsoleGate('open');
+          return;
+        }
+        setConsoleNeedSetup(Boolean(s && s.need_setup));
+        setConsoleGate(s && s.need_setup ? 'setup' : 'locked');
+      } catch {
+        /* 老后端没有 /api/console/*（404）：不能把用户永远关在这一屏 ——
+           放行进控制台，用原有的"未登录提示条"兜住。前后端版本不一致时也不白屏。 */
+        setConsoleGate('open');
+      }
+    })();
+    return () => setConsoleLockedHandler(null);
+  }, []);
 
   useEffect(() => {
     applyAppearance(appearance);
@@ -619,25 +462,120 @@ export default function App() {
     try {
       setConfig(await get('/api/config'));
     } catch {
-      /* 保持旧配置 */
+      /* 保持旧配置（未登录星群账号时就是这条路；界面偏好另有 /api/ui/prefs，不受影响） */
     }
   };
 
+  const loadStatus = async () => {
+    try {
+      setStatusInfo(await get('/api/status'));
+    } catch {
+      /* 保持旧值：标题栏会显示「版本读取中」 */
+    }
+  };
+
+  /* 拉数据这条只在**控制台会话通了**之后才跑（2026-10-07）。
+     为什么：密码屏还没过的时候，/api/** 一律 401 —— 照样发请求的话，
+     浏览器控制台会刷出一串红色 401（老板看到就以为坏了），而且这些请求本来
+     一个字节都拿不到。gate 一变成 'open' 就立刻拉真数据（登录后所有页面马上有值）。 */
   useEffect(() => {
+    if (consoleGate !== 'open') return undefined;
     loadConfig();
+    loadStatus();
+    loadUiPrefs();       // 界面偏好只认控制台会话，账号没登录也读得到
     refresh();
     const timer = setInterval(refresh, 5000);
     return () => clearInterval(timer);
-  }, []);
+  }, [consoleGate]);
+
+  // 顶层提示 3 秒后自己消失，和各个页面里的 toast 一个节奏
+  useEffect(() => {
+    if (!shellMsg) return undefined;
+    const t = setTimeout(() => setShellMsg(''), 3200);
+    return () => clearTimeout(t);
+  }, [shellMsg]);
+
+  /* 小白模式是**服务器上的设置**（桌面端读的也是它，settings.json 那一份），
+     不能只存浏览器 localStorage —— 两边存的地方不同，老板桌面端关了、控制台还开着，
+     侧栏一个 10 项一个 6 项，看着就是"没对齐"。
+     规则：服务器给了 beginner_mode 就以它为准（同时镜像到 localStorage，断网时也有个默认）；
+     切换时写回服务器；写不进去（没登录等）就只在本机生效，并如实说一句。 */
+  const beginnerFromServer = useRef(false);
+  useEffect(() => {
+    if (beginnerFromServer.current) return;
+    if (!config || typeof config.beginner_mode !== 'boolean') return;
+    beginnerFromServer.current = true;
+    setBeginner(config.beginner_mode);
+    localStorage.setItem(BEGINNER_KEY, config.beginner_mode ? '1' : '0');
+  }, [config]);
 
   const setBeginnerMode = (on) => {
-    localStorage.setItem(BEGINNER_KEY, on ? '1' : '0');
-    setBeginner(Boolean(on));
+    const v = Boolean(on);
+    localStorage.setItem(BEGINNER_KEY, v ? '1' : '0');
+    setBeginner(v);
+    put('/api/config', { beginner_mode: v })
+      .then(() => setShellMsg(v ? '小白模式已开启，已同步到服务器' : '小白模式已关闭，已同步到服务器'))
+      .catch((e) => setShellMsg(isAuthError(e)
+        ? '已在本机生效；登录后会同步到服务器'
+        : `已在本机生效，但没同步到服务器：${e.message}`));
+  };
+
+  /* ── 外观/界面偏好（背景、遮罩、不透明度、主题、强调色、质感）──────────────
+     2026-10-07 起是**服务器设置**（键名 ui_*），本地只留镜像。
+     老板原话："换浏览器会出现先前配置归 0" —— 原因就是这份原来只存 localStorage。
+
+     ⚠ 走 /api/ui/prefs，**不是 /api/config**：后者属于"星群账号"那一层，
+     没登录账号就 401；而界面偏好跟账号权益无关，只跟"进不进得了这个控制台"有关。
+     早先接在 /api/config 上时实测踩到：控制台密码过了、账号那层没登录 →
+     偏好读不到 → 界面又是默认值，等于没修（老板要的正是"换浏览器也在"）。
+     规则：
+       服务器有值 → 以服务器为准，并镜像回 localStorage（断网时还有得用）；
+       服务器没值 → 说明是老用户第一次上来，把本地这份**写上去一次**（迁移，不丢设置）；
+     写入失败（会话过期等）静默回退本地并给一句中文提示，不弹英文报错、不白屏。 */
+  const appearanceSynced = useRef(false);
+
+  const pushAppearance = (ap) => put('/api/ui/prefs', appearanceToServer(ap))
+    .catch((e) => {
+      setShellMsg(isConsoleLocked(e)
+        ? '外观已在本机生效；控制台会话过期了，重新输密码后会同步到服务器'
+        : `外观已在本机生效，但没同步到服务器：${e.message}`);
+    });
+
+  const applyServerAppearance = (payload) => {
+    const { ap, hasServer } = appearanceFromServer(payload);
+    if (hasServer && ap) {
+      appearanceSynced.current = true;
+      setAppearance((prev) => {
+        const next = { ...prev, ...ap };
+        // 与本地一致时返回原对象引用：避免每次拉偏好都白重渲染一遍
+        const same = Object.keys(next).every((k) => next[k] === prev[k]);
+        return same ? prev : next;
+      });
+      return;
+    }
+    if (!appearanceSynced.current) {
+      appearanceSynced.current = true;      // 一次会话只迁移一次，别每次拉偏好都写
+      pushAppearance(appearance);
+    }
+  };
+
+  const loadUiPrefs = async () => {
+    try {
+      applyServerAppearance(await get('/api/ui/prefs'));
+    } catch {
+      /* 读不到（会话过期 / 老后端没这条接口）：继续用本地镜像，不影响界面可用 */
+    }
+  };
+
+  // 改动即时生效 + 写本地镜像 + 同步服务器（会话过期时那次失败会被上面静默吞掉）
+  const onAppearanceChange = (next) => {
+    setAppearance(next);
+    pushAppearance(next);
   };
 
   // 登录/认领/退出之后配置才有权限拉：一起刷新，否则设置页端口一直是空的
   const reloadAll = async () => {
-    await Promise.all([refresh(), loadConfig()]);
+    await Promise.all([refresh(), loadConfig(), loadStatus(), loadUiPrefs()]);
   };
 
   const onToken = (value) => {
@@ -646,9 +584,55 @@ export default function App() {
     setToken(value || '');
   };
 
-  const accountTip = auth?.email
-    ? `星群账号 · 已登录：${auth.email}`
+  /* 星群账号登录状态过期（读资料接口回 401，2026-10-10 修老板截图里那处自相矛盾）：
+     本地 token 这时已经没有意义了 —— **立刻清掉**，让顶栏芯片、侧栏、账号卡、
+     设置页那几行字一起回到「未登录」，并给一句实话。
+     以前不清 token：芯片按"本地有 token"说「已登录」，账号卡却因为读不到资料说
+     「未登录」，同一页两处自相矛盾。判别标准就一条：**页面上任何两处
+     "登录/未登录"的说法都必须一致** —— 所以下面所有登录态文案统一看本地 token。 */
+  useEffect(() => {
+    setAccountExpiredHandler(() => {
+      if (!localStorage.getItem('astroswarm_token')) return;   // 已经清过：别重复提示
+      onToken('');
+      setShellMsg('登录状态已过期，请重新登录');
+      reloadAll();                                             // 顺手把账号状态重读一遍
+    });
+    return () => setAccountExpiredHandler(null);
+  }, []);
+
+  /* 打开登录弹窗。传入点击事件时用它的 currentTarget 记住触发按钮；
+     没有事件（提示条那种 onLogin() 不传参的用法）就退回当前焦点元素。
+     先写 ref 再 setState：紧接着那次重渲染才拿得到最新的「焦点还回哪儿」。 */
+  const openLogin = (ev) => {
+    loginReturnRef.current = (ev && ev.currentTarget) || document.activeElement || null;
+    setLoginOpen(true);
+  };
+  const closeLogin = () => setLoginOpen(false);
+
+  // 账号资料（昵称/头像）：登录后立刻读一次，之后由 profile.js 那个共享 store 广播，
+  // 侧栏 / 顶栏 / 图标栏 / 设置页账号卡用的是同一份数据，不会一处新一处旧。
+  // ⚠ 判据用本地 token（登录成功的真凭据），不用 auth.email —— /api/auth/status
+  //   无论登录与否都回本机邮箱，拿它当判据会在没登录时也去拉资料、白报 401。
+  const profileState = useProfile();
+  useEffect(() => {
+    ensureProfile(Boolean(token), true);
+  }, [token]);
+  /* 官网那边改完昵称/头像，这边不用手动刷新：焦点回来、标签页切回来、
+     以及每 60 秒各读一次（页面藏起来就停，卸载时清定时器）。 */
+  useProfileAutoSync(Boolean(token));
+
+  const accountName = profileState.profile?.display_name
+    || profileState.profile?.nickname
+    || '';
+  /* 登录态的判据只有本地 token 一个（/api/auth/status 回的本机邮箱只是资料，
+     而且它要 Authorization 对得上才给 —— 拿它当登录标志会让同一页出现
+     "芯片说已登录、这行说未登录"这种自相矛盾）。 */
+  const accountTip = token
+    ? `星群账号 · 已登录：${accountName || auth?.email || '已登录'}`
     : '星群账号 · 未登录，点击登录';
+
+  // 标题栏的版本号：/api/status → /api/config → 「版本读取中」（绝不写死数字）
+  const versionText = versionLabel(statusInfo, config);
 
   /* 小白模式隐藏 messages / plugins / logs / deps 四个入口。但首页「打开消息中心」、
      接入页「打开消息中心」、设置页「实时日志 / 依赖管理」都会把用户直接送到这些页 ——
@@ -657,30 +641,53 @@ export default function App() {
   const visibleNav = (items) =>
     items.filter(([id]) => !(beginner && ADVANCED_PAGES.includes(id)) || id === view);
 
-  /* 侧边栏（极光玻璃）：三组「运行 / 能力 / 系统」，组标题小字次要色，条目仍是原来的 .nav-item。
-     组内是一个面板，组与组之间留空；列表自带 overflow，窄屏只在组内滚动、不横向溢出。 */
+  /* 统一导航的 4 组（2026-10-02）：机器人 / 工坊 / 人格 / 设置 —— 与桌面端一一对应。
+     子项收在组里、点组标题才展开；当前页所在的组永远展开，收起时组标题后面带上当前页名字，
+     免得收起来后一屏只剩四个组名，看不出自己在哪。 */
+  const visibleGroups = NAV_GROUPS
+    .map((g) => ({ ...g, items: visibleNav(g.items) }))
+    .filter((g) => g.items.length);
+
+  const toggleGroup = (id) => setOpenGroups((prev) => ({ ...prev, [id]: !prev[id] }));
+  const groupOpen = (g) =>
+    (g.items.some(([id]) => id === view) ? true : Boolean(openGroups[g.id]));
+
+  /* 侧边栏（极光玻璃）：4 组；组内是一个面板，组与组之间留空；
+     列表自带 overflow，窄屏只在组内滚动、不横向溢出。 */
   const renderNav = () => (
     <nav className="navgroups" aria-label="主导航">
-      {NAV_GROUPS.map((g) => {
-        const items = visibleNav(g.items);
-        if (!items.length) return null;
+      {visibleGroups.map((g) => {
+        const open = groupOpen(g);
+        const current = g.items.find(([id]) => id === view);
         return (
           <div className="navgrp" key={g.id}>
-            <div className="navgrp__title">{g.title}</div>
-            <div className="navgrp__list">
-              {items.map(([id, label, icon]) => (
-                <button
-                  key={id}
-                  type="button"
-                  className={view === id ? 'nav-item nav-item--on' : 'nav-item'}
-                  onClick={() => setView(id)}
-                  aria-current={view === id ? 'page' : undefined}
-                >
-                  <Icon name={icon} size={18} />
-                  <span>{label}</span>
-                </button>
-              ))}
-            </div>
+            <button
+              type="button"
+              className={open ? 'navgrp__title navgrp__title--open' : 'navgrp__title'}
+              onClick={() => toggleGroup(g.id)}
+              aria-expanded={open}
+              title={open ? `收起「${g.title}」` : `展开「${g.title}」`}
+            >
+              <span>{g.title}</span>
+              {!open && current && <span className="navgrp__now">{current[1]}</span>}
+              <span className="navgrp__chev">{open ? '▾' : '▸'}</span>
+            </button>
+            {open && (
+              <div className="navgrp__list">
+                {g.items.map(([id, label, icon]) => (
+                  <button
+                    key={id}
+                    type="button"
+                    className={view === id ? 'nav-item nav-item--on' : 'nav-item'}
+                    onClick={() => setView(id)}
+                    aria-current={view === id ? 'page' : undefined}
+                  >
+                    <Icon name={icon} size={18} />
+                    <span>{label}</span>
+                  </button>
+                ))}
+              </div>
+            )}
           </div>
         );
       })}
@@ -691,12 +698,13 @@ export default function App() {
      账号按钮 → 三组（组间竖分隔线）；窄屏由 .navflow 允许换行，不横向溢出。 */
   const renderTopnav = () => (
     <nav className="topnav navflow" aria-label="顶部导航">
-      <button type="button" className="topnav__account" title={accountTip} onClick={() => setView('settings')}>
-        <Icon name="user" size={16} />
-        <span>星群账号</span>
+      {/* 顶栏那个「星群账号」与侧栏是同一个入口（瑞士极简主题），一起改成开弹窗 */}
+      <button type="button" className="topnav__account" title={accountTip} onClick={openLogin}>
+        <AccountAvatar profile={profileState.profile} size={18} />
+        <span>{accountName || '星群账号'}</span>
       </button>
-      {NAV_GROUPS.flatMap((g, gi) => {
-        const items = visibleNav(g.items);
+      {visibleGroups.flatMap((g, gi) => {
+        const items = g.items;
         if (!items.length) return [];
         return [
           ...(gi > 0 ? [<span className="topnav__sep" key={`sep-${g.id}`} />] : []),
@@ -721,11 +729,12 @@ export default function App() {
      组与组之间用一条极细分隔线（图标模式下没有文字，只能靠线分层）。 */
   const renderRail = () => (
     <nav className="rail" aria-label="图标导航">
-      <button type="button" className="rail__account" title={accountTip} onClick={() => setView('settings')}>
-        <Icon name="user" size={18} />
+      {/* 图标栏那个账号按钮（深空终端主题）同理：开弹窗，不跳设置 */}
+      <button type="button" className="rail__account" title={accountTip} onClick={openLogin}>
+        <AccountAvatar profile={profileState.profile} size={22} />
       </button>
-      {NAV_GROUPS.flatMap((g, gi) => {
-        const items = visibleNav(g.items);
+      {visibleGroups.flatMap((g, gi) => {
+        const items = g.items;
         if (!items.length) return [];
         return [
           ...(gi > 0 ? [<span className="railsep" key={`sep-${g.id}`} />] : []),
@@ -747,6 +756,37 @@ export default function App() {
     </nav>
   );
 
+  /* 「锁定」= 退出控制台会话。刻意**不动星群账号**（老板要的是锁屏，
+     顺手退账号会害他重走一遍邮箱登录）。 */
+  const lockConsole = async () => {
+    try {
+      await post('/api/console/logout', {});
+    } catch {
+      /* 会话可能已经过期了：本地清掉照样回密码屏 */
+    }
+    clearConsoleToken();
+    setConsoleGate('locked');
+    setShellMsg('控制台已锁定（星群账号仍保持登录）');
+  };
+
+  if (consoleGate !== 'open') {
+    if (consoleGate === 'checking') {
+      // 正在问服务器：给一屏安静的中文加载，不要闪默认值
+      return <div className="cl-screen"><div className="cl-card"><p className="cl-hint">正在读取控制台状态…</p></div></div>;
+    }
+    return (
+      <ConsoleLogin
+        needSetup={consoleGate === 'setup' || consoleNeedSetup}
+        onMsg={setShellMsg}
+        onAuthed={() => {
+          setConsoleGate('open');
+          // 拿到会话立刻拉真实数据：配置、状态、外观偏好（换浏览器后设置全在这儿回来）
+          reloadAll();
+        }}
+      />
+    );
+  }
+
   return (
     <>
       {/* 动态背景层（图片/视频 + 遮罩强度），永远在最底层且不挡点击 */}
@@ -762,29 +802,60 @@ export default function App() {
       </div>
       <div className="shell">
       <header className="titlebar">
-        <span className="titlebar__title">AstroSwarm 星群</span>
-        <span className="titlebar__ver">v{APP_VERSION}</span>
+        {/* 顶栏品牌 = 软件名（2026-10-10 老板定名：软件叫「星巢 Nest」；
+            「AstroSwarm 星群」是网站/账号服务的品牌，只留在账号相关文案里）。 */}
+        <span className="titlebar__title">星巢 Nest</span>
+        <span className="titlebar__ver" title="Linux 无头端自己的版本号（取自服务器）">
+          {versionText} · 星巢 Nest
+        </span>
         <div className="titlebar__right">
           <button type="button" className="btn btn--ghost btn--sm" onClick={() => setView('logs')}>
             实时日志
           </button>
-          {/* 通道开通判据是 member；没有权益的账号只写「未开通」 */}
-          <StatusChip ok={isMember(auth)} warn={!auth?.email}>
-            {isMember(auth) ? `已开通 · ${auth.plan}` : auth?.email ? '未开通' : '未登录'}
+          {/* 「锁定」= 退出控制台会话（回密码屏），**不动星群账号**。
+              为什么放在标题栏最顺手的位置：老板离开电脑时要一键锁屏，
+              找三层菜单再锁等于不会锁。 */}
+          <button
+            type="button"
+            className="btn btn--ghost btn--sm"
+            title="锁定控制台：回到密码屏。星群账号不会退出。"
+            onClick={lockConsole}
+          >
+            锁定
+          </button>
+          {/* 账号只表示"登录了没有"。插件与通道全部免费，不再有"免费版/会员"之分。
+              ⚠ 判据要和别处一样用本地 token，不能用 auth.email ——
+              /api/auth/status 无论登录与否都会回本机账号邮箱，用它会让"未登录"的机器
+              顶着「已登录」，和上面那条未登录提示条自相矛盾。 */}
+          <StatusChip ok={Boolean(token)} warn={!token}>
+            {token ? (
+              <>
+                {/* 和桌面端一致：这块也带头像，名字优先用官网昵称，没读到就还是「已登录」 */}
+                <AccountAvatar profile={profileState.profile} size={14} />
+                <span>{accountName || '已登录'}</span>
+                {auth?.plan ? <span>{` · ${auth.plan}`}</span> : null}
+              </>
+            ) : '未登录'}
           </StatusChip>
         </div>
       </header>
+      {/* 未登录时第一眼就要知道该干什么：一条带「去登录」的提示条，登录后自己消失。
+          以前只有卡片里的小字（LOGIN_HINT），不翻到对应卡片根本看不见。
+          「去登录」开的是登录弹窗（2026-10-06）：就地填完就能继续看这一页，不跳走。 */}
+      <LoginBanner show={!token} onLogin={openLogin} />
       {renderTopnav()}
       <div className="app">
         <aside className="sidebar-wrap">
+          {/* 「星群账号」入口保留（老板明确要求不删）：点它开登录弹窗，
+              不再跳到「设置 → 账号」页签 */}
           <button
             type="button"
             className="sidebar-account"
             title={accountTip}
-            onClick={() => setView('settings')}
+            onClick={openLogin}
           >
-            <Icon name="user" size={18} />
-            <span>星群账号</span>
+            <AccountAvatar profile={profileState.profile} size={22} />
+            <span>{accountName || '星群账号'}</span>
           </button>
           {renderNav()}
         </aside>
@@ -801,6 +872,7 @@ export default function App() {
                 onAccess={() => setView('access')}
                 onMessages={() => setView('messages')}
                 onServices={() => setView('services')}
+                onGo={(v) => setView(v)}
               />
             )}
             {view === 'access' && (
@@ -811,6 +883,7 @@ export default function App() {
                 services={services}
                 onSaved={loadConfig}
                 onMessages={() => setView('messages')}
+                loggedIn={Boolean(token)}
               />
             )}
             {view === 'services' && (
@@ -821,6 +894,7 @@ export default function App() {
                 onAccess={() => setView('access')}
                 onLogs={() => setView('logs')}
                 onDeps={() => setView('deps')}
+                loggedIn={Boolean(token)}
               />
             )}
             {view === 'brain' && (
@@ -832,6 +906,12 @@ export default function App() {
               />
             )}
             {view === 'messages' && <MessageCenter loggedIn={Boolean(token)} />}
+            {view === 'workshop' && (
+              <WorkshopPage
+                onMsg={setShellMsg}
+                onGoPlugins={() => setView('plugins')}
+              />
+            )}
             {view === 'plugins' && (
               <Plugins
                 auth={auth}
@@ -850,7 +930,6 @@ export default function App() {
                 onBack={() => setView('plugins')}
               />
             )}
-            {view === 'workshop' && <Workshop />}
             {view === 'logs' && <Logs loggedIn={Boolean(token)} />}
             {view === 'settings' && (
               <Settings
@@ -865,15 +944,35 @@ export default function App() {
                 onChanged={reloadAll}
                 onToken={onToken}
                 appearance={appearance}
-                onAppearance={setAppearance}
+                onAppearance={onAppearanceChange}
                 onGo={(v) => setView(v)}
+                version={versionText}
+                tab={settingsTab}
+                onTab={setSettingsTab}
+                onLockConsole={lockConsole}
               />
             )}
             {view === 'deps' && <Deps />}
           </div>
         </main>
       </div>
+      {shellMsg && <div className="toast">{shellMsg}</div>}
       </div>
+      {/* 登录弹窗挂在 .shell **外面**：遮罩要盖住整窗（含标题栏与侧栏），
+          也避开 .shell 那个 z-index:1 的层叠上下文，不必和里面的卡片比层级。
+          登录成功后 LoginForm 自己回调 closeLogin，紧接着 reloadAll 让首页四卡与
+          今日数据立刻拿到真实值（不用手动刷新）。 */}
+      <LoginModal
+        open={loginOpen}
+        onClose={closeLogin}
+        returnFocusTo={loginReturnRef.current}
+        loggedIn={Boolean(token)}
+        email={auth?.email || ''}
+        onToken={onToken}
+        onChanged={reloadAll}
+        onMsg={setShellMsg}
+        onGoAccount={() => { closeLogin(); setSettingsTab('account'); setView('settings'); }}
+      />
     </>
   );
 }
@@ -997,9 +1096,9 @@ function QWeatherCard() {
    （只露标题，任务面板自身隐藏）。面板内所有子行间距 = 面板自身间距 6
    （Qt 的子布局会继承父布局 spacing，所以这里不能用页面的 14）。
    开发者模式关闭时：PyPI / zip 的输入与按钮禁用、「NoneBot 插件市场」整块隐藏。
-   列表项格式取自 _refresh_market_list：`[免费|需开通] 名字  v版本  [分类]`。 */
-const PLUGIN_TIER_LABEL = { free: '免费', member: '需开通', buy: '需开通' };
-const PLUGIN_ITEM_COLOR = { free: '#34D399', member: '#22D3EE', buy: '#22D3EE' };
+   列表项格式取自 _refresh_market_list：`[免费|会员|单买] 名字  v版本  [分类]`。 */
+/* 插件列表现已全部免费：「插件管理」页的商店改成了卡片 + 搜索 + 分类标签，
+   每张卡自己带「安装 / ✓已装 + 配置」按钮，这里不再按 tier 区分文案与颜色。 */
 
 /** 插件详情页：介绍 / 功能 / 可调参数（写 <data_home>/tool_packs/<id>/config.json）。 */
 function PluginDetail({ pid, entry, auth, onBack }) {
@@ -1019,16 +1118,22 @@ function PluginDetail({ pid, entry, auth, onBack }) {
       })
       .catch((e) => setMsg(`读取插件详情失败：${e.message}`));
   };
-  useEffect(load, [pid]);
+  /* ⚠ 这两行以前写的是 `useEffect(load, [pid])` / `useEffect(loadEnt, [pid])` ——
+     直接把"会返回 Promise 的函数"当 effect 传进去了。React 会把 effect 的返回值
+     当成清理函数，于是**离开插件详情页时**去调 promise.destroy() →
+     "destroy is not a function" → 整页被 ErrorBoundary 接住显示「页面出错了」。
+     这是 2026-10-12 截图验收时才暴露的既有缺陷（2016 年那次恢复版本就在），
+     不是本轮改动引入的。修法：包一层不返回值的箭头函数（只改写法，语义不变）。 */
+  useEffect(() => { load(); }, [pid]);
 
   const loadEnt = () =>
     get('/api/plugins/entitlement')
       .then(setEnt)
       .catch(() => {});
-  useEffect(loadEnt, [pid]);
+  useEffect(() => { loadEnt(); }, [pid]);
 
   const price = entry?.price;
-  const buyUrl = ACTIVATE_URL;   // 开通用账号中心；市场清单里的旧购买链接不再使用
+  const buyUrl = entry?.buy_url || entry?.url || '';   // 市场清单里的旧购买链接已不再使用
   const owned = Boolean(ent && (ent.owned_plugins || []).includes(pid));
   // 能力包已全部免费开源：这里只做「装了就能用」的兜底判断，
   // 旧清单里带 tier 的条目按后端口径（all_plugins / 已登记）放行。
@@ -1110,38 +1215,41 @@ function PluginDetail({ pid, entry, auth, onBack }) {
     }
   };
 
+  /* 插件参数渲染（2026-10-12 换统一控件）：
+     · bool   → 开关行（带一句说明），不再是一个裸复选框
+     · number → NumberField（标签 + 数值 + 单位后缀 + 步进 + 范围提示），
+                不再是裸 input[type=number]；档位少（step=1 且跨度 ≤ 20）时自动变滑杆
+     · text   → 保持输入框，但右侧说明统一走 hint 行 */
   const field = (f) => {
     const v = form[f.key];
     if (f.type === 'bool') {
       return (
-        <label className="check">
-          <input type="checkbox" checked={Boolean(v)} onChange={(e) => set(f.key, e.target.checked)} />
-          <span>{f.label || f.key}</span>
-        </label>
+        <ToggleRow
+          key={f.key}
+          checked={Boolean(v)}
+          onChange={(next) => set(f.key, next)}
+          label={f.label || f.key}
+          desc={f.help || ''}
+        />
       );
     }
     if (f.type === 'number') {
       return (
-        <div className="param-row">
-          <span>{f.label || f.key}</span>
-          <input
-            className="p-input"
-            type="number"
-            value={v ?? ''}
-            min={f.min}
-            max={f.max}
-            step={f.step || 1}
-            onChange={(e) => set(f.key, e.target.value)}
-          />
-          <b>
-            {f.min != null && f.max != null ? `${f.min} ~ ${f.max}` : ''}
-            {f.unit || ''}
-          </b>
-        </div>
+        <NumberField
+          key={f.key}
+          label={f.label || f.key}
+          value={v}
+          min={f.min}
+          max={f.max}
+          step={f.step || 1}
+          unit={f.unit || ''}
+          hint={f.help || ''}
+          onChange={(next) => set(f.key, next)}
+        />
       );
     }
     return (
-      <div className="param-row">
+      <div className="param-row" key={f.key}>
         <span>{f.label || f.key}</span>
         <input className="p-input" value={v ?? ''} spellCheck={false} onChange={(e) => set(f.key, e.target.value)} />
         <b>{(f.help || '') + (f.unit || '')}</b>
@@ -1256,22 +1364,45 @@ function PluginDetail({ pid, entry, auth, onBack }) {
             : '这个插件还没安装，安装后才能改参数。'}
         </p>
         {fields.length === 0 && <p className="card__note">这个插件没有可调参数。</p>}
-        {fields.map((f) => (
+        {/* 2026-10-12 信息层级：开关（功能开关）常显 —— 藏起来会让人以为"这个功能没了"；
+            数值项（概率/间隔/冷却/限速/时段这类配一次就不动的）收进折叠区，
+            标题行给一句当前值摘要，不用展开也知道现在配的是什么。 */}
+        {fields.filter((f) => f.type === 'bool').map((f) => field(f))}
+        {(() => {
+          const nums = fields.filter((f) => f.type === 'number');
+          if (!nums.length) return null;
+          const summary = nums.slice(0, 3)
+            .map((f) => `${f.label || f.key} ${form[f.key] ?? '—'}${f.unit || ''}`)
+            .join(' · ');
+          const dirtyNums = changed.filter((k) => nums.some((f) => f.key === k)).length;
+          return (
+            <Collapse
+              storageKey={`plugin-${pid}-numbers`}
+              title={`数值参数（${nums.length} 项）`}
+              summary={nums.length > 3 ? `${summary} …` : summary}
+              dirty={dirtyNums > 0}
+              dirtyText={`已改 ${dirtyNums} 项`}
+            >
+              {nums.map((f) => field(f))}
+            </Collapse>
+          );
+        })()}
+        {fields.filter((f) => f.type !== 'bool' && f.type !== 'number').map((f) => (
           <div key={f.key}>{field(f)}</div>
         ))}
         {fields.length > 0 && (
           <div className="p-row">
-            <button
-              type="button"
-              className="btn btn--primary"
+            <PillButton
+              tone="primary"
               disabled={!installed || busy || !changed.length}
+              loading={busy}
               onClick={save}
             >
               {busy ? '保存中…' : changed.length ? `保存参数（${changed.length} 项改动）` : '保存参数'}
-            </button>
-            <button type="button" className="btn btn--ghost" onClick={load}>
+            </PillButton>
+            <PillButton tone="ghost" disabled={busy} onClick={load}>
               重新读取
-            </button>
+            </PillButton>
           </div>
         )}
       </section>
@@ -1286,12 +1417,11 @@ function Plugins({ auth, onDetail = () => {} }) {
   const [packs, setPacks] = useState([]);
   const [status, setStatus] = useState('正在加载插件商店...');
   const [category, setCategory] = useState('');
+  const [query, setQuery] = useState('');
   const [picked, setPicked] = useState('');
   const [packId, setPackId] = useState('');
   const [pyPackage, setPyPackage] = useState('');
   const [zipPath, setZipPath] = useState('');
-  // 已登记的插件 id（列表里标「✓已拥有」，并让它们可安装）
-  const [ownedPlugins, setOwnedPlugins] = useState([]);
   const [qweather, setQweather] = useState(false);
   const [msg, setMsg] = useState('');
   // 开发者模式（后端 /api/console/dev-mode，存服务器 config_home/console.json）：
@@ -1302,16 +1432,29 @@ function Plugins({ auth, onDetail = () => {} }) {
   // /api/plugins/installed：已装插件、本地插件目录、pyproject 记录的商店插件
   const [localInfo, setLocalInfo] = useState({ installed: [], local: [], store: [], dir: '' });
   const [deps, setDeps] = useState(null);
+  // 兑换码 / 权益（桌面端 plugins_page 的「兑换 + 刷新权益」那一行）
+  const [redeemCode, setRedeemCode] = useState('');
+  const [redeeming, setRedeeming] = useState(false);
+  const [ent, setEnt] = useState(null);
+  // 官网市场正在装哪一个（按钮显示「正在安装…」并禁用）
+  const [marketBusyId, setMarketBusyId] = useState('');
 
   const loadLocal = () => {
     get('/api/plugins/installed')
-      .then((d) => setLocalInfo(d))
+      // 逐项兜底：服务器回了 200 但少字段时（或换了一版接口），
+      // 直接 setLocalInfo(d) 会让 store.map / local.map 抛错，整页被 ErrorBoundary 接住。
+      .then((d) => setLocalInfo({
+        installed: Array.isArray(d.installed) ? d.installed : [],
+        local: Array.isArray(d.local) ? d.local : [],
+        store: Array.isArray(d.store) ? d.store : [],
+        dir: d.dir || '',
+      }))
       .catch((e) => fail(e, '本地插件清单'));
   };
 
   /* 未登录时这一页的四块数据全都读不到（/api/tools/status、/api/plugins/entitlement、
      /api/plugins/installed 都鉴权）。以前每处都是 .catch(() => {})，静默吞掉：
-     表现是「已装能力包空列表」「插件全显示未开通」，用户以为功能没了。
+     表现是「已装能力包空列表」「付费插件全显示未购买」，用户以为功能没了。
      现在统一记一句实话，并在对应卡片上显示，不再把「没登录」装成「没有数据」。 */
   const [needLogin, setNeedLogin] = useState(false);
   const fail = (e, what) => {
@@ -1341,12 +1484,8 @@ function Plugins({ auth, onDetail = () => {} }) {
           setStatus('插件商店暂不可用或暂无内容，可稍后点「刷新」重试');
           return;
         }
-        // 「当前账号」按 member 判；没有权益的账号写「未开通」
-        const plan = auth?.email ? (isMember(auth) ? '已开通' : '未开通') : '未登录星群账号（插件不受影响）';
-        const locked = list.filter((e) => tier(e) !== 'free').length;
-        setStatus(
-          `插件商店已加载：${list.length} 个 · 当前账号：${plan}` + (locked ? ` · ${locked} 个需开通` : ''),
-        );
+        // 插件与能力包全部免费、微信通道也不需要开通 —— 这里只说数量，不提会员/付费
+        setStatus(`插件商店已加载：${list.length} 个（全部免费，装上就能用）`);
       })
       .catch((e) => setStatus(`插件商店加载失败：${e.message}（可点「刷新」重试）`));
   };
@@ -1358,26 +1497,78 @@ function Plugins({ auth, onDetail = () => {} }) {
     get('/api/console/dev-mode')
       .then((d) => setDevMode(Boolean(d.developer_mode)))
       .catch((e) => fail(e, '开发者模式'));
-    // 已登记的插件：以前只认开通标记，会被判成「没权限」装不上
     get('/api/plugins/entitlement')
-      .then((d) => setOwnedPlugins((d.owned_plugins || []).map(String)))
-      .catch((e) => fail(e, '已购插件权益'));
+      .then((d) => setEnt(d))
+      .catch(() => setEnt(null));      // 未登录时读不到：上面那行会说"先登录"
   }, []);
 
-  const tier = (e) => String(e.tier || 'free').toLowerCase();
-  const isOwned = (e) => ownedPlugins.includes(String(e.id));
-  const allowed = (e) => tier(e) === 'free' || isFull(auth) || isOwned(e);
-  const categories = [...new Set(entries.map((e) => e.category || '未分类'))].sort();
-  const shown = category ? entries.filter((e) => (e.category || '未分类') === category) : entries;
-
-  const install = async () => {
-    const entry = entries.find((e) => String(e.id) === picked);
-    if (!entry) {
-      setMsg('请先在插件商店选择一个插件');
+  /* 兑换码：成功与否都由后端说了算（它才知道码是真的）。
+     成功后后端会把新权益存本机，这里顺手再读一次权益，界面上立刻能看到变化。 */
+  const redeem = async () => {
+    const code = redeemCode.trim();
+    if (!code) {
+      setMsg('先把兑换码填上');
       return;
     }
-    if (!allowed(entry)) {
-      setMsg(`「${entry.name}」需要先在账号中心开通，开通后再点安装`);
+    setRedeeming(true);
+    try {
+      const r = await post('/api/plugins/redeem', { code });
+      setRedeemCode('');
+      setEnt(r || null);
+      setMsg('兑换成功，权益已更新');
+      loadPacks();
+    } catch (e) {
+      setMsg(withAuthHint(e));
+    } finally {
+      setRedeeming(false);
+    }
+  };
+
+  const refreshEnt = async () => {
+    try {
+      setEnt(await post('/api/plugins/refresh-entitlement', {}));
+      setMsg('权益已刷新');
+    } catch (e) {
+      setMsg(withAuthHint(e));
+    }
+  };
+
+  // 插件与能力包现在全部免费（后端 _entitled 恒为 True）——界面上不再出现
+  // "会员/单买/未解锁"这类字样，也不需要再按 tier 判断能不能装。
+  const categories = [...new Set(entries.map((e) => e.category || '未分类'))].sort();
+
+  // 已装：能力包看 /api/tools/status，普通插件看 /api/plugins/installed
+  const installedIds = new Set([
+    ...packs.map((p) => String(p.id)),
+    ...(localInfo.installed || []).map((p) => String(p.id)),
+  ]);
+  const isInstalled = (e) => installedIds.has(String(e.id));
+
+  const kw = query.trim().toLowerCase();
+  const shown = entries.filter((e) => {
+    if (category && (e.category || '未分类') !== category) return false;
+    if (!kw) return true;
+    const hay = `${e.name || ''} ${e.description || ''} ${e.id || ''}`.toLowerCase();
+    return hay.includes(kw);
+  });
+  // 默认按分类分组（分组只在"全部 + 没搜索"时才有意义）
+  const grouped = !category && !kw;
+  const groups = [];
+  if (grouped) {
+    shown
+      .slice()
+      .sort((a, b) => String(a.category || '未分类').localeCompare(String(b.category || '未分类')))
+      .forEach((e) => {
+        const cat = e.category || '未分类';
+        const last = groups[groups.length - 1];
+        if (last && last.cat === cat) last.items.push(e);
+        else groups.push({ cat, items: [e] });
+      });
+  }
+
+  const installEntry = async (entry) => {
+    if (!entry) {
+      setMsg('请先在插件商店选择一个插件');
       return;
     }
     try {
@@ -1385,10 +1576,40 @@ function Plugins({ auth, onDetail = () => {} }) {
       await post(entry.kind && entry.kind !== 'plugin' ? '/api/tools/install' : '/api/plugins/install', {
         id: entry.id,
       });
-      setMsg('已安装，重启机器人生效');
+      setMsg(`「${entry.name}」已安装，重启机器人生效`);
       loadPacks();
+      loadLocal();
     } catch (e) {
       setMsg(withAuthHint(e));
+    }
+  };
+
+  const install = () => installEntry(entries.find((e) => String(e.id) === picked));
+
+  /* 官网市场那一条的「安装」：还是走同一个商店插件安装接口 /api/plugins/install，
+     但市场接口是白名单字段，**只有 name、没有 id**。所以：
+       1) 先在已经拉到的 /api/plugins 清单里按名字找回真 id（同一份清单，能对上）；
+       2) 对不上就把名字当 id 发过去（后端按 id 匹配，匹配不到会回 404，
+          那时把后端的原因照实显示，不假装装好了）。
+     两个键一起发，后端按哪个都能认。 */
+  const installMarket = async (entry) => {
+    const name = String((entry && entry.name) || '');
+    if (!name) {
+      setMsg('市场条目没有名字，装不了');
+      return;
+    }
+    const hit = entries.find((e) => String(e.name || '') === name);
+    setMarketBusyId(name);
+    try {
+      await post('/api/plugins/install', { id: hit ? String(hit.id) : name, name });
+      setMsg(`「${name}」已安装，重启机器人生效`);
+      load();
+      loadPacks();
+      loadLocal();
+    } catch (e) {
+      setMsg(withAuthHint(e));
+    } finally {
+      setMarketBusyId('');
     }
   };
 
@@ -1415,7 +1636,7 @@ function Plugins({ auth, onDetail = () => {} }) {
         if (last) setPkgStage(last);
         if (!st.running) {
           if (st.error) {
-            setMsg(`${name} 安装失败。下面是安装命令的输出，出问题时把这段发给开发者：${st.error}`);
+            setMsg(`${name} 安装失败，下面是命令输出：${st.error}`);
           } else {
             setMsg(`${name} 装好了（已写进机器人 pyproject），重启机器人后生效`);
             setPyPackage('');
@@ -1452,8 +1673,15 @@ function Plugins({ auth, onDetail = () => {} }) {
   const restartBot = async () => {
     if (!window.confirm('确定重启机器人？\n大约 10 秒内 QQ / 微信 会短暂离线，正在进行的对话会中断。')) return;
     try {
-      await post('/api/services/restart', { service: 'bot' });
-      setMsg('已发送重启指令，NoneBot 起来后新插件才生效');
+      // 走 /api/bot/restart：它会等到反向 WS 真连上再回，并把每步耗时写进日志，
+      // 避免"以为没重启"（设置类改动不需要它，只有改了代码/装了插件才用）。
+      const r = await post('/api/bot/restart', {});
+      const secs = (r && r.seconds) || {};
+      setMsg(
+        `机器人已重启（停止 ${secs.stop ?? '?'}s｜启动 ${secs.start ?? '?'}s｜` +
+        `反向 WS 重连 ${secs.reconnect ?? '?'}s）` +
+        (r && r.qq_connected === false ? '：协议端稍后会自动重连，看日志确认' : '')
+      );
     } catch (e) {
       setMsg(withAuthHint(e));
     }
@@ -1484,78 +1712,146 @@ function Plugins({ auth, onDetail = () => {} }) {
       <header className="page-head">
         <div>
           <h1>插件管理</h1>
-          <p>插件商店（直连星群服务器）与本地插件管理；第三方插件安装默认关闭，可在「设置 → 开发者模式」开启（后果自负）。</p>
+          <p>装插件、管插件都在这里；第三方插件安装默认关闭，可在「设置 → 开发者模式」开启（后果自负）。</p>
         </div>
       </header>
+
+      {/* 本机能力（可搜索 · 可开关）：与桌面端 plugins_page.py::_build_capability_panel
+          同一位置（标题下面、插件商店上面）。2026-10-12 老板：「插件页面看不见好友
+          申请那个功能」「加一个能搜索还带开关的」。 */}
+      <MachineCapabilities onMsg={setMsg} />
 
       <div className="pl-row">
         <section className="card pl-panel">
           <h2 className="card__title">插件商店</h2>
           <p className="card__note">
-            直连星群服务器拉取插件清单；安装前自动校验适配器兼容性与 SHA256。插件全部免费、源码开源，直接装即可。
+            插件与能力包全部免费，安装前会自动校验兼容性。
           </p>
 
+          {/* 搜索：名字或说明里的字都能搜（插件一多，靠翻列表找太慢） */}
           <div className="p-row">
-            <span>分类</span>
-            <select className="p-select" value={category} onChange={(e) => setCategory(e.target.value)}>
-              <option value="">全部分类</option>
-              {categories.map((c) => (
-                <option key={c} value={c}>
-                  {c}
-                </option>
-              ))}
-            </select>
+            <input
+              className="p-input mkt-search"
+              value={query}
+              placeholder="搜索插件：输名字或说明里的字都行"
+              spellCheck={false}
+              onChange={(e) => setQuery(e.target.value)}
+            />
             <button type="button" className="btn btn--ghost" onClick={load}>
               刷新
             </button>
             <button
               type="button"
-              className="btn btn--ghost"
-              title="去官网插件市场看介绍与下载（astroswarm.cn/plugins.html）"
-              onClick={() => {
-                window.open('https://astroswarm.cn/plugins.html', '_blank', 'noopener');
-                setMsg('已打开插件市场：装插件直接用左边的列表，这里只是去看介绍和下载 zip');
-              }}
+              className="btn btn--primary"
+              title="先点卡片上的「安装」，或先选中一行再点这里"
+              onClick={install}
             >
-              插件市场
-            </button>
-            <button type="button" className="btn btn--primary" onClick={install}>
-              安装
+              安装选中的
             </button>
           </div>
 
-          <div className="p-list p-list--134">
-            {shown.map((e) => (
-              <div className="p-item-row" key={String(e.id)}>
-                <button
-                  type="button"
-                  className={picked === String(e.id) ? 'p-item p-item--on' : 'p-item'}
-                  style={{ color: allowed(e) ? PLUGIN_ITEM_COLOR[tier(e)] || '#22D3EE' : '#94A3B8' }}
-                  onClick={() => setPicked(String(e.id))}
-                  title={e.description || ''}
-                >
-                  {`[${PLUGIN_TIER_LABEL[tier(e)] || '免费'}] ${e.name}  v${e.version}  [${e.category || '未分类'}]  免费${isOwned(e) ? '  ✓已拥有' : ''}`}
-                </button>
-                <button
-                  type="button"
-                  className="btn btn--ghost p-item__more"
-                  title="看这个插件的介绍、功能和可调参数"
-                  onClick={() => onDetail(String(e.id), e)}
-                >
-                  详情
-                </button>
-              </div>
+          {/* 分类用横排小标签：一共有哪几类一眼看全（比下拉直观） */}
+          <div className="mkt-tags">
+            {['', ...categories].map((c) => (
+              <button
+                key={c || '__all__'}
+                type="button"
+                className={category === c ? 'mkt-tag mkt-tag--on' : 'mkt-tag'}
+                onClick={() => setCategory(c)}
+              >
+                {c || '全部'}
+              </button>
             ))}
           </div>
+
+          {shown.length === 0 && (
+            <p className="card__note">没有匹配的插件。换个词，或点「全部」看所有插件。</p>
+          )}
+
+          {(grouped ? groups : [{ cat: '', items: shown }]).map((group) => (
+            <div className="mkt-group" key={group.cat || '__flat__'}>
+              {group.cat && (
+                <p className="mkt-group__title">{`${group.cat} · ${group.items.length} 个`}</p>
+              )}
+              <div className="mkt-cards">
+                {group.items.map((e) => {
+                  const inst = isInstalled(e);
+                  const cat = e.category || '未分类';
+                  return (
+                    <div
+                      className={picked === String(e.id) ? 'mkt-card mkt-card--on' : 'mkt-card'}
+                      key={String(e.id)}
+                      onClick={() => setPicked(String(e.id))}
+                    >
+                      <span className="mkt-card__icon" data-cat={cat}>
+                        {cat.slice(0, 1)}
+                      </span>
+                      <div className="mkt-card__body">
+                        <div className="mkt-card__head">
+                          <b className="mkt-card__name">{e.name}</b>
+                          <span className="mkt-card__ver">{`v${e.version || ''}`}</span>
+                          <span className="mkt-badge">{cat}</span>
+                          <span className="mkt-badge mkt-badge--free">免费</span>
+                        </div>
+                        <div className="mkt-card__desc">
+                          {e.description || `${cat}：装进机器人就能用`}
+                        </div>
+                      </div>
+                      <div className="mkt-card__actions">
+                        <button
+                          type="button"
+                          className="btn btn--ghost"
+                          title="看介绍、功能与可调参数"
+                          onClick={(ev) => {
+                            ev.stopPropagation();
+                            onDetail(String(e.id), e);
+                          }}
+                        >
+                          详情
+                        </button>
+                        {inst ? (
+                          <>
+                            <span className="mkt-installed">✓ 已装</span>
+                            <button
+                              type="button"
+                              className="btn btn--ghost"
+                              title="打开它的可调参数"
+                              onClick={(ev) => {
+                                ev.stopPropagation();
+                                onDetail(String(e.id), e);
+                              }}
+                            >
+                              配置
+                            </button>
+                          </>
+                        ) : (
+                          <button
+                            type="button"
+                            className="btn btn--primary"
+                            onClick={(ev) => {
+                              ev.stopPropagation();
+                              installEntry(e);
+                            }}
+                          >
+                            安装
+                          </button>
+                        )}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          ))}
 
           <p className="card__note">{status}</p>
           {needLogin && (
             <p className="card__note">
-              {LOGIN_HINT}：下面「已装能力包 / 已安装 / 本地插件」三块都会是空的，
-              需要开通的插件也读不到开通状态 —— 不是这些插件不存在。
+              {LOGIN_HINT}：下面「已装能力包 / 已安装 / 本地插件」三块都会是空的 ——
+              不是这些插件不存在。
             </p>
           )}
-          <p className="card__note">已装能力包</p>
+          <h3 className="card__subtitle">已装能力包</h3>
 
           <div className="p-row">
             <div className="p-list p-list--72">
@@ -1586,7 +1882,7 @@ function Plugins({ auth, onDetail = () => {} }) {
             <button
               type="button"
               className="btn btn--ghost"
-              title="先在左边「已装能力包」里选一个，再点这里看它的可调参数"
+              title="先在左边选一个能力包，再点这里调参数。"
               onClick={() => {
                 if (!packId) {
                   setMsg('先在左边「已装能力包」里选一个，再点「配置」');
@@ -1606,28 +1902,47 @@ function Plugins({ auth, onDetail = () => {} }) {
             </button>
           </div>
 
-          <p className="card__note">开发者模式：从 PyPI 安装任意 NoneBot 插件（不推荐，兼容与合规由用户自负）</p>
+          {/* 开发者高级区：默认收起（桌面端 plugins_page 的 _ADVANCED_TITLE 那一段），
+              第三方 zip / PyPI / 在线插件市场都收在里面 —— 平时不占版面，也不诱导点。 */}
+          <details className="fold">
+            <summary className="fold__summary">开发者高级区（第三方 zip / PyPI）</summary>
+            <div className="fold__body">
+              <p className="card__note">
+                要先开「设置 → 开发者模式」；风险自负。
+              </p>
 
-          <div className="p-row">
-            <input
-              className="p-input"
-              value={pkgBusy && pkgStage ? pkgStage : pyPackage}
-              placeholder={devMode ? 'PyPI 包名，如 nonebot-plugin-status' : 'PyPI 包名（需先开开发者模式）'}
-              spellCheck={false}
-              disabled={!devMode || pkgBusy}
-              onChange={(e) => setPyPackage(e.target.value)}
-            />
-            <button
-              type="button"
-              className="btn btn--primary"
-              disabled={!devMode || pkgBusy}
-              onClick={installPyPI}
-            >
-              安装
-            </button>
-          </div>
+              <h3 className="card__subtitle">第三方 zip 安装</h3>
+              <ZipInstall />
 
-          <p className="card__note">已安装（pyproject 记录）</p>
+              <h3 className="card__subtitle">从 PyPI 安装</h3>
+              <div className="p-row">
+                <input
+                  className="p-input"
+                  value={pkgBusy && pkgStage ? pkgStage : pyPackage}
+                  placeholder={devMode ? 'PyPI 包名，如 nonebot-plugin-status' : 'PyPI 包名（需先开开发者模式）'}
+                  spellCheck={false}
+                  disabled={!devMode || pkgBusy}
+                  onChange={(e) => setPyPackage(e.target.value)}
+                />
+                <button
+                  type="button"
+                  className="btn btn--primary"
+                  disabled={!devMode || pkgBusy}
+                  onClick={installPyPI}
+                >
+                  安装
+                </button>
+              </div>
+              <p className="card__note">不推荐：第三方插件风险自负。</p>
+
+              <h3 className="card__subtitle">在线插件市场</h3>
+              <p className="card__note">
+                在页面下方「官网市场」里逛，那是对外开放的区域。
+              </p>
+            </div>
+          </details>
+
+          <h3 className="card__subtitle">已安装（pyproject 记录）</h3>
           <div className="p-list p-list--115">
             {localInfo.store.map((name) => (
               <div className="p-item" key={name}>
@@ -1638,12 +1953,65 @@ function Plugins({ auth, onDetail = () => {} }) {
         </section>
 
         <section className="card pl-panel">
-          <h2 className="card__title">第三方插件（已限制）</h2>
-          <p className="card__note">开发者模式开启后可安装第三方 zip；插件兼容性、安全性、平台协议合规由用户自行承担。</p>
+          <h2 className="card__title">兑换与配置</h2>
 
-          <ZipInstall />
+          {/* 兑换码：桌面端 plugins_page 的「兑换」那一行。走 /api/plugins/redeem，
+              兑换成功后后端会把新权益存到本机，所以顺手再刷一次权益。 */}
+          <h3 className="card__subtitle">兑换码</h3>
+          <div className="p-row">
+            <input
+              className="p-input"
+              value={redeemCode}
+              placeholder="把兑换码粘在这里"
+              spellCheck={false}
+              disabled={redeeming}
+              onChange={(e) => setRedeemCode(e.target.value)}
+            />
+            <button type="button" className="btn btn--primary" disabled={redeeming} onClick={redeem}>
+              {redeeming ? '正在兑换…' : '兑换'}
+            </button>
+          </div>
+          <p className="card__note">
+            {ent && ent.plan
+              ? `当前账号：${ent.email || '已登录'} · ${ent.plan}`
+              : ent && ent.email
+                ? `当前账号：${ent.email}`
+                : '兑换要先登录（设置 → 星群账号）。'}
+          </p>
+          <div className="p-row">
+            <button type="button" className="btn btn--ghost btn--sm" onClick={refreshEnt}>
+              刷新权益
+            </button>
+          </div>
+
+          <h3 className="card__subtitle">和风天气</h3>
+          <p className="card__note">
+            天气插件要用：先生成密钥对，再贴到和风控制台。
+          </p>
+          <div className="p-row">
+            <button
+              type="button"
+              className={qweather ? 'btn btn--primary' : 'btn'}
+              onClick={() => setQweather((v) => !v)}
+            >
+              {qweather ? '收起和风天气配置' : '配置和风天气'}
+            </button>
+          </div>
+
+          <h3 className="card__subtitle">已装列表</h3>
+          <p className="card__note">
+            「已装能力包」就是清单：选中后「配置」或「卸载」；装上即启用。
+          </p>
         </section>
       </div>
+
+      {/* 官网插件市场：和桌面端「插件」页同一份清单（/api/plugins/market）。
+          单独一张全宽卡，不去挤上面那两栏的版面。 */}
+      <MarketPanel
+        busyId={marketBusyId}
+        onInstall={installMarket}
+        onMsg={setMsg}
+      />
 
       {qweather && <QWeatherCard />}
 
@@ -1673,8 +2041,13 @@ function Plugins({ auth, onDetail = () => {} }) {
             复制插件目录
           </button>
           <span className="p-gap" />
-          <button type="button" className="btn btn--primary" onClick={restartBot}>
-            重启 NoneBot 生效
+          <button
+            type="button"
+            className="btn btn--primary"
+            onClick={restartBot}
+            title="装完插件必须重启一次机器人（插件代码不做热重载）；点一下就好，重启日志会写清每步耗时。"
+          >
+            重启机器人（装完插件点这里）
           </button>
         </div>
       </section>
@@ -1693,7 +2066,7 @@ function Plugins({ auth, onDetail = () => {} }) {
                 ? `上次任务失败：${deps.error}`
                 : deps && Array.isArray(deps.missing) && deps.checked
                   ? `上次检查 ${deps.checked} 项依赖，缺失 ${deps.missing.length} 项`
-                  : '当前没有正在执行的安装任务。点上面「重装缺失依赖」或在插件商店安装后，进度会显示在这里。'}
+                  : '当前没有安装任务。'}
         </p>
       </section>
 
@@ -1713,9 +2086,9 @@ function Plugins({ auth, onDetail = () => {} }) {
    「管理器」，选「任务」「NoneBot」永远是空面板 —— 属于点了没用的假筛选项。
    后端已补上 ?name=nonebot（logs.LOG_FILES 白名单，只收名字不收路径），
    于是「NoneBot」这一项现在有真实数据了，重新加回来。 */
-const LOG_SOURCES = ['全部', '管理器', 'NoneBot'];
+const LOG_SOURCES = ['全部', '管理器', '机器人'];
 /* 来源 → 后端日志名（logs.LOG_FILES 的键）。名字写死在这里，页面上永远给不出路径。 */
-const LOG_STREAM_NAMES = { 管理器: 'headless', NoneBot: 'nonebot' };
+const LOG_STREAM_NAMES = { 管理器: 'headless', 机器人: 'nonebot' };
 const LOG_LEVELS = ['全部', 'INFO', 'OK', 'WARN', 'ERROR'];
 
 function inferLevel(line) {
@@ -1733,6 +2106,10 @@ function Logs({ loggedIn = true }) {
   const [source, setSource] = useState('全部');
   const [level, setLevel] = useState('全部');
   const [msg, setMsg] = useState('');
+  // 关键字过滤：日志一多，靠眼睛翻是不现实的（桌面端也有这一条）
+  const [keyword, setKeyword] = useState('');
+  // 实时跟随：默认开（新日志来就贴底）；关掉之后可以安心往回翻，不会被拽下去
+  const [follow, setFollow] = useState(true);
   // 流的状态：'' 正常；否则是一句给用户看的实话（未登录 / 断开）
   const [streamNote, setStreamNote] = useState('');
   const boxRef = useRef(null);
@@ -1767,7 +2144,7 @@ function Logs({ loggedIn = true }) {
          浏览器会自己按 EventSource 的规则重连，所以文案说「正在自动重连」。 */
       es.onerror = () => {
         setStreamNote(
-          `${src} 日志流已断开，浏览器正在自动重连；如果一直连不上，多半是登录态过期了 —— 重新登录后再回本页。`,
+          `${src} 日志流已断开，正在自动重连。一直连不上就重新登录。`,
         );
       };
       return es;
@@ -1776,11 +2153,14 @@ function Logs({ loggedIn = true }) {
   }, [loggedIn]);
 
   useEffect(() => {
-    if (boxRef.current) boxRef.current.scrollTop = boxRef.current.scrollHeight;
-  }, [entries]);
+    if (follow && boxRef.current) boxRef.current.scrollTop = boxRef.current.scrollHeight;
+  }, [entries, follow]);
 
+  const kw = keyword.trim().toLowerCase();
   const shown = entries.filter(
-    (e) => (source === '全部' || e.source === source) && (level === '全部' || e.level === level),
+    (e) => (source === '全部' || e.source === source)
+      && (level === '全部' || e.level === level)
+      && (!kw || e.msg.toLowerCase().includes(kw)),
   );
 
   return (
@@ -1788,7 +2168,7 @@ function Logs({ loggedIn = true }) {
       <header className="page-head">
         <div>
           <h1>日志</h1>
-          <p>管理器（无头端）与 NoneBot（机器人）两路日志实时推送；可按来源与级别筛选。</p>
+          <p>管理器与机器人两路日志实时推送，可按来源与级别筛选。</p>
         </div>
       </header>
 
@@ -1810,6 +2190,33 @@ function Logs({ loggedIn = true }) {
               </option>
             ))}
           </select>
+          <input
+            className="p-input log-kw"
+            value={keyword}
+            placeholder="按关键字过滤，如 错误 / 微信"
+            spellCheck={false}
+            title="只看含这几个字的行；清空就恢复全部"
+            onChange={(e) => setKeyword(e.target.value)}
+          />
+          <span className="tgl-inline log-follow" title="关掉后新日志不会再把你拽到底部">
+            <span>实时跟随</span>
+            <Toggle
+              checked={follow}
+              ariaLabel="实时跟随日志"
+              onChange={(v) => setFollow(v)}
+            />
+          </span>
+          <button
+            type="button"
+            className="btn"
+            title="拉到最新一行"
+            onClick={() => {
+              setFollow(true);
+              if (boxRef.current) boxRef.current.scrollTop = boxRef.current.scrollHeight;
+            }}
+          >
+            跳到最新
+          </button>
           <span className="log-bar__spacer" />
           <button
             type="button"
@@ -1844,9 +2251,25 @@ function Logs({ loggedIn = true }) {
 
         {/* 有日志但筛没了，要说清楚是筛选的问题，不是「日志没了」 */}
         {!streamNote && entries.length > 0 && shown.length === 0 && (
-          <p className="card__note log-note">当前筛选（来源「{source}」· 级别「{level}」）没有匹配的日志，把筛选放宽试试。</p>
+          <p className="card__note log-note">
+            当前筛选没有匹配的日志，放宽试试。
+          </p>
+        )}
+        {follow && shown.length > 0 && (
+          <p className="card__note log-note">
+            {`实时跟随中，共 ${shown.length} 行。`}
+          </p>
         )}
       </section>
+
+      {/* 日志保留的入口就放在日志页里：看完日志顺手就能改保留天数 / 清旧日志，
+          不用再跑去「全局管理」找。默认收起，不抢日志面板的版面。 */}
+      <details className="fold">
+        <summary className="fold__summary">日志保留与清理</summary>
+        <div className="fold__body">
+          <LogRetention onMsg={setMsg} />
+        </div>
+      </details>
 
       {msg && <div className="toast">{msg}</div>}
     </>
@@ -1855,8 +2278,16 @@ function Logs({ loggedIn = true }) {
 
 const PERSONA_PRESETS = {
   星群助手:
-    '你是星群（AstroSwarm）的 AI 助手，负责跨平台对话与记忆管理。回答保持简洁直接，情绪随心情波动，回答长短看情况，只给关键信息，不啰嗦。',
+    '你是星群 AI 助手，回答简洁直接，只给关键信息。',
 };
+
+/* 人设卡片「谁在生效」那一行的文案（导出是为了让冒烟直接断言，不用渲染）。
+   优先级与后端一致：本地人设 > 预设档案 > 手写人格文本（本地人设启用时后端会把档案关掉，二者互斥）。 */
+export function effectivePersonaText(form, activePersona, presetName) {
+  if (activePersona) return `当前生效：本地人设《${activePersona.name || activePersona.id}》`;
+  if (form && form.agent_profile_enabled) return `当前生效：预设档案 ${presetName || '星群助手'}`;
+  return '当前生效：手写人设';
+}
 
 /* ------------------------------------------------------------------ AI 大脑
    与桌面端 brain_page.py 1:1：
@@ -1887,9 +2318,31 @@ const SPIN_LABELS = {
   ai_quiet_start: '免打扰开始(时)',
   ai_quiet_end: '免打扰结束(时)',
 };
+/* 数值项的**纯标签 + 单位**（给 NumberField 用：标签写「间隔最小」、单位后缀写「分」，
+   不再把单位塞在括号里 —— 单位是控件的一部分，不该混在标签文字里）。 */
+const SPIN_META = {
+  ai_interval_min: { label: '间隔最小', unit: '分' },
+  ai_interval_max: { label: '间隔最大', unit: '分' },
+  ai_cooldown: { label: '冷却', unit: '分' },
+  ai_quiet_start: { label: '免打扰开始', unit: '时' },
+  ai_quiet_end: { label: '免打扰结束', unit: '时' },
+};
+// 内置记忆三档（与后端 qbotmanager.core.ai_config 的 MEMORY_LEVEL_* 逐字一致）。
+// 「无」= 不记不读；「基础」= 现在线上的行为（只记事实和日记、带最近 3 条）；
+// 「智能」= 再加高权重与承诺必带、时间线、印象档合并、隐私过滤、可查可删。
+const MEMORY_LEVELS = [
+  ['off', '无'],
+  ['basic', '基础'],
+  ['smart', '智能'],
+];
+const MEMORY_LEVEL_LABELS = { off: '无', basic: '基础', smart: '智能' };
+const MEMORY_LEVEL_HINTS = {
+  off: '无：完全不记也不读，等于回到没有记忆的状态。',
+  basic: '基础：只记事实和日记，每次带上最近 3 条记忆——现在线上就是这一档。',
+  smart: '智能：在基础之上加权重/承诺必带、时间线、印象档合并、隐私过滤与可查可删。',
+};
 // 桌面端 Settings 里已有、但无头端 /api/config 还没接的项：先给同款默认值，UI 与桌面端一致
-const BRAIN_DEFAULTS = {
-  ai_provider: 'custom',
+const BRAIN_DEFAULTS = {  ai_provider: 'custom',
   ai_base_url: '',
   ai_model: '',
   ai_api_key: '',
@@ -1911,11 +2364,16 @@ const BRAIN_DEFAULTS = {
   ai_quiet_start: 0,
   ai_quiet_end: 8,
   memory_enabled: true,
+  /* 内置记忆三档（无/基础/智能）。真实值从 /api/ai/settings 读（见下面的 useEffect），
+     这里只是首帧兜底：桌面端与控制台默认都是「基础」= 现在线上的行为。 */
+  memory_level: 'basic',
   mcp_enabled: false,
   mcp_servers: {},
 };
 
-function AiBrain({ config, onSaved, beginner, loggedIn = true }) {
+// 导出是为了让冒烟把它真渲染一遍并点一次胶囊（人设整合后必须锁住：一张卡、两段、互斥、状态行）
+// profiles 可注入：生产环境就是内置的那份清单；冒烟传空数组验「还没有下载档案」那一句。
+export function AiBrain({ config, onSaved, beginner, loggedIn = true, profiles = AGENT_PROFILES }) {
   const [form, setForm] = useState(null);
   const [personality, setPersonality] = useState('');
   const [msg, setMsg] = useState('');
@@ -1932,7 +2390,19 @@ function AiBrain({ config, onSaved, beginner, loggedIn = true }) {
   const [importPanel, setImportPanel] = useState(false);
   const [importText, setImportText] = useState('');
   const [importName, setImportName] = useState('');
+  /* 人设卡片的「胶囊」两态与本卡片内就地提示。
+     personaPill：滑块滑到哪一段（'preset' / 'custom'），纯视觉；
+     personaHint：切换时改了什么的实话（例如「已切到自定义：预设档案已停用」）。 */
+  const [personaPill, setPersonaPill] = useState('preset');
+  const [personaHint, setPersonaHint] = useState('');
+  const segWrapRef = useRef(null);
+  const segPresetRef = useRef(null);
+  const segCustomRef = useRef(null);
   const [mcpText, setMcpText] = useState('{}');
+  /* 「现在记住了什么」：读内置记忆库（GET /api/memory/builtin）。
+     peek=null 表示还没点过；peekMsg 是读不到时的一句实话。 */
+  const [peek, setPeek] = useState(null);
+  const [peekMsg, setPeekMsg] = useState('');
   /* MCP 状态必须走专用接口 /api/mcp/config（返回 {ok, mcp:{enabled,servers}}）。
      以前从 /api/config 读 mcp_enabled / mcp_servers，而后端 headless_config 的
      DEFAULTS / SAFE_KEYS 根本没有这两个键 → 永远 undefined → 保存时 !!undefined 恒 false，
@@ -1942,12 +2412,11 @@ function AiBrain({ config, onSaved, beginner, loggedIn = true }) {
   // 用户是否真的动过 MCP 控件（勾选框 / JSON 框）；没动过就不提交，避免无谓写入
   const [mcpTouched, setMcpTouched] = useState(false);
   const [wakeBusy, setWakeBusy] = useState(false);
-  /* 服务商模型列表：填完密钥自动拉一次，也能点「获取模型」手动重拉。
-     走 POST /api/ai/models（与桌面端 model_list 同一套候选地址与解析），
-     拉到的优先、上次的缓存兜底，两边都没有时仍可直接手填模型名。 */
+  /* 「获取模型」：按当前服务商地址 + 密钥拉一次真实模型列表（桌面端 brain_page 同一个按钮）。
+     models = 服务商回的模型名；modelMsg = 一句人话结果（拉不到也能手填模型名）。 */
   const [models, setModels] = useState([]);
-  const [modelMsg, setModelMsg] = useState('');
   const [modelBusy, setModelBusy] = useState(false);
+  const [modelMsg, setModelMsg] = useState('');
   const personaFileRef = useRef(null);
 
   useEffect(() => {
@@ -1968,6 +2437,48 @@ function AiBrain({ config, onSaved, beginner, loggedIn = true }) {
       .catch(() => setMcpBase(false));
   }, []);
 
+  /* 内置记忆三档 + 空 @ / 上文窗口：真实值存在机器人侧 aichat_manager.json，
+     只有 /api/ai/settings 读得到（/api/config 是「星群账号」那一层，不带这些键）。
+     读不到就保持兜底值，保存时也不会把这个键写坏——保存只提交用户点过的档位。 */
+  /* 机器人侧「上文/超长」这一组（2026-10-12 补界面）：
+       empty_at_action      只 @ 不写字时怎么办（轻唤一句 / 不回复）
+       context_window_minutes 上文回溯上限（分钟，1~1440）
+       max_incoming_chars   单条正文上限（字，200~100000，0 = 不限制）
+     这三个以前**只有后端、没有输入框**，用户在控制台上根本改不到。
+     「只提交真改过的」：把读到的原值记在 baseline 里，保存时只 PUT 变了的那些 ——
+     既不会把没读到的值写成默认，也不会把用户没动过的项反复写一遍。 */
+  const robotBaseline = useRef(null);
+  useEffect(() => {
+    get('/api/ai/settings')
+      .then((d) => {
+        if (!d) return;
+        robotBaseline.current = {
+          empty_at_action: d.empty_at_action !== undefined ? String(d.empty_at_action) : '',
+          context_window_minutes: typeof d.context_window_minutes === 'number'
+            ? d.context_window_minutes : null,
+          max_incoming_chars: typeof d.max_incoming_chars === 'number'
+            ? d.max_incoming_chars : null,
+        };
+        setForm((prev) => (prev === null ? prev : {
+          ...prev,
+          memory_level: d.memory_level === undefined
+            ? prev.memory_level : String(d.memory_level || 'basic'),
+          memory_enabled: d.memory_level === undefined
+            ? prev.memory_enabled : String(d.memory_level) !== 'off',
+          memory_level_note: d.memory_level_note || prev.memory_level_note,
+          empty_at_action: d.empty_at_action !== undefined
+            ? String(d.empty_at_action) : prev.empty_at_action,
+          empty_at_info: d.empty_at_info || prev.empty_at_info,
+          context_window_minutes: typeof d.context_window_minutes === 'number'
+            ? d.context_window_minutes : prev.context_window_minutes,
+          context_window_note: d.context_window_note || prev.context_window_note,
+          max_incoming_chars: typeof d.max_incoming_chars === 'number'
+            ? d.max_incoming_chars : prev.max_incoming_chars,
+        }));
+      })
+      .catch(() => { /* 未登录 / 接口不可用：不提示，保持兜底值 */ });
+  }, []);
+
   useEffect(() => {
     if (form === null && config) {
       const merged = { ...BRAIN_DEFAULTS, ...config };
@@ -1978,6 +2489,16 @@ function AiBrain({ config, onSaved, beginner, loggedIn = true }) {
 
   // MCP 基线读到后回填表单（用户已经动过 MCP 控件就不覆盖他改的值）
   const formReady = form !== null;
+
+  /* 胶囊滑块回填：按已保存的配置把滑块挪到正确那一段（只挪视觉，不改配置 —— silent）。
+     首次拿到配置才做一次；之后用户点切换就是显式改配置，不再被回填覆盖。 */
+  const pillInitedRef = useRef(false);
+  useEffect(() => {
+    if (pillInitedRef.current || form === null || !config) return;
+    pillInitedRef.current = true;
+    const preset = Boolean(({ ...BRAIN_DEFAULTS, ...config }).agent_profile_enabled);
+    setPersonaPill(preset ? 'preset' : 'custom');
+  }, [config, form]);
   useEffect(() => {
     if (!formReady || !mcpBase || mcpTouched) return;
     setForm((cur) => ({ ...cur, mcp_enabled: mcpBase.enabled, mcp_servers: mcpBase.servers }));
@@ -2024,7 +2545,7 @@ function AiBrain({ config, onSaved, beginner, loggedIn = true }) {
       });
       return list;
     } catch (e) {
-      setMsg(`人设列表读取失败：${e.message}`);
+      setMsg(apiErrText(e, '人设列表'));
       return [];
     }
   };
@@ -2032,6 +2553,101 @@ function AiBrain({ config, onSaved, beginner, loggedIn = true }) {
   useEffect(() => { refreshPersonas(); }, []);
 
   const personaName = (p) => (p && (p.name || p.id)) || '';
+
+  /* 胶囊的键盘操作：Tab 能聚焦到胶囊上，左右方向键在两段之间切换（原生分段控件的手感）。
+     Tab 焦点跟着选中项走（选中项 tabIndex=0，另一段 -1），所以一次 Tab 进一次就够。 */
+  const segOrder = ['preset', 'custom'];
+  const onSegKey = (e, key, other, otherRef) => {
+    const k = e.key;
+    if (k === 'ArrowLeft' || k === 'ArrowRight' || k === 'ArrowUp' || k === 'ArrowDown') {
+      e.preventDefault();
+      onPersonaPill(other);
+      if (otherRef && otherRef.current) otherRef.current.focus();
+      return;
+    }
+    if (k === 'Home' || k === 'End') {
+      e.preventDefault();
+      const want = k === 'Home' ? segOrder[0] : segOrder[segOrder.length - 1];
+      if (want !== key) {
+        onPersonaPill(want);
+        const ref = want === 'preset' ? segPresetRef : segCustomRef;
+        if (ref.current) ref.current.focus();
+      }
+      return;
+    }
+    if (k === 'Enter' || k === ' ') {
+      e.preventDefault();
+      onPersonaPill(key);
+    }
+  };
+
+  /* 只保存人格设定这一项（自定义/手写人设用）。不碰接口配置、不碰 MCP。 */
+  const savePersonality = async () => {
+    setPersonaBusy(true);
+    try {
+      const d = await put('/api/ai/personality', { personality });
+      if (d && d.personality !== undefined) setPersonality(d.personality);
+      onSaved();
+      setMsg('人格设定已保存，重启机器人生效。');
+    } catch (e) {
+      setMsg(`保存人格设定失败：${e.message}`);
+    } finally {
+      setPersonaBusy(false);
+    }
+  };
+
+  /* ------------------------------------------------------------ 谁在生效
+     三块并成一张卡片后，用户第一眼要看到「现在到底是谁在说话」。优先级与后端一致：
+     本地人设 > 预设档案 > 手写人格文本（本地人设启用时后端会把档案开关关掉，二者互斥）。
+     取值放在下面 f 定义之后（effectivePersonaLabel），这里只留切换逻辑。 */
+
+  /* 切换胶囊 = 互斥切换：切到「自定义」就关掉预设档案；切回「预设」就停用本地人设。
+     两条路径都会把结果写回服务器（/api/config 的 agent_profile_enabled + local_persona_id），
+     并且**一定**就地说明改了什么，绝不静默改状态。 */
+  const persistPersonaMode = async (patch) => {
+    try {
+      const saved = await put('/api/config', patch);
+      setForm((cur) => ({ ...(cur || BRAIN_DEFAULTS), ...patch, ...(saved || {}) }));
+      onSaved();
+      return true;
+    } catch (e) {
+      setMsg(`保存人设来源失败：${e.message}`);
+      return false;
+    }
+  };
+
+  const onPersonaPill = async (key, opts) => {
+    if (key !== 'preset' && key !== 'custom') return;
+    if (key === personaPill) return;
+    setPersonaPill(key);
+    if (opts && opts.silent) return;            // 初始化回填：只挪滑块，不动配置
+    if (key === 'preset') {
+      // 启用档案 = 停用本地人设（后端 persona/activate 也是这么互斥的）
+      const had = Boolean(activePersona);
+      if (had) {
+        try {
+          const d = await post('/api/persona/deactivate', {});
+          if (d && d.personality !== undefined) setPersonality(d.personality);
+        } catch (e) {
+          setMsg(`停用本地人设失败：${e.message}`);
+        }
+      }
+      const ok = await persistPersonaMode({ agent_profile_enabled: true, local_persona_id: '' });
+      if (had) await refreshPersonas();     // 列表里的「启用中」标记要跟着掉，状态行才会改口
+      setPersonaHint(had
+        ? '已切到预设：本地人设已停用，改用档案里的人格。'
+        : '已切到预设：按档案走，本地人设保持停用。');
+      if (ok) setMsg('已切到预设档案（重启机器人生效）');
+      return;
+    }
+    // key === 'custom'：用本地人设或手写人格文本 —— 预设档案必须让位
+    const hadProfile = Boolean(f.agent_profile_enabled);
+    const ok = await persistPersonaMode({ agent_profile_enabled: false });
+    setPersonaHint(hadProfile
+      ? '已切到自定义：预设档案已停用，人格以本地人设 / 下面这段文字为准。'
+      : '已切到自定义：预设档案本来就是关的，人格以本地人设 / 下面这段文字为准。');
+    if (ok) setMsg('已切到自定义（本地人设或手写人格，重启机器人生效）');
+  };
 
   const importPersonaPayload = async (payload) => {
     setPersonaBusy(true);
@@ -2093,7 +2709,7 @@ function AiBrain({ config, onSaved, beginner, loggedIn = true }) {
       const d = await post('/api/persona/deactivate', {});
       if (d.personality !== undefined) setPersonality(d.personality);
       await refreshPersonas();
-      setMsg('已停用本地人设，人格恢复内置默认，重启机器人后生效。');
+      setMsg('已停用本地人设，重启机器人后生效。');
     } catch (e) {
       setMsg(`停用失败：${e.message}`);
     } finally {
@@ -2123,8 +2739,20 @@ function AiBrain({ config, onSaved, beginner, loggedIn = true }) {
     }
   };
 
-  const togglePersonaGuide = async () => {
-    if (guide) {                 // 再点一次收起
+  /* 「现在记住了什么」：拉一次内置记忆库。读不到就说读不到（不显示成「没有记忆」）。 */
+  const peekBuiltinMemory = async () => {
+    setPeekMsg('');
+    try {
+      const d = await get('/api/memory/builtin');
+      setPeek(d);
+      if (!d || !d.rows || !d.rows.length) setPeekMsg('还没有记忆：聊过天之后这里会出现它记住的事。');
+    } catch (e) {
+      setPeek({ level_label: '—', rows: [] });
+      setPeekMsg(`读记忆库失败：${e.message}`);
+    }
+  };
+
+  const togglePersonaGuide = async () => {    if (guide) {                 // 再点一次收起
       setGuide('');
       return;
     }
@@ -2136,8 +2764,14 @@ function AiBrain({ config, onSaved, beginner, loggedIn = true }) {
     }
   };
 
-  const f = form || BRAIN_DEFAULTS;
+  // 还没拿到配置时的兜底也带上 config（服务端渲染 / 首帧就能说对「谁在生效」，不会先闪一句错的）
+  const f = form || { ...BRAIN_DEFAULTS, ...(config || {}) };
   const set = (patch) => setForm({ ...f, ...patch });
+  /* 谁在生效：本地人设 > 预设档案 > 手写人格文本（f / personas 都在上面了，顺序不能提前） */
+  const activePersona = personas.find((p) => p.active) || null;
+  const presetName = (profiles.find(([k]) => k === (f.agent_profile_id || 'star_helper')) || [])
+    .slice(1)[0] || '星群助手';
+  const effectivePersonaLabel = effectivePersonaText(f, activePersona, presetName);
   const onProvider = (key) => {
     const p = AI_PROVIDERS.find((x) => x[0] === key) || AI_PROVIDERS[0];
     const patch = { ai_provider: key };
@@ -2146,45 +2780,30 @@ function AiBrain({ config, onSaved, beginner, loggedIn = true }) {
     set(patch);
   };
 
-  // 与后端 ai_config.normalize_api_url 同口径：去掉误贴的 /chat/completions 与尾斜杠，
-  // 缓存键才跟服务端写进去的那把对得上。
-  const normUrl = (u) => String(u || '').trim()
-    .replace(/\/chat\/completions$/i, '')
-    .replace(/\/+$/, '');
-  const cachedModels = () => {
-    const cache = f.ai_models_cache;
-    if (!cache || typeof cache !== 'object') return [];
-    return cache[normUrl(f.ai_base_url)] || [];
-  };
-  const modelOptions = models.length ? models : cachedModels();
 
+  /* 获取模型：后端拿接口地址 + 密钥去问服务商要模型列表（密钥留空/脱敏时用服务器上那把）。
+     拉不到不算错：提示一句「可以手填」，不挡保存。 */
   const fetchModels = async () => {
     if (modelBusy) return;
     setModelBusy(true);
     setModelMsg('正在获取模型列表…');
     try {
-      // 密钥留空或还是 ****1234 的脱敏值时，后端用服务器上存的那把（保存过就能直接拉）
       const r = await post('/api/ai/models', {
         api_url: f.ai_base_url || '',
         api_key: f.ai_api_key || '',
         protocol: 'openai',
       });
-      const list = r.models || [];
+      const list = (r && r.models) || [];
       setModels(list);
       setModelMsg(list.length
-        ? `拉到 ${r.count} 个模型：${list.slice(0, 8).join('、')}${list.length > 8 ? ' …' : ''}`
+        ? `拉到 ${r.count || list.length} 个模型，下面选一个就填进「模型」`
         : '服务商没回模型列表 —— 直接手填模型名即可');
     } catch (e) {
+      setModels([]);
       setModelMsg(`没拉到（${e.message}）—— 可以直接手填模型名，保存不受影响`);
     } finally {
       setModelBusy(false);
     }
-  };
-
-  // 填完密钥（真的改了，不是脱敏值）离开输入框就自动拉一次
-  const onKeyBlur = () => {
-    const key = String(f.ai_api_key || '').trim();
-    if (key && !key.startsWith('****')) fetchModels();
   };
 
   const genWake = async () => {
@@ -2232,6 +2851,60 @@ function AiBrain({ config, onSaved, beginner, loggedIn = true }) {
       const savedCfg = await put('/api/config', payload);
       setForm({ ...f, ...savedCfg, mcp_servers: servers });
       await put('/api/ai/personality', { personality });
+      /* 内置记忆三档走专用接口（与桌面端「AI 大脑」页写的是同一份
+         aichat_manager.json）。机器人侧**每条消息现读**这份配置
+         （core/memory/policy.py::level()），所以改完立即生效，不用重启。 */
+      let memMsg = '';
+      /* 「上文 / 超长 / 只 @ 不写字」三项目前和记忆档位走同一个接口（/api/ai/settings），
+         打包成一次 PUT；只提交**相对读到的基线真的变了**的键。
+         没读到基线（未登录）时一个都不提交 —— 免得把服务器上的值写成界面默认值。 */
+      const extra = {};
+      const baseLine = robotBaseline.current;
+      if (baseLine) {
+        if (baseLine.empty_at_action
+          && String(f.empty_at_action || '') !== baseLine.empty_at_action) {
+          extra.empty_at_action = String(f.empty_at_action);
+        }
+        if (baseLine.context_window_minutes !== null
+          && Number(f.context_window_minutes) !== baseLine.context_window_minutes) {
+          extra.context_window_minutes = Number(f.context_window_minutes);
+        }
+        if (baseLine.max_incoming_chars !== null
+          && Number(f.max_incoming_chars) !== baseLine.max_incoming_chars) {
+          extra.max_incoming_chars = Number(f.max_incoming_chars);
+        }
+      }
+      const wantSettings = Boolean(f.memory_level) || Object.keys(extra).length > 0;
+      if (wantSettings) {
+        const body = { ...extra };
+        if (f.memory_level) body.memory_level = String(f.memory_level);
+        try {
+          const r = await put('/api/ai/settings', body);
+          const changed = (r && r.changed) || [];
+          const bits = [];
+          if (body.memory_level) {
+            bits.push(changed.includes('memory_level')
+              ? `记忆档位：${MEMORY_LEVEL_LABELS[f.memory_level] || f.memory_level}`
+              : '记忆档位没变');
+          }
+          if (extra.empty_at_action) bits.push('只 @ 不写字的处理方式');
+          if (extra.context_window_minutes !== undefined) bits.push('上文回溯上限');
+          if (extra.max_incoming_chars !== undefined) bits.push('单条正文上限');
+          // 后端还没接 max_incoming_chars 时不能装成存上了：看 changed 里有没有它
+          if (extra.max_incoming_chars !== undefined && !changed.includes('max_incoming_chars')) {
+            bits.push('单条正文上限**服务器还没接这个接口，本次没写进去**');
+          }
+          if (bits.length) memMsg = `；${bits.join('、')}`;
+          if (r && typeof r.max_incoming_chars === 'number') {
+            robotBaseline.current = {
+              ...(robotBaseline.current || {}),
+              max_incoming_chars: r.max_incoming_chars,
+            };
+          }
+        } catch (e) {
+          memMsg = `；上文/超长那一组保存失败：${e.message}`;
+        }
+      }
       /* MCP 走专用接口（存进机器人侧读的那份 manager 文件）。
          写之前必须确认「读到了基线」：读不到（未登录 / 接口不可用）时一个字节都不写，
          否则就会重现「不写 MCP 却把写成 enabled:false」这种把配置改坏的问题。
@@ -2255,7 +2928,8 @@ function AiBrain({ config, onSaved, beginner, loggedIn = true }) {
         mcpMsg = '；MCP 状态没读到，本次未改动服务器上的 MCP 配置（登录后重试）';
       }
       setMsg(
-        `AI 配置已保存 ${Object.keys(payload).length} 项（模型 / 智能体档案 / 视觉）${mcpMsg}，重启机器人生效；` +
+        `AI 配置已保存 ${Object.keys(payload).length} 项（模型 / 智能体档案 / 视觉）${mcpMsg}${memMsg}，` +
+        '**改完立即生效（不用重启机器人）**；' +
         '主动聊天与记忆等数值在「插件详情页」里改。'
       );
       setMcpText(JSON.stringify(servers, null, 2));
@@ -2268,25 +2942,30 @@ function AiBrain({ config, onSaved, beginner, loggedIn = true }) {
   const headlessTodo = (what) => setMsg(
     `${what}：这是桌面端（Windows 版）的功能，无头端暂未接入 —— 记忆时间线、本地知识库请在桌面版里操作。`
   );
-  const num = (key, lo, hi) => (
-    <label className="num-item" key={key}>
-      <span>{SPIN_LABELS[key]}</span>
-      <input
-        type="number"
+  /* 数值项（2026-10-12）：原来是一排裸 input[type=number]（.num-grid），
+     现在统一走 NumberField：标签 + −/+ 步进 + 范围提示；跨度 ≤ 20 档的（免打扰时段 0~23）
+     自动变滑杆。这些项**低频**，由下面那两处 Collapse 收起来，标题行给当前值摘要。 */
+  const num = (key, lo, hi) => {
+    const meta = SPIN_META[key] || { label: SPIN_LABELS[key] || key, unit: '' };
+    return (
+      <NumberField
+        key={key}
+        label={meta.label}
+        value={f[key]}
         min={lo}
         max={hi}
-        value={f[key]}
-        onChange={(e) => set({ [key]: e.target.value === '' ? lo : Number(e.target.value) })}
+        unit={meta.unit}
+        onChange={(v) => set({ [key]: v })}
       />
-    </label>
-  );
+    );
+  };
 
   return (
     <>
       <header className="page-head">
         <div>
           <h1>AI 大脑</h1>
-          <p>内置 AI 大脑：QQ / 微信 / 飞书 / 纸飞机共享模型、记忆与工具；接口配置与平台开关在本页完成</p>
+          <p>QQ / 微信 / 飞书 / 纸飞机共用一个 AI 大脑。</p>
         </div>
       </header>
 
@@ -2318,9 +2997,11 @@ function AiBrain({ config, onSaved, beginner, loggedIn = true }) {
             .join(' / ')}
           {' · 人格 '}
           <b>
-            {f.agent_profile_enabled
-              ? `智能体档案（${f.agent_profile_id || '默认'}）`
-              : '内置人格'}
+            {activePersona
+              ? `本地人设《${personaName(activePersona)}》`
+              : (f.agent_profile_enabled
+                ? `智能体档案（${f.agent_profile_id || '默认'}）`
+                : '内置人格')}
           </b>
         </span>
         {!f.ai_api_key && (
@@ -2334,37 +3015,40 @@ function AiBrain({ config, onSaved, beginner, loggedIn = true }) {
         <h2 className="card__title">接口配置</h2>
         <p className="card__note">
           选择服务商自动填接口地址与默认模型（预设已按官方文档核对）；平台开关决定 AI
-          在哪些平台生效，保存后重启机器人生效。
+          在哪些平台生效，<b>保存后立即生效，不用重启机器人</b>。
         </p>
 
+        {/* 2026-10-12：原来四个平台是一排 16px 的裸复选框（老板说的"开关太 low"就是这个）。
+            换成同一套开关：整块可点、键盘 Tab 可达、空格切换、有焦点环。
+            这四个是**功能开关**，不折进折叠区 —— 藏起来会让人以为"这个平台不支持了"。 */}
         <div className="kv-row kv-row--platform">
           <span>平台启用</span>
           {[
             ['qq', 'QQ'],
             ['wechat', '微信'],
           ].map(([key, label]) => (
-            <label className="check" key={key} title="关闭后 AI 大脑不再处理该平台的消息，但平台通道本身仍正常运行">
-              <input
-                type="checkbox"
-                checked={Boolean((f.ai_platforms || {})[key])}
-                onChange={(e) => set({ ai_platforms: { ...(f.ai_platforms || {}), [key]: e.target.checked } })}
-              />
+            <span className="tgl-inline" key={key} title="关掉后 AI 大脑不再处理该平台的消息。">
               <span>{label}</span>
-            </label>
+              <Toggle
+                checked={Boolean((f.ai_platforms || {})[key])}
+                ariaLabel={`${label} 平台启用`}
+                onChange={(v) => set({ ai_platforms: { ...(f.ai_platforms || {}), [key]: v } })}
+              />
+            </span>
           ))}
           {!beginner &&
             [
               ['feishu', '飞书'],
               ['telegram', '纸飞机'],
             ].map(([key, label]) => (
-              <label className="check" key={key}>
-                <input
-                  type="checkbox"
-                  checked={Boolean((f.ai_platforms || {})[key])}
-                  onChange={(e) => set({ ai_platforms: { ...(f.ai_platforms || {}), [key]: e.target.checked } })}
-                />
+              <span className="tgl-inline" key={key}>
                 <span>{label}</span>
-              </label>
+                <Toggle
+                  checked={Boolean((f.ai_platforms || {})[key])}
+                  ariaLabel={`${label} 平台启用`}
+                  onChange={(v) => set({ ai_platforms: { ...(f.ai_platforms || {}), [key]: v } })}
+                />
+              </span>
             ))}
         </div>
 
@@ -2373,7 +3057,7 @@ function AiBrain({ config, onSaved, beginner, loggedIn = true }) {
           <select
             value={f.ai_provider || 'custom'}
             onChange={(e) => onProvider(e.target.value)}
-            title="DeepSeek / 通义 / 智谱 / Kimi / OpenAI 等大厂接口自动填地址与默认模型，也可选「自定义接口」手动填写"
+            title="选大厂服务商自动填地址与模型，也可自定义。"
           >
             {AI_PROVIDERS.map(([key, name]) => (
               <option key={key} value={key}>
@@ -2396,31 +3080,12 @@ function AiBrain({ config, onSaved, beginner, loggedIn = true }) {
         <div className="kv-row kv-row--wide">
           <span>模型</span>
           <input
-            list="as-model-options"
             value={f.ai_model ?? ''}
-            placeholder="填完密钥后点「获取模型」，也可直接手填"
+            placeholder="deepseek-v4-flash"
             spellCheck={false}
             onChange={(e) => set({ ai_model: e.target.value })}
           />
-          <button
-            type="button"
-            className="btn btn--ghost"
-            onClick={fetchModels}
-            disabled={modelBusy}
-            title="按上面填的接口地址与 API 密钥，去服务商拉一份你账号里真实可用的模型列表"
-          >
-            {modelBusy ? '获取中…' : '获取模型'}
-          </button>
-          <datalist id="as-model-options">
-            {modelOptions.map((m) => (
-              <option key={m} value={m} />
-            ))}
-          </datalist>
         </div>
-        <p className="card__note">
-          {modelMsg
-            || '模型名不再写死：填完 API 密钥会自动去服务商拉一次真实列表（拉不到也能直接手填，服务商刚上线的新模型照样能用）。'}
-        </p>
 
         <div className="kv-row kv-row--wide">
           <span>API 密钥</span>
@@ -2430,140 +3095,217 @@ function AiBrain({ config, onSaved, beginner, loggedIn = true }) {
             placeholder="sk-..."
             spellCheck={false}
             onChange={(e) => set({ ai_api_key: e.target.value })}
-            onBlur={onKeyBlur}
           />
         </div>
 
         <div className="btn-row">
-          <button type="button" className="btn btn--primary" onClick={save}>
+          <PillButton
+            disabled={modelBusy || !String(f.ai_base_url || '').trim()}
+            loading={modelBusy}
+            title="按上面的接口地址和密钥，问服务商要一次真实模型列表"
+            onClick={fetchModels}
+          >
+            {modelBusy ? '获取中…' : '获取模型'}
+          </PillButton>
+          <PillButton tone="primary" onClick={save}>
             保存 AI 配置
-          </button>
+          </PillButton>
         </div>
-      </section>
-
-      {!beginner && (
-        <section className="card card--strong card--brain">
-          <h2 className="card__title">智能体档案</h2>
-          <p className="card__note">
-            想让它按「李清菡 / EVA」这类预设运行就打开下面的开关；人格仍以上方人格设定为准。
-          </p>
-
-          <label className="check" title="开启后机器人按所选档案的功能层运行（李清菡：群管/语音/图片/游戏/记忆等）">
-            <input
-              type="checkbox"
-              checked={Boolean(f.agent_profile_enabled)}
-              onChange={(e) => set({ agent_profile_enabled: e.target.checked })}
-            />
-            <span>启用智能体档案（默认关闭）</span>
-          </label>
-
+        {modelMsg && <p className="card__note">{modelMsg}</p>}
+        {models.length > 0 && (
           <div className="kv-row kv-row--wide">
-            <span>档案选择</span>
+            <span>模型列表</span>
             <select
-              value={f.agent_profile_id || 'star_helper'}
-              onChange={(e) => set({ agent_profile_id: e.target.value })}
-              title="星群助手 = 默认行为；李清菡 = 完整功能层预设"
+              value=""
+              title="选一个就填到上面的「模型」里"
+              onChange={(e) => { if (e.target.value) set({ ai_model: e.target.value }); }}
             >
-              {AGENT_PROFILES.map(([key, name]) => (
-                <option key={key} value={key}>
-                  {name}
-                </option>
+              <option value="">选一个填进「模型」</option>
+              {models.map((m) => (
+                <option key={m} value={m}>{m}</option>
               ))}
             </select>
           </div>
+        )}
+      </section>
 
-          <details style={{ marginTop: 12 }}>
-            <summary
-              style={{
-                cursor: 'pointer',
-                fontSize: 13,
-                opacity: 0.7,
-                padding: '6px 0',
-              }}
-            >
-              高级设置：唤醒词 · 绑定账号 · 视觉模型（默认收起）
-            </summary>
-            <p className="card__note" style={{ marginTop: 8 }}>
-              唤醒词用于群聊无 @ 唤醒（私聊不需要）；QQ 群不 @ 也回复，需要群主开启「获取群内全部消息」后才会推送。
+      {/* 人设：档案（预设）/ 本地人设（自定义）/ 人格文本 / 主动聊天 —— 合成一张卡片。
+          以前这是三张卡（智能体档案 / 人设工坊（本地）/ 人设与主动聊天），功能重合、
+          设置框离得远，用户看不出「到底谁在生效」。现在顶部一个胶囊切换来源，
+          下面固定放主动聊天这几项（跟人设来源无关）。
+          小白模式也显示这张卡：与桌面端 set_beginner() 一致（它只藏档案/工坊/记忆，
+          人设与主动聊天这一块始终在）。 */}
+      <section className="card card--strong card--brain">
+        <h2 className="card__title">人设与主动聊天</h2>
+        <p className="card__note">
+          先选人设从哪来：用下载好的档案（预设），还是自己写 / 导入一份（自定义）；
+          <b>人设与主动聊天参数改完立即生效，不用重启机器人</b>。
+        </p>
+
+        <div className="seg" role="tablist" aria-label="人设来源" ref={segWrapRef}>
+          <span className="seg__thumb" data-pos={personaPill} aria-hidden="true" />
+          <button
+            type="button"
+            ref={segPresetRef}
+            className={personaPill === 'preset' ? 'seg__btn seg__btn--on' : 'seg__btn'}
+            role="tab"
+            aria-selected={personaPill === 'preset'}
+            tabIndex={personaPill === 'preset' ? 0 : -1}
+            title="用下载好的智能体档案（会自动停用本地人设）"
+            onClick={() => onPersonaPill('preset')}
+            onKeyDown={(e) => onSegKey(e, 'preset', 'custom', segCustomRef)}
+          >
+            预设
+          </button>
+          <button
+            type="button"
+            ref={segCustomRef}
+            className={personaPill === 'custom' ? 'seg__btn seg__btn--on' : 'seg__btn'}
+            role="tab"
+            aria-selected={personaPill === 'custom'}
+            tabIndex={personaPill === 'custom' ? 0 : -1}
+            title="用本地人设或自己写的人格文本（会自动停用预设档案）"
+            onClick={() => onPersonaPill('custom')}
+            onKeyDown={(e) => onSegKey(e, 'custom', 'preset', segPresetRef)}
+          >
+            自定义
+          </button>
+        </div>
+        <p className="card__note" style={{ marginTop: 0 }}>
+          预设 = 下载好的智能体档案；自定义 = 自己写或导入的人设。两段互斥，切换会告诉你改了什么。
+        </p>
+
+        <p
+          className={activePersona
+            ? 'brain-status brain-status--local'
+            : (f.agent_profile_enabled ? 'brain-status brain-status--profile' : 'brain-status')}
+        >
+          {effectivePersonaLabel}
+        </p>
+        {personaHint && <p className="card__note brain-pill-hint">{personaHint}</p>}
+
+        {personaPill === 'preset' ? (
+          <div className="persona-pane" role="tabpanel" aria-label="预设">
+            <p className="card__note">
+              挑个档案打开开关，就有群管、表情、游戏等功能。
             </p>
+            <ToggleRow
+              checked={Boolean(f.agent_profile_enabled)}
+              label="启用档案"
+              desc="开启后按档案启用群管、语音、图片、游戏。"
+              onChange={(on) => {
+                set({ agent_profile_enabled: on });
+                setPersonaHint(on
+                  ? '已启用预设档案：保存后按档案走（人格设定仍以上面那段文字为准）。'
+                  : '已关掉预设档案：改成手写人格或本地人设。');
+              }}
+            />
 
-          <div className="kv-row kv-row--wide">
-            <span>唤醒词</span>
-            <input
-              value={f.agent_wake_words ?? ''}
-              placeholder="逗号分隔，如：李清菡,学姐,菡姐,菡菡（留空 = 档案默认）"
-              spellCheck={false}
-              onChange={(e) => set({ agent_wake_words: e.target.value })}
-            />
-            <button
-              type="button"
-              className="btn btn--ghost"
-              onClick={genWake}
-              disabled={wakeBusy}
-              title="用上方语言模型按人格文本生成唤醒词；未配置模型时自动按名字句式提取"
-            >
-              {wakeBusy ? '生成中…' : '按人格生成'}
-            </button>
-          </div>
+            {profiles.length ? (
+              <div className="kv-row kv-row--wide">
+                <span>档案选择</span>
+                <select
+                  value={f.agent_profile_id || 'star_helper'}
+                  onChange={(e) => set({ agent_profile_id: e.target.value })}
+                  title="星群助手 = 默认行为；李清菡 = 完整功能层预设"
+                >
+                  {profiles.map(([key, name]) => (
+                    <option key={key} value={key}>
+                      {name}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            ) : (
+              <p className="brain-list__empty">还没有下载档案，去「插件工坊」看看</p>
+            )}
 
-          <label className="check">
-            <input
-              type="checkbox"
-              checked={Boolean(f.agent_wake_auto)}
-              onChange={(e) => set({ agent_wake_auto: e.target.checked })}
-            />
-            <span>人格变化时自动重新生成唤醒词（手动修改唤醒词后自动取消）</span>
-          </label>
+            <details style={{ marginTop: 12 }}>
+              <summary
+                style={{
+                  cursor: 'pointer',
+                  fontSize: 13,
+                  opacity: 0.7,
+                  padding: '6px 0',
+                }}
+              >
+                高级设置：唤醒词 · 绑定账号 · 视觉模型（默认收起）
+              </summary>
+              <p className="card__note" style={{ marginTop: 8 }}>
+                唤醒词用于群聊，不用 @ 也能叫醒；私聊直接说。
+              </p>
 
-          <div className="kv-row kv-row--wide">
-            <span>你同学 openid</span>
-            <input
-              value={f.agent_owner_openid ?? ''}
-              placeholder="你的官方 openid（先用你的账号与机器人对话，从消息中心会话标识复制；留空 = 群管专属命令降级）"
-              spellCheck={false}
-              onChange={(e) => set({ agent_owner_openid: e.target.value })}
-            />
-          </div>
+              <div className="kv-row kv-row--wide">
+                <span>唤醒词</span>
+                <input
+                  value={f.agent_wake_words ?? ''}
+                  placeholder="逗号分隔，如：李清菡,学姐,菡姐,菡菡（留空 = 档案默认）"
+                  spellCheck={false}
+                  onChange={(e) => set({ agent_wake_words: e.target.value })}
+                />
+                <button
+                  type="button"
+                  className="btn btn--ghost"
+                  onClick={genWake}
+                  disabled={wakeBusy}
+                  title="按人格文本生成唤醒词；没配模型时按名字提取。"
+                >
+                  {wakeBusy ? '生成中…' : '按人格生成'}
+                </button>
+              </div>
 
-          <p className="card__note">视觉模型（图片描述/生成；密钥留空 = 不启用）</p>
-          <div className="kv-row kv-row--wide">
-            <span>视觉接口地址</span>
-            <input
-              value={f.vision_api_url ?? ''}
-              placeholder="https://api.siliconflow.cn/v1"
-              spellCheck={false}
-              onChange={(e) => set({ vision_api_url: e.target.value })}
-            />
-          </div>
-          <div className="kv-row kv-row--wide">
-            <span>视觉模型</span>
-            <input
-              value={f.vision_model ?? ''}
-              placeholder="Qwen/Qwen3-Omni-30B-A3B-Instruct"
-              spellCheck={false}
-              onChange={(e) => set({ vision_model: e.target.value })}
-            />
-          </div>
-          <div className="kv-row kv-row--wide">
-            <span>视觉 API 密钥</span>
-            <input
-              type="password"
-              value={f.vision_api_key ?? ''}
-              placeholder="sk-..."
-              spellCheck={false}
-              onChange={(e) => set({ vision_api_key: e.target.value })}
-            />
-          </div>
-          </details>
-        </section>
-      )}
+              <ToggleRow
+                checked={Boolean(f.agent_wake_auto)}
+                label="人格变化时自动重生成唤醒词"
+                onChange={(v) => set({ agent_wake_auto: v })}
+              />
 
-      {!beginner && (
-        <section className="card card--strong card--brain">
-          <h2 className="card__title">人设工坊（本地）</h2>
+              <div className="kv-row kv-row--wide">
+                <span>你的会话标识</span>
+                <input
+                  value={f.agent_owner_openid ?? ''}
+                  placeholder="从「消息中心」复制你的会话标识贴这里"
+                  spellCheck={false}
+                  onChange={(e) => set({ agent_owner_openid: e.target.value })}
+                />
+              </div>
+
+              <p className="card__note">视觉模型（图片描述/生成；密钥留空 = 不启用）</p>
+              <div className="kv-row kv-row--wide">
+                <span>视觉接口地址</span>
+                <input
+                  value={f.vision_api_url ?? ''}
+                  placeholder="https://api.siliconflow.cn/v1"
+                  spellCheck={false}
+                  onChange={(e) => set({ vision_api_url: e.target.value })}
+                />
+              </div>
+              <div className="kv-row kv-row--wide">
+                <span>视觉模型</span>
+                <input
+                  value={f.vision_model ?? ''}
+                  placeholder="Qwen/Qwen3-Omni-30B-A3B-Instruct"
+                  spellCheck={false}
+                  onChange={(e) => set({ vision_model: e.target.value })}
+                />
+              </div>
+              <div className="kv-row kv-row--wide">
+                <span>视觉 API 密钥</span>
+                <input
+                  type="password"
+                  value={f.vision_api_key ?? ''}
+                  placeholder="sk-..."
+                  spellCheck={false}
+                  onChange={(e) => set({ vision_api_key: e.target.value })}
+                />
+              </div>
+            </details>
+          </div>
+        ) : (
+          <div className="persona-pane" role="tabpanel" aria-label="自定义">
           <p className="card__note">
-            上传自己的「人格卡 + 工具」人设包（和内置李清菡 / EVA 同一种模式）：先下载模板填写，再导入
-            JSON 或 zip（也可以直接粘一段人设文字）；启用后写入人格并加载自带工具，保存重启机器人生效。启用本地人设会自动关闭上方智能体档案，避免双人格。
+            导入人设包：先下载模板填写，再导入。
+            也可以直接粘一段人设文字；启用后会自动关闭预设档案。
           </p>
           <div className="btn-row btn-row--6">
             <button
@@ -2622,7 +3364,7 @@ function AiBrain({ config, onSaved, beginner, loggedIn = true }) {
                 <textarea
                   className="brain-area"
                   value={importText}
-                  placeholder="也可以直接把人格卡 JSON 或一整段人设文字粘在这里，再点右边「导入」"
+                  placeholder="也可以直接粘一段人设文字，再点「导入」。"
                   spellCheck={false}
                   onChange={(e) => setImportText(e.target.value)}
                 />
@@ -2702,39 +3444,53 @@ function AiBrain({ config, onSaved, beginner, loggedIn = true }) {
               卸载
             </button>
           </div>
-        </section>
-      )}
 
-      <section className="card card--strong card--brain">
-        <h2 className="card__title">人设与主动聊天</h2>
-        <p className="card__note">原 ac 指令已移除，改在这里配置；保存后重启机器人生效。</p>
+          {/* 人格设定 = 最终生效的人设文本：档案 / 本地人设最终都以文本形式落到这里，
+              也可以什么都不选、直接手写一段。保存按钮只写这一项（/api/ai/personality）。 */}
+          <div className="kv-row kv-row--wide kv-row--top">
+            <span>人格设定</span>
+            <textarea
+              className="brain-area"
+              value={personality}
+              placeholder="例如：回答简洁直接，不废话…"
+              spellCheck={false}
+              onChange={(e) => setPersonality(e.target.value)}
+            />
+          </div>
+          <div className="btn-row btn-row--6">
+            <button
+              type="button"
+              className="btn btn--primary"
+              disabled={personaBusy}
+              title="只保存这一项人格设定，不动接口配置"
+              onClick={savePersonality}
+            >
+              {personaBusy ? '保存中…' : '保存人设'}
+            </button>
+            <span className="card__note" style={{ margin: 0 }}>
+              这里写什么，机器人就按什么演；留空 = 内置默认。
+            </span>
+          </div>
+          </div>
+        )}
 
-        <div className="kv-row kv-row--wide kv-row--top">
-          <span>人格设定</span>
-          <textarea
-            className="brain-area"
-            value={personality}
-            placeholder="机器人的人设/性格，例如：你是 AstroSwarm 星群内置 AI 助手，回答简洁直接…"
-            spellCheck={false}
-            onChange={(e) => setPersonality(e.target.value)}
-          />
-        </div>
-
-        <label className="check">
-          <input
-            type="checkbox"
-            checked={Boolean(f.ai_proactive)}
-            onChange={(e) => set({ ai_proactive: e.target.checked })}
-          />
-          <span>启用主动聊天（机器人会不定时主动找用户聊天）</span>
-        </label>
+        {/* 主动聊天：跟人设从哪来无关，两种形态都显示。
+            「启用主动聊天」是**关键开关**（开了它会自己找人说话）—— 常显，不折。
+            下面那些间隔/冷却/免打扰时段是低频数值 —— 收进折叠区，标题行给当前值摘要。 */}
+        <ToggleRow
+          checked={Boolean(f.ai_proactive)}
+          label="启用主动聊天（机器人会不定时主动找用户聊天）"
+          desc="关掉后下面这些频率参数都不生效，它只在被 @ 或私聊时回话。"
+          onChange={(v) => set({ ai_proactive: v })}
+        />
 
         <div className="kv-row kv-row--wide">
           <span>目标用户</span>
           <input
             value={f.ai_proactive_targets ?? ''}
-            placeholder="QQ 官方 openid，多个用逗号分隔（留空 = 无目标；先用目标账号与机器人对话获取 openid）"
+            placeholder="多个用逗号分隔；留空 = 不主动找人"
             spellCheck={false}
+            aria-label="目标用户"
             onChange={(e) => set({ ai_proactive_targets: e.target.value })}
           />
         </div>
@@ -2743,43 +3499,165 @@ function AiBrain({ config, onSaved, beginner, loggedIn = true }) {
           <span>搭话群聊</span>
           <input
             value={f.ai_proactive_groups ?? ''}
-            placeholder="QQ 群 openid，多个用逗号分隔（留空 = 不搭话；机器人需已在群内接收过消息）"
+            placeholder="多个用逗号分隔；留空 = 不搭话"
             spellCheck={false}
+            aria-label="搭话群聊"
             onChange={(e) => set({ ai_proactive_groups: e.target.value })}
           />
         </div>
 
-        <div className="num-grid">
+        <Collapse
+          storageKey="brain-proactive-numbers"
+          title="主动聊天频率（5 项）"
+          summary={`间隔 ${f.ai_interval_min ?? '—'}–${f.ai_interval_max ?? '—'} 分 · 冷却 ${f.ai_cooldown ?? '—'} 分 · 免打扰 ${f.ai_quiet_start ?? '—'}–${f.ai_quiet_end ?? '—'} 时`}
+        >
+          <p className="card__note">
+            间隔 = 两次主动搭话之间至少/至多隔多久；冷却 = 刚聊完这段时间内不再主动；
+            免打扰时段内它不会主动开口（按服务器本地时间）。
+          </p>
           {num('ai_interval_min', 1, 1440)}
           {num('ai_interval_max', 1, 1440)}
           {num('ai_cooldown', 1, 1440)}
           {num('ai_quiet_start', 0, 23)}
           {num('ai_quiet_end', 0, 23)}
-        </div>
+        </Collapse>
       </section>
 
       {!beginner && (
         <section className="card card--strong card--brain">
           <h2 className="card__title">记忆与 MCP</h2>
-          <label className="check">
-            <input
-              type="checkbox"
-              checked={Boolean(f.memory_enabled)}
-              onChange={(e) => set({ memory_enabled: e.target.checked })}
-            />
-            <span>启用全局记忆（默认开启，AI 会记住长期事项）</span>
-          </label>
-          <label className="check">
-            <input
-              type="checkbox"
-              checked={Boolean(f.mcp_enabled)}
-              onChange={(e) => {
-                setMcpTouched(true);
-                set({ mcp_enabled: e.target.checked });
+          {/* 内置记忆三档（2026-10-11 老板拍板）：无 / 基础 / 智能。
+              存的是机器人侧 aichat_manager.json 的 memory_level。
+              **2026-10-11 热重载**：机器人侧每次调用都现读这份配置
+              （core/memory/policy.py::level()，带 mtime+size 缓存），
+              所以改完立即生效，不用重启机器人。 */}
+          <div className="seg seg--3" role="group" aria-label="记忆档位">
+            <span
+              className="seg__thumb"
+              style={{
+                transform: `translateX(${Math.max(0, MEMORY_LEVELS.findIndex(([v]) => v === f.memory_level)) * 100}%)`,
               }}
+              aria-hidden="true"
             />
-            <span>启用 MCP 工具（供 AI 调用外部服务器）</span>
-          </label>
+            {MEMORY_LEVELS.map(([value, label]) => (
+              <button
+                key={value}
+                type="button"
+                className={`seg__btn${f.memory_level === value ? ' seg__btn--on' : ''}`}
+                aria-pressed={f.memory_level === value}
+                title={MEMORY_LEVEL_HINTS[value]}
+                onClick={() => set({
+                  memory_level: value,
+                  // 「无」= 不记不读：把旧开关一起摆对，避免两处状态互相打架
+                  memory_enabled: value !== 'off',
+                })}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+          <p className="card__note">
+            记忆档位：<b>{MEMORY_LEVEL_LABELS[f.memory_level] || '基础'}</b> ——
+            {MEMORY_LEVEL_HINTS[f.memory_level] || MEMORY_LEVEL_HINTS.basic}
+            <b>改完立即生效，不用重启机器人。</b>
+          </p>
+
+          {/* 「只 @ 不写字时怎么办」—— 能选档位的就不让人填数字（档位胶囊）。
+              默认「轻唤一句」。这是行为开关，不是低频数值，所以放在折叠区**外面**。 */}
+          {f.empty_at_info && Array.isArray(f.empty_at_info.options) && (
+            <NumberField
+              className="numf--wide"
+              label={f.empty_at_info.label || '只 @ 不写字时'}
+              value={String(f.empty_at_action || (f.empty_at_info && f.empty_at_info.default) || 'greet')}
+              options={(f.empty_at_info.options || []).map((o) => ({ value: o.value, label: o.label }))}
+              hint={f.empty_at_info.note || ''}
+              onChange={(v) => set({ empty_at_action: v })}
+            />
+          )}
+
+          {/* 上文回溯上限 + 单条正文上限：都是"配一次就不动"的低频数值 → 收进折叠区，
+              标题行给当前值摘要。这两个以前**只有后端、没有输入框**，这次补上。 */}
+          <Collapse
+            storageKey="brain-context-limits"
+            title="上文与超长消息（2 项）"
+            summary={`上文回溯 ${f.context_window_minutes ?? '—'} 分钟 · 单条上限 ${Number(f.max_incoming_chars) === 0 ? '不限' : `${f.max_incoming_chars ?? '—'} 字`}`}
+          >
+            <p className="card__note">
+              {f.context_window_note || '上文回溯上限：群里旧消息超过这个时间就不进提示词。被显式引用（回复某条）时不受这个限制。'}
+            </p>
+            <NumberField
+              label="上文回溯上限"
+              value={f.context_window_minutes ?? 5}
+              min={1}
+              max={1440}
+              unit="分"
+              hint="1~1440 分钟；默认 5 分钟"
+              onChange={(v) => set({ context_window_minutes: v })}
+            />
+            <NumberField
+              label="单条正文上限"
+              value={f.max_incoming_chars ?? 4000}
+              min={0}
+              max={100000}
+              step={100}
+              unit="字"
+              hint="粘进来的长文会被截到这个长度，免得一次请求太大；填 0 = 不限制"
+              onChange={(v) => set({ max_incoming_chars: v })}
+            />
+          </Collapse>
+          <div className="btn-row btn--row-6">
+            <button type="button" className="btn" onClick={peekBuiltinMemory}>
+              现在记住了什么
+            </button>
+          </div>
+          {peek && (
+            <div className="card__note">
+              <div>
+                档位 {peek.level_label || peek.level || '—'}
+                {typeof peek.total === 'number' ? `｜共 ${peek.total} 条` : ''}
+                {peek.promises ? `｜承诺 ${peek.promises}` : ''}
+                {peek.impressions ? `｜印象档 ${peek.impressions}` : ''}
+                {peek.expired ? `｜已过期 ${peek.expired}` : ''}
+              </div>
+              {Array.isArray(peek.rows) && peek.rows.length > 0 ? (
+                <ul className="brain-list">
+                  {peek.rows.slice(0, 40).map((r) => (
+                    <li key={`${r.qq}-${r.id}`}>
+                      [{r.kind}/权重{r.weight}] {String(r.fact).slice(0, 80)}
+                      <span className="card__note">（{r.qq}）</span>
+                    </li>
+                  ))}
+                </ul>
+              ) : (
+                <div>{peekMsg || '还没有记忆：聊过天之后这里会出现它记住的事。'}</div>
+              )}
+              {peek.rows && peek.rows.length > 40 && (
+                <div>（只显示最近 40 条，共 {peek.rows.length} 条）</div>
+              )}
+            </div>
+          )}
+          {/* 记忆与 MCP：这两个是**隐私相关**的开关（记忆 = 长期留存聊天内容；
+              MCP = 让 AI 调外部服务器），一律常显，绝不折进折叠区。 */}
+          <ToggleRow
+            checked={Boolean(f.memory_enabled)}
+            label="启用全局记忆（默认开启，AI 会记住长期事项）"
+            desc="关掉后不再写入新记忆，已有的记忆仍在下面「现在记住了什么」里可查可删。"
+            onChange={(v) => set({
+              memory_enabled: v,
+              memory_level: v
+                ? (f.memory_level === 'off' ? 'basic' : f.memory_level)
+                : 'off',
+            })}
+          />
+          <ToggleRow
+            checked={Boolean(f.mcp_enabled)}
+            label="启用 MCP 工具（供 AI 调用外部服务器）"
+            desc="开启后 AI 可以按下面的地址调用外部 MCP 服务器，等于把外部工具接进对话。"
+            onChange={(v) => {
+              setMcpTouched(true);
+              set({ mcp_enabled: v });
+            }}
+          />
           <div className="kv-row kv-row--wide kv-row--top">
             <span>MCP 服务器</span>
             <textarea
@@ -2796,7 +3674,7 @@ function AiBrain({ config, onSaved, beginner, loggedIn = true }) {
           <p className="card__note">JSON 格式：sse 用 url/headers；stdio 用 command/args/env；保存后重启机器人生效。</p>
           {mcpBase === false && (
             <p className="card__note">
-              MCP 状态没读到（通常是没登录）：这里显示的是默认值，保存时不会改动服务器上的 MCP 配置。
+              MCP 状态没读到，保存时不会改动服务器上的配置。
             </p>
           )}
           <MemoryTimeline />
@@ -2808,7 +3686,7 @@ function AiBrain({ config, onSaved, beginner, loggedIn = true }) {
         <div className="empty-state empty-state--brain">
           <div className="empty-state__title">未检测到内置 AI 插件</div>
           <div className="empty-state__hint">
-            重启一次机器人后，AstroSwarm 会自动把内置 ai 插件安装到插件目录，并在这里展示模型、MCP、记忆与身份绑定状态。
+            重启一次机器人就会自动装好。
           </div>
         </div>
       ) : (
@@ -2830,10 +3708,10 @@ function AiBrain({ config, onSaved, beginner, loggedIn = true }) {
             <button
               type="button"
               className="btn"
-              title="无头端没有本地编辑器：点这里复制 bot 的 .env 路径"
-              onClick={() => copyServerPath(setMsg, ' .env 路径', botEnvPath)}
+              title="点这里复制配置文件路径"
+              onClick={() => copyServerPath(setMsg, '配置路径', botEnvPath)}
             >
-              复制 .env
+              复制配置路径
             </button>
             <button
               type="button"
@@ -2847,15 +3725,44 @@ function AiBrain({ config, onSaved, beginner, loggedIn = true }) {
         </section>
       )}
 
+      {/* 机器人 AI（群聊）：群聊回话、引用解析、群里搭话、允许回话的群、免@连续对话。
+          和桌面端「AI 大脑 → 人设与主动聊天」同一批设置，数据在机器人侧 aichat_manager.json。
+          onOpenPack：「去「连续对话能力包」配置」直接走插件详情那条路由 ——
+          这个控制台里详情页就是配置页（参数按 manifest schema 渲染，保存写
+          tool_packs/<id>/config.json），所以不用另做跳转/滚动/高亮。 */}
+      <BotAiCard
+        onMsg={setMsg}
+        onOpenPack={(pid) => {
+          if (!pid) return;
+          setDetailPid(String(pid));
+          setDetailEntry(null);
+          setView('plugin-detail');
+        }}
+      />
+
       {msg && <div className="toast">{msg}</div>}
     </>
   );
 }
 
 
-function Overview({ health, auth, services, config, loggedIn, onAccess, onMessages, onServices }) {
+/* 首页那条横排三步条上的短名（桌面端首页写的就是「1 连 AI / 2 接 QQ / 3 启动」）。
+   步骤状态与按钮仍由 setupSteps() 算（那个纯函数的 title 是给竖排视图用的，别动）。 */
+const STEP_SHORT = { ai: '连 AI', qq: '接 QQ', bot: '启动' };
+
+/* 首页（导出是为了让冒烟能直接把它渲染一遍：区块顺序 / 标题用词要有断言锁着）。
+   结构固定（与桌面端 home_page.py 一一对应）：
+     标题区（副标题 + 更新于 + 服务状态点）
+     → 横排三步条（右侧带「你想要什么功能」输入框）
+     → 平台四卡（一行四张）
+     → 今日数据 / 最近消息（两列）
+     → 机器人 / 当前任务（两列）
+     → 折叠区（本机信息 / 运行数据 / 运维入口） */
+export function Overview({ health, auth, services, config, loggedIn, onAccess, onMessages, onServices, onGo = () => {} }) {
   const [msg, setMsg] = useState('');
   const [now, setNow] = useState(() => new Date());
+  const [idea, setIdeaText] = useState('');
+  const [starting, setStarting] = useState(false);
 
   useEffect(() => {
     const timer = setInterval(() => setNow(new Date()), 1000);
@@ -2867,6 +3774,15 @@ function Overview({ health, auth, services, config, loggedIn, onAccess, onMessag
     const timer = setTimeout(() => setMsg(''), 3200);
     return () => clearTimeout(timer);
   }, [msg]);
+
+  /* 微信卡的状态（桌面端首页那张卡同源）：/api/wechat/status。
+     SSR（冒烟）不跑 effect，初始就是「未登录」，与桌面端「没登录就写未登录」一致。 */
+  const [wxLoggedIn, setWxLoggedIn] = useState(false);
+  useEffect(() => {
+    get('/api/wechat/status')
+      .then((d) => setWxLoggedIn(Boolean(d && d.logged_in)))
+      .catch(() => {});
+  }, []);
 
   const act = async (action) => {
     const label = { start: '启动', stop: '停止', restart: '重启' }[action] || action;
@@ -2907,18 +3823,19 @@ function Overview({ health, auth, services, config, loggedIn, onAccess, onMessag
   const qqReason = qqMap[qqRaw] || '等待协议端连接';
   const qqTone = !botOn ? 'stopped' : qqLinked ? 'running' : 'warn';
   const qqLabel = !botOn ? 'QQ · 未连接' : qqLinked ? 'QQ · 已连接' : 'QQ · 未连接';
-  // 微信通道的闸门后端读 member（deploy.apply_wechat_gate / console_ext.wechat_state），
-  // 前端必须同一个口径，否则月费用户会被显示成「未解锁」，而后端其实是开的。
-  const wxOn = isMember(auth);
+  // 微信通道已免费开放（2026-10-01）：不再看账号档位，这里恒为可用。
+  const wxOn = true;
   const botTone = services == null ? 'unknown' : botOn ? 'running' : deployed ? 'stopped' : 'unknown';
   const botLabel = services == null ? '机器人 · 状态未知' : botOn ? '机器人 · 运行中' : deployed ? '机器人 · 已停止' : '机器人 · 未部署';
+  // 标题区右侧那个状态点：桌面端是「任何一个通道在跑就算运行中」
+  const anyChannelOn = Boolean(botOn || qqLinked || wxLoggedIn);
   // 「机器人现在好不好」= 三件事都成立才算正常；任何一项不成立都给出人话原因 + 该做什么
   const healthy = botOn && qqLinked && wxOn;
   const problems = [];
-  if (!botOn) problems.push(deployed ? '机器人进程没在跑：点下面的按钮启动。' : '机器人还没部署过：先启动一次，部署脚本会装好运行环境。');
+  if (!botOn) problems.push(deployed ? '机器人进程没在跑：点下面的按钮启动。' : '机器人还没部署过：先启动一次。');
   else if (!qqLinked) problems.push(`QQ 通道未连接（当前：${qqReason}）：协议端没连上，QQ 现在收不到消息，去「接入 → QQ」核对反向 WS 地址。`);
-  if (!wxOn) problems.push('微信通道未开通：当前只有 QQ 通道，去账号中心开通后就能用微信。');
-  const botPort = config?.bot_port || health?.bot_port || 12113;
+  // 未登录时 config 是 null：这里**不能**回落成 12113，否则界面会顶着一个假的端口号
+  const botPort = portText(config, health);
   const clock = now.toTimeString().slice(0, 8);
   const wsUrl = `ws://${window.location.hostname || '127.0.0.1'}:${botPort}/onebot/v11/ws`;
 
@@ -2942,14 +3859,14 @@ function Overview({ health, auth, services, config, loggedIn, onAccess, onMessag
         }
       : !wxOn
         ? {
-            title: '微信通道未开通',
-            hint: '当前只有 QQ 通道；微信通道去账号中心开通后即可用。',
+            title: '微信通道当前不可用',
+            hint: '微信通道已免费开放：重启一次机器人，再去「接入 → 微信」扫码登录即可。',
             primary: { label: '去接入', onClick: onAccess },
             secondary: [{ label: '重启机器人', onClick: restartBot }],
           }
         : {
             title: '一切正常',
-            hint: 'QQ 已连接，机器人正在收消息。要改配置或加平台去「接入」。',
+            hint: 'QQ 已连接，正在收消息。',
             primary: null,
             secondary: [
               { label: '重启机器人', onClick: restartBot },
@@ -2962,72 +3879,175 @@ function Overview({ health, auth, services, config, loggedIn, onAccess, onMessag
       <header className="page-head">
         <div>
           <h1>首页</h1>
-          <p>机器人现在好不好，一眼看出问题在哪</p>
+          <p>各平台服务状态总览，一键进入管理</p>
         </div>
         <div className="page-head__right">
           <span className="home-time">更新于 {clock}</span>
+          <StatusBadge tone={services == null ? 'unknown' : anyChannelOn ? 'running' : 'stopped'}>
+            {services == null ? '服务状态未知' : anyChannelOn ? '服务运行中' : '服务已停止'}
+          </StatusBadge>
         </div>
       </header>
 
-      {/* 1) 顶部一行健康摘要：正常/需要注意 + 三个通道状态（都带文字，不靠颜色单独表意） */}
-      <section className="card hp-health">
-        <div className="hp-health__head">
-          <StatusBadge tone={healthy ? 'success' : 'warn'}>{healthy ? '正常' : '需要注意'}</StatusBadge>
-          <span className="hp-health__note">
-            {healthy ? '三个通道都正常' : '下面有不正常的地方，按提示处理即可'}
+      {/* 0) 三步开箱（**一条横排**）：1 连 AI → 2 接 QQ → 3 启动，每步一个状态 chip + 小按钮；
+             同一行最右侧是「你想要什么功能」输入框 + 去做插件。
+             状态由 setupSteps() 这个纯函数判断（AI 有没有模型名 / QQ 有没有凭证或已连 /
+             机器人有没有在跑），完成绿、当前蓝、待办灰 —— 与桌面端首页同一条结构。 */}
+      <section className="card steps-bar">
+        {setupSteps({
+          aiModel: config?.ai_model,
+          qqReady: Boolean(String(config?.qq_app_id || '').trim()) || qqLinked,
+          botRunning: botOn,
+        }).map((step, i) => (
+          <span className="steps-bar__seg" key={step.id}>
+            {i > 0 && <span className="steps-bar__arrow">→</span>}
+            <span className={`steps-bar__name steps-bar__name--${step.tone}`}>
+              {`${step.no} ${STEP_SHORT[step.id] || step.title}`}
+            </span>
+            <span className={`steps-bar__chip steps-bar__chip--${step.tone}`}>{step.status}</span>
+            <button
+              type="button"
+              className="btn btn--sm"
+              disabled={starting && step.id === 'bot'}
+              onClick={() => {
+                if (step.id === 'ai') {
+                  onGo('brain');
+                  setMsg('去「AI 大脑」填接口地址与 Key，填完保存');
+                  return;
+                }
+                if (step.id === 'qq') {
+                  onGo('access');
+                  return;
+                }
+                setStarting(true);
+                act('start').finally(() => setStarting(false));
+              }}
+            >
+              {step.id === 'bot' && starting ? '正在启动…' : step.button}
+            </button>
           </span>
-        </div>
-        <div className="hp-health__row">
-          <StatusBadge tone={qqTone}>{qqLabel}</StatusBadge>
-          <StatusBadge tone={wxOn ? 'success' : 'warn'}>{wxOn ? '微信 · 已解锁' : '微信 · 未解锁'}</StatusBadge>
-          <StatusBadge tone={botTone}>{botLabel}</StatusBadge>
-        </div>
-        {problems.length > 0 && (
-          <ul className="hp-health__list">
-            {problems.map((t) => (
-              <li key={t}>{t}</li>
-            ))}
-          </ul>
-        )}
+        ))}
+
+        <span className="steps-bar__gap" />
+        <input
+          className="p-input steps-bar__wish"
+          value={idea}
+          placeholder="你想要什么功能？一句话，我让 AI 给你做一个插件"
+          spellCheck={false}
+          onChange={(e) => setIdeaText(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key !== 'Enter') return;
+            setIdea(idea);
+            onGo('workshop');
+          }}
+        />
+        <button
+          type="button"
+          className="btn btn--primary"
+          onClick={() => {
+            setIdea(idea);
+            onGo('workshop');
+          }}
+        >
+          去做插件
+        </button>
       </section>
 
-      {/* 2) 一屏一个实心主操作：异常时是「去接入」，正常时不给实心按钮（没事情要做）。
-          次级最多两个（描边，现在三个分支最多只给 1 个，slice 不会丢掉任何动作），
-          危险/边缘动作一律第三级（ghost）——「停止机器人」不再是红色实心大按钮；
-          「看服务详情」这类运维入口收进底部「详情与运维」折叠，避免四个按钮挤成一行。 */}
-      <section className="card hp-act">
-        <h2 className="card__title">{mainAction.title}</h2>
-        <p className="card__note">{mainAction.hint}</p>
-        <div className="hp-act__btns">
-          {mainAction.primary ? (
-            <button type="button" className="btn btn--primary" onClick={mainAction.primary.onClick}>
-              {mainAction.primary.label}
-            </button>
-          ) : null}
-          {mainAction.secondary.slice(0, 2).map((b) => (
-            <button key={b.label} type="button" className="btn" onClick={b.onClick}>
-              {b.label}
-            </button>
+      {/* 2) 平台四卡（桌面端首页同一套，一行四张）：点任意一张进「接入」看细节。
+          「一键启停全部通道」在下面的「机器人」卡里。 */}
+      <div className="hp-cards">
+        <button type="button" className="hp-card" onClick={onAccess} title="去「接入 → QQ」看详细设置">
+          <StatusBadge tone={qqTone}>{botOn ? 'QQ · 运行中' : 'QQ · 未运行'}</StatusBadge>
+          <span className="hp-card__line">{`AppID ${configText(loggedIn, config?.qq_app_id)}`}</span>
+          <span className="hp-card__line">
+            {`官方通道 ${configuredText(loggedIn, config?.qq_app_id)}`}
+          </span>
+        </button>
+        <button type="button" className="hp-card" onClick={onAccess} title="去「接入 → 微信」扫码登录">
+          <StatusBadge tone={wxLoggedIn ? 'success' : 'stopped'}>
+            {wxLoggedIn ? '微信 · 已连接' : '微信 · 未登录'}
+          </StatusBadge>
+          <span className="hp-card__line">iLink 私聊个人助手</span>
+        </button>
+        <button type="button" className="hp-card" onClick={onAccess} title="去「接入 → 飞书」填凭证、装适配器">
+          <StatusBadge tone="stopped">飞书 · 未接入</StatusBadge>
+          <span className="hp-card__line">规划中</span>
+        </button>
+        <button type="button" className="hp-card" onClick={onAccess} title="纸飞机通道还在规划中">
+          <StatusBadge tone="stopped">纸飞机 · 未接入</StatusBadge>
+          <span className="hp-card__line">规划中</span>
+        </button>
+      </div>
+      {problems.length > 0 && (
+        <ul className="hp-health__list">
+          {problems.map((t) => (
+            <li key={t}>{t}</li>
           ))}
-          {/* 停止是危险动作：主界面用第三级样式 + 二次确认，确认框里才说清后果 */}
-          {botOn && (
-            <button type="button" className="btn btn--ghost" onClick={stopAll}>
-              停止机器人
-            </button>
-          )}
-        </div>
-      </section>
+        </ul>
+      )}
 
-      {/* 3) 两列网格（别拉成通栏大块）：左列本机信息（压成 3 行）+ 当前任务，右列最近消息（真实会话） */}
+      {/* 3) 今日数据 / 最近消息（两列）：今日数据照桌面端 home_page.py 的行项目 */}
       <div className="hp-grid">
-        <div className="hp-col">
+        <section className="card hp-today">
+          <h2 className="card__title">今日数据</h2>
+          <TodayStats loggedIn={loggedIn} />
+        </section>
+
+        <section className="card hp-recent">
+          <h2 className="card__title">最近消息</h2>
+          <RecentMessages onOpen={onMessages} loggedIn={loggedIn} />
+          <p className="card__note">点上面任意一条 → 进入消息中心</p>
+          <div className="hp-linkrow">
+            <button type="button" className="hp-link" onClick={onMessages}>
+              打开消息中心 ›
+            </button>
+          </div>
+        </section>
+      </div>
+
+      {/* 4) 机器人 / 当前任务（两列）：机器卡里**只有一个切换按钮**（桌面端 self.btn_toggle
+            同一个做法：运行中显示「停止全部」，否则显示「启动全部」），右侧是任务空态。
+            首页不放「重启」—— 重启在「全局管理」，写在那行说明的 tooltip 里。 */}
+      <div className="hp-grid">
+        <section className="card hp-act">
+          <h2 className="card__title">机器人</h2>
+          <button
+            type="button"
+            className="btn btn--primary btn--block"
+            disabled={starting}
+            onClick={() => {
+              if (botOn) {
+                stopAll();
+                return;
+              }
+              setStarting(true);
+              act('start').finally(() => setStarting(false));
+            }}
+          >
+            {botOn ? '停止全部' : '启动全部'}
+          </button>
+          <p className="card__note" title="重启在「全局管理」。">一键启停全部通道。</p>
+        </section>
+
+        <section className="card">
+          <h2 className="card__title">当前任务</h2>
+          {/* 空闲时就是两行说明，不留空态大块；有任务时这里换成任务列表 */}
+          <p className="card__note">当前没有正在执行的任务</p>
+          <p className="card__note">点击「启动全部」开始，或在插件/依赖页发起安装任务</p>
+        </section>
+      </div>
+
+      {/* 4) 折叠区只留运维入口、路径细节与原始数据 */}
+      <details className="fold">
+        <summary className="fold__summary">详情与运维：运行数据 · 路径与日志入口</summary>
+        <div className="fold__body">
           <section className="card">
             <h2 className="card__title">本机信息</h2>
             <div className="stat-rows">
               {[
                 // 同类信息合并成行：版本/机器码一行、目录一行、服务与端口一行，不再一项一行撑满屏
                 ['版本 / 机器码',
-                  `${health?.version || APP_VERSION} · ${health?.machine_id ? String(health.machine_id).slice(0, 8) + '…' : '登录后可见'}`],
+                  `${health?.version ? `v${String(health.version).replace(/^v/, '')}` : '版本读取中'} · ${health?.machine_id ? String(health.machine_id).slice(0, 8) + '…' : '登录后可见'}`],
                 ['机器人目录', services?.bot?.bot_dir || '—'],
                 ['服务 / 端口', `${health?.ok ? '后端正常' : '后端未连通'} · ${botPort}`],
               ].map(([label, value]) => (
@@ -3039,28 +4059,6 @@ function Overview({ health, auth, services, config, loggedIn, onAccess, onMessag
             </div>
           </section>
 
-          <section className="card">
-            <h2 className="card__title">当前任务</h2>
-            {/* 空闲时就是一行说明，不留空态大块；有任务时这里换成任务列表 */}
-            <p className="card__note">当前没有正在执行的任务 · 点上面的按钮启动，或在「依赖」页发起安装</p>
-          </section>
-        </div>
-
-        <section className="card hp-recent">
-          <h2 className="card__title">最近消息</h2>
-          <RecentMessages onOpen={onMessages} loggedIn={loggedIn} />
-          <div className="hp-linkrow">
-            <button type="button" className="hp-link" onClick={onMessages}>
-              打开消息中心 ›
-            </button>
-          </div>
-        </section>
-      </div>
-
-      {/* 4) 折叠区只留运维入口、路径细节与原始数据 */}
-      <details className="fold">
-        <summary className="fold__summary">详情与运维：运行数据 · 路径与日志入口</summary>
-        <div className="fold__body">
           <section className="card">
             <h2 className="card__title">运行数据</h2>
             <StatsPanel loggedIn={loggedIn} />
@@ -3096,10 +4094,8 @@ function Overview({ health, auth, services, config, loggedIn, onAccess, onMessag
 }
 
 function WeChatBody({ auth, onMessages }) {
-  // 微信闸门 = member（后端 deploy.apply_wechat_gate 读的就是 feature_gate()["member"]）。
-  // 以前读 full，后端收窄 full 之后已开通的账号会被判成「未开通」——后端其实是开的。
-  const member = isMember(auth);
-  const reason = auth?.reason || 'QQ 通道可用；微信通道未开通（本机权益未通过签名校验）';
+  // 微信通道已免费开放（2026-10-01）：不再按账号档位判断，扫码登录就能用。
+  const member = true;
   // 微信通道（iLink）：状态和二维码都由后端从适配器落的文件里读，前端只做展示与触发
   const [wx, setWx] = useState(null);
   const [code, setCode] = useState('');
@@ -3115,7 +4111,7 @@ function WeChatBody({ auth, onMessages }) {
       .then((d) => { setWx(d); setWxErr(''); })
       .catch((e) => {
         setWx(null);
-        setWxErr(isAuthError(e) ? 'login' : String(e.message));
+        setWxErr(isAuthError(e) ? 'login' : apiErrText(e, '微信状态读取中'));
       });
   useEffect(() => {
     loadWx();
@@ -3127,7 +4123,7 @@ function WeChatBody({ auth, onMessages }) {
   const qrFresh = qrUrl && (wx?.qrcode_age ?? 999) < 110;   // 二维码 2 分钟一换
   const loggedIn = Boolean(wx?.logged_in);
   const tone = loggedIn ? 'success' : member && qrUrl ? 'warn' : 'stopped';
-  const stateText = loggedIn ? '已连接' : !member ? '未开通' : qrUrl ? '等待扫码' : '未登录';
+  const stateText = loggedIn ? '已连接' : qrUrl ? '等待扫码' : '未登录';
 
   /* 「重新扫码登录」的按钮名看起来只是刷新一张图，后端实现却是 /api/wechat/relogin
      = 清登录态 + 重启机器人（console_ext 的 relogin），会打断正在进行的对话、
@@ -3160,7 +4156,7 @@ function WeChatBody({ auth, onMessages }) {
     try {
       await post('/api/wechat/verify-code', { code: v });
       setCode('');
-      setMsg('配对码已提交，微信那边确认后这里会自动变成「已连接」');
+      setMsg('配对码已提交，确认后会自动变成「已连接」。');
       loadWx();
     } catch (e) {
       setMsg(withAuthHint(e));
@@ -3188,18 +4184,9 @@ function WeChatBody({ auth, onMessages }) {
 
   return (
     <>
-      {!member && (
-        <>
-          <p className="gate-lock">{reason}。开通后即可扫码登录。</p>
-          <a className="btn btn--ghost btn--block" href={ACTIVATE_URL} target="_blank" rel="noreferrer">
-            去账号中心开通微信通道
-          </a>
-        </>
-      )}
-
       <section className="card card--wx">
         <StatusBadge tone={wxErr ? 'unknown' : tone}>
-          微信 ClawBot · {wxErr ? '状态读不到' : stateText}
+          微信 iLink · {wxErr ? '状态读不到' : stateText}
         </StatusBadge>
         {wxErr === 'login' && (
           <p className="card__note">{LOGIN_HINT}：微信状态读不到，下面显示的不是真实状态。</p>
@@ -3216,9 +4203,7 @@ function WeChatBody({ auth, onMessages }) {
           <b>{loggedIn ? '已登录' : wx?.login_status ? `扫码状态：${wx.login_status}` : '—'}</b>
         </div>
         <div className="qr-box">
-          {!member ? (
-            reason
-          ) : loggedIn ? (
+          {loggedIn ? (
             '微信通道已连接，收到私聊会由 Agent 直接回复'
           ) : qrFresh ? (
             <img
@@ -3237,7 +4222,7 @@ function WeChatBody({ auth, onMessages }) {
           </p>
         )}
         <p className="card__note">
-          说明：ClawBot 是私密个人助手通道，不支持群聊；其他用户无法添加你的 ClawBot。
+          说明：iLink 是私密个人助手通道，不支持群聊。
         </p>
         <div className="p-row">
           <input
@@ -3266,7 +4251,7 @@ function WeChatBody({ auth, onMessages }) {
             输入配对码
           </button>
           <button type="button" className="btn" onClick={restartBot}>
-            重启 NoneBot
+            重启机器人
           </button>
         </div>
       </section>
@@ -3278,11 +4263,9 @@ function WeChatBody({ auth, onMessages }) {
         <p className="card__note">
           {wxErr === 'login'
             ? `${LOGIN_HINT}：登录后才能判断微信有没有会话。`
-            : !member
-              ? '微信通道未解锁：解锁并登录后，微信私聊会话会出现在消息中心（把「平台」选成「微信」）。'
-              : loggedIn
-                ? '已连接：点下面的按钮进消息中心，「平台」选「微信」即可只看微信会话。'
-                : '微信还没登录：扫码并提交配对码后，会话才会出现在消息中心。'}
+            : loggedIn
+              ? '已连接。会话在「消息中心」里看。'
+              : '微信还没登录：扫码并提交配对码后才有会话。'}
         </p>
         <button type="button" className="btn btn--block" onClick={onMessages}>
           打开消息中心
@@ -3294,7 +4277,8 @@ function WeChatBody({ auth, onMessages }) {
   );
 }
 
-function QQBody({ config, health, services, onSaved }) {
+function QQBody({ config, health, services, onSaved, officialApiOk = true,
+                  loggedIn = true, wsUrl = '' }) {
   const [form, setForm] = useState(null);
   const [msg, setMsg] = useState('');
   const [tutorial, setTutorial] = useState(false);
@@ -3307,9 +4291,11 @@ function QQBody({ config, health, services, onSaved }) {
     if (form === null && config) setForm(config);
   }, [config, form]);
   const f = form || {};
-  const botPort = f.bot_port || health?.bot_port || 12113;
   const host = window.location.hostname || '127.0.0.1';
-  const wsUrl = `ws://${host}:${botPort}/onebot/v11/ws`;
+  // 未登录时 wsUrl 由 AccessPage 传空串进来：**不编一个端口**给用户看，
+  // 否则他会拿一个假地址去填协议端（原来这里回落 12113，正是"配置归 0"的观感来源之一）。
+  const botPort = portText(form, health);
+  const showWs = Boolean(wsUrl);
   const botOn = services?.bot?.state === 'running';
   const qq = services?.bot?.qq;
   const qqText =
@@ -3336,20 +4322,21 @@ function QQBody({ config, health, services, onSaved }) {
 
   const save = async () => {
     try {
-      const payload = { bot_port: Number(botPort) || 12113 };
+      // ⚠ 这里必须取 f.bot_port（表单里的真值），**不能**取上面那个给界面看的 botPort ——
+      // 它未登录时是「登录后显示」这句文案，Number() 之后会变成 NaN → 回落 12113，
+      // 等于把用户真实端口悄悄改成默认值（这正是"配置归 0"那一类 bug 的写法）。
+      const payload = { bot_port: Number(f.bot_port) || 12113 };
       // AppID 不是脱敏字段（后端原样返回），可以一直提交；
       // AppSecret / AppToken / 访问令牌只在用户改过时提交。
-      // 接入方式（官方 / 第三方）后端 SAFE_KEYS 一直支持，改了要一起提交，
-      // 否则界面上切了通道、重启后还是原来那条。
-      if (f.qq_channel) payload.qq_channel = String(f.qq_channel);
-      if (f.qq_app_id !== undefined) payload.qq_app_id = String(f.qq_app_id || '');
+      // 官方凭证只在这张卡还管着它的时候提交（新接口没上时的备用入口）。
+      if (!officialApiOk && f.qq_app_id !== undefined) payload.qq_app_id = String(f.qq_app_id || '');
       ['qq_app_secret', 'qq_app_token', 'qq_onebot_token'].forEach((k) => {
         if (edited[k]) payload[k] = String(f[k] || '');
       });
       const saved = await put('/api/config', payload);
       setForm({ ...f, ...saved });
       setEdited({});
-      setMsg('已保存，重启 NoneBot 后生效');
+      setMsg('已保存，重启机器人后生效');
       onSaved();
     } catch (e) {
       setMsg(String(e.message));
@@ -3357,6 +4344,10 @@ function QQBody({ config, health, services, onSaved }) {
   };
 
   const copyUrl = async () => {
+    if (!showWs) {
+      setMsg('先登录星群账号：反向 WS 地址里的端口存在服务器上，读到了才复制得对');
+      return;
+    }
     try {
       await navigator.clipboard.writeText(wsUrl);
       setMsg(`已复制：${wsUrl}`);
@@ -3382,7 +4373,7 @@ function QQBody({ config, health, services, onSaved }) {
           停止全部
         </button>
         <button type="button" className="btn btn--ghost" onClick={() => act('restart')}>
-          重启 NoneBot
+          重启机器人
         </button>
       </div>
 
@@ -3390,10 +4381,10 @@ function QQBody({ config, health, services, onSaved }) {
         <button
           type="button"
           className="btn btn--ghost"
-          onClick={() => copyServerPath(setMsg, ' .env 路径', botEnvPath)}
-          title="无头端没有本地编辑器：点这里复制 bot 的 .env 路径；要改配置去「设置」页"
+          onClick={() => copyServerPath(setMsg, '配置路径', botEnvPath)}
+          title="点这里复制配置文件路径"
         >
-          复制 .env
+          复制配置路径
         </button>
         <button type="button" className="btn btn--ghost" onClick={() => setTutorial((v) => !v)}>
           接入教程（LLOneBot）
@@ -3406,16 +4397,19 @@ function QQBody({ config, health, services, onSaved }) {
           <p className="card__note">
             {`1. 在任意一台设备安装协议端（LLOneBot / NapCat / Lagrange.OneBot）并扫码登录 QQ 小号；
 2. 打开协议端的「网络配置」→ 新建「WebSocket 服务端 / 反向 WebSocket」；
-3. 地址填 ${wsUrl}，启用并保存；
+3. 地址填 ${showWs ? wsUrl : '（登录后这里会显示你这台服务器的真实地址）'}，启用并保存；
 4. 回到本页，上面「状态」变成「已连接」即接入成功。`}
           </p>
         </section>
       )}
 
+      {/* 群消息模式 + 官方通道体检：和桌面端 QQ 页那张状态卡同一套结论 */}
+      <QqOfficialCard onMsg={setMsg} />
+
       <div className="home-row home-row--cards">
         <section className="card card--kv card--wide">
           <StatusBadge tone={botOn ? 'running' : 'stopped'}>
-            NoneBot · {botOn ? '运行中' : '已停止'}
+            机器人 · {botOn ? '运行中' : '已停止'}
           </StatusBadge>
           <div className="stat-row">
             <span>端口</span>
@@ -3437,7 +4431,7 @@ function QQBody({ config, health, services, onSaved }) {
           </StatusBadge>
           <div className="stat-row">
             <span>反向地址</span>
-            <b className="mono">{wsUrl}</b>
+            <b className="mono">{showWs ? wsUrl : NEED_LOGIN}</b>
           </div>
           <div className="stat-row">
             <span>通道</span>
@@ -3448,44 +4442,35 @@ function QQBody({ config, health, services, onSaved }) {
             <b>{qqText}</b>
           </div>
           <p className="card__note">
-            协议端由你自行安装并扫码登录（例如 LLOneBot / Lagrange），AstroSwarm
-            只负责连接，不内置、不分发任何协议端；使用第三方协议有账号风险，请自备小号。
+            协议端由你自行安装并扫码登录（例如 LLOneBot / Lagrange），星巢 Nest
+            只负责连接；第三方协议请自备小号。
           </p>
         </section>
       </div>
 
       <section className="card card--kv card--wide">
-        <h2 className="card__title">QQ 通道配置</h2>
-
-        {/* 接入方式做成真控件：后端 qq_channel 一直在 SAFE_KEYS 里，机器人与状态判定
-            也已经按它分流（deploy._qq_state / bot._enabled_qq_adapters）。以前这里是
-            只读文字，等于官方通道在无头端永远切不过去。保存后要重启 NoneBot 生效。 */}
-        <div className="kv-row">
+        <h2 className="card__title">第三方 OneBot（协议端）</h2>
+        {/* 这两个「下拉」各自只有一个选项、也没有 onChange —— 点了不会变，是假控件。
+            无头端固定只走第三方 OneBot + 反向 WS（后端的 qq_channel / qq_onebot_mode 虽然
+            在白名单里，但界面上没有第二种可选值），所以改成只读文字，不再做成下拉。 */}
+        <div className="stat-row">
           <span>接入方式</span>
-          <select
-            value={f.qq_channel || 'onebot'}
-            onChange={(e) => editField('qq_channel', e.target.value)}
-            title="官方机器人 = QQ 开放平台的 AppID / AppSecret；第三方 = 自备协议端（NapCat / LLOneBot / Lagrange）"
-          >
-            <option value="onebot">第三方 OneBot 协议（自备协议端）</option>
-            <option value="official">QQ 官方机器人（QQ 开放平台）</option>
-          </select>
+          <b>第三方 OneBot 协议（协议端自行安装）</b>
         </div>
         <p className="card__note">
-          {(f.qq_channel || 'onebot') === 'official'
-            ? '当前走官方通道：下面「QQ 官方机器人（QQ 开放平台）」三项填 AppID / AppSecret / AppToken，第三方协议端可以不用开。'
-            : '当前走第三方通道：协议端需你自己安装（例如 LLOneBot、Lagrange.OneBot、NapCat）并扫码登录，AstroSwarm 不提供、不下载任何协议端；使用第三方协议存在账号风险，请自备小号。'}
+          协议端需你自己安装（例如 LLOneBot、Lagrange.OneBot、NapCat）并扫码登录，星巢
+          Nest 不提供协议端；第三方协议请自备小号。
         </p>
 
         <div className="kv-group">
           <div className="stat-row">
-            <span>连接方式（第三方通道）</span>
-            <b>反向 WS（推荐）：协议端来连星群</b>
+            <span>连接方式</span>
+            <b>反向 WS（推荐）：协议端来连星巢 Nest</b>
           </div>
 
           <div className="kv-group">
             <p className="card__note">
-              {`把下面的地址复制到协议端的「反向 WebSocket / WebSocket 服务端」配置里，保存后协议端会主动连回星群（本机/局域网直连，无需端口转发）。
+              {`把地址复制到协议端的「反向 WebSocket」配置里，保存后会自动连回来。
 NapCat：网络配置 → 新建 WebSocket 服务端；LLOneBot：网络配置 → 反向 WebSocket 客户端。
 协议端在另一台设备时：监听地址填 0.0.0.0，并把下面地址里的 ${host} 换成这台电脑的局域网 IP。`}
             </p>
@@ -3504,7 +4489,13 @@ NapCat：网络配置 → 新建 WebSocket 服务端；LLOneBot：网络配置 �
               />
             </div>
             <div className="kv-row kv-row--url">
-              <input className="mono" value={wsUrl} readOnly />
+              {/* 未登录时这里原来是 ws://…:12113 这个**编出来的**地址，
+                  用户会照着填到协议端去。现在如实说"登录后显示"。 */}
+              <input
+                className="mono"
+                value={showWs ? wsUrl : '登录后显示（端口存在服务器上）'}
+                readOnly
+              />
               <button type="button" className="btn btn--primary" onClick={copyUrl}>
                 复制地址
               </button>
@@ -3527,18 +4518,26 @@ NapCat：网络配置 → 新建 WebSocket 服务端；LLOneBot：网络配置 �
             />
           </div>
           <p className="card__note">
-            访问令牌是协议端连回来时的校验口令：机器人这边填什么，协议端那边就要填一样的，
-            否则 QQ 会连不上。改完要重启 NoneBot 生效。
+            两边填一样的口令，
+            否则 QQ 会连不上。改完要重启机器人生效。
           </p>
         </div>
 
-        {/* QQ 官方机器人（QQ 开放平台）凭证：重排版时前端丢了这三个字段，而后端
-            headless_config 的 SAFE_KEYS 一直支持 qq_app_id / qq_app_secret / qq_app_token。
-            密钥用 password 输入；框里显示的 ****xxxx 是后端脱敏值，直接保存不会覆盖服务器上的真值。 */}
-        <div className="kv-group">
+        <button type="button" className="btn btn--primary btn--self" onClick={save}>
+          保存通道配置
+        </button>
+      </section>
+
+      {/* QQ 官方机器人（QQ 开放平台）凭证：正常归上面那张「QQ 官方机器人」卡管
+          （走 /api/qq/official）。只有那个接口还没上（404）时才退回这里的旧入口 ——
+          写的是 /api/config 的 qq_app_id / qq_app_secret / qq_app_token，
+          headless_config 的 SAFE_KEYS 一直支持。后端补上后这块自动消失，不留两份表单。 */}
+      {!officialApiOk && (
+        <section className="card card--kv card--wide">
+          <h2 className="card__title">QQ 官方机器人（备用入口）</h2>
           <p className="card__note">
-            QQ 官方机器人（QQ 开放平台）：接入方式选「QQ 官方机器人」时用下面三项；密钥框里的 ****xxxx
-            是脱敏显示，不重新输入就保持服务器上的原值。
+            官方那套接口还没上，先在这里填 AppID / AppSecret / AppToken；
+            密钥框里的 ****xxxx 是脱敏显示，不重新输入就保持服务器上的原值。
           </p>
           <div className="kv-row">
             <span>AppID</span>
@@ -3572,12 +4571,11 @@ NapCat：网络配置 → 新建 WebSocket 服务端；LLOneBot：网络配置 �
               onChange={(e) => editField('qq_app_token', e.target.value)}
             />
           </div>
-        </div>
-
-        <button type="button" className="btn btn--primary btn--self" onClick={save}>
-          保存通道配置
-        </button>
-      </section>
+          <button type="button" className="btn btn--primary btn--self" onClick={save}>
+            保存官方凭证
+          </button>
+        </section>
+      )}
 
       {msg && <div className="toast">{msg}</div>}
     </>
@@ -3590,7 +4588,8 @@ NapCat：网络配置 → 新建 WebSocket 服务端；LLOneBot：网络配置 �
    状态文字挪进信息列后，按钮横向位置就不再随状态文字长短漂移。
    复制地址 / 重新扫码这类就地快捷动作放在信息列自己的行里，不影响右侧操作槽对齐。
    展开后才出现该通道原来的全部设置（QQBody / WeChatBody 原样保留，功能一个没删）。 */
-function AccessPage({ auth, config, health, services, onSaved, onMessages }) {
+function AccessPage({ auth, config, health, services, onSaved, onMessages,
+                      loggedIn = true }) {
   const [open, setOpen] = useState('');
   const [wx, setWx] = useState(null);
   const [msg, setMsg] = useState('');
@@ -3600,7 +4599,8 @@ function AccessPage({ auth, config, health, services, onSaved, onMessages }) {
   const qqLinked = qqRaw === 'connected';
   const qqTone = !botOn ? 'stopped' : qqLinked ? 'running' : 'warn';
   const qqLabel = !botOn ? '未连接（机器人未运行）' : qqLinked ? '已连接（协议端在线）' : '未连接（等待协议端）';
-  const wxOn = isMember(auth);
+  // 微信通道已免费开放（2026-10-01）：不再看账号档位，恒为可用。
+  const wxOn = true;
   const toggle = (id) => setOpen((v) => (v === id ? '' : id));
 
   // 折叠状态下也要有信息：微信通道摘要自己拉一次 /api/wechat/status（和展开后的 WeChatBody 同源）
@@ -3612,23 +4612,68 @@ function AccessPage({ auth, config, health, services, onSaved, onMessages }) {
       .then((d) => { setWx(d); setWxErr(''); })
       .catch((e) => {
         setWx(null);
-        setWxErr(isAuthError(e) ? 'login' : String(e.message));
+        setWxErr(isAuthError(e) ? 'login' : apiErrText(e, '微信状态读取中'));
       });
   useEffect(() => {
     loadWx();
     const t = setInterval(loadWx, 5000);
     return () => clearInterval(t);
   }, []);
+  /* 飞书通道摘要：折叠状态下也得有信息，和展开后的 FeishuCard 同源（同一个接口、
+     同一套徽标口径 feishuBadge）。未登录/接口没上时如实写，不装成"没填凭证"。 */
+  const [feishu, setFeishu] = useState(null);
+  const [feishuErr, setFeishuErr] = useState('');
+  const loadFeishu = () =>
+    get('/api/feishu/status')
+      .then((d) => { setFeishu(d); setFeishuErr(''); })
+      .catch((e) => {
+        setFeishu(null);
+        setFeishuErr(apiErrText(e, '飞书状态读取中'));
+      });
+  useEffect(() => {
+    loadFeishu();
+  }, []);
+  const feishuInfo = feishuBadge(feishu, feishuErr);
+  const feishuSummary = feishuErr
+    ? feishuErr
+    : feishu
+      ? (feishu.ready
+        ? '已就绪，重启机器人后连上'
+        : (feishu.why || '还差一步：看上面的徽标'))
+      : '读取中…';
+  /* QQ 官方机器人摘要（折叠状态用）+ 判断新接口在不在：
+     在 → 官方凭证归 QqOfficialCard 管；不在（404）→ QQBody 里保留旧入口兜底，
+     免得后端还没补上时用户连凭证都没地方填。
+     注意只有 404 才算「接口没有」；500 之类的服务端故障不该把备用入口放出来。 */
+  const [official, setOfficial] = useState(null);
+  const [officialErr, setOfficialErr] = useState('');
+  const [officialMissing, setOfficialMissing] = useState(false);
+  useEffect(() => {
+    get('/api/qq/official')
+      .then((d) => { setOfficial(d); setOfficialErr(''); setOfficialMissing(false); })
+      .catch((e) => {
+        setOfficial(null);
+        setOfficialMissing(/404|not found/i.test(String(e.message)));
+        setOfficialErr(apiErrText(e, 'QQ 官方状态读取中'));
+      });
+  }, []);
+  const officialApiOk = !officialMissing;
   useEffect(() => {
     if (!msg) return undefined;
     const t = setTimeout(() => setMsg(''), 3200);
     return () => clearTimeout(t);
   }, [msg]);
 
-  const botPort = config?.bot_port || health?.bot_port || 12113;
-  const wsUrl = `ws://${window.location.hostname || '127.0.0.1'}:${botPort}/onebot/v11/ws`;
+  // 未登录时 config 是 null：**不编端口**，wsUrl 留空（QQBody 会显示"登录后显示"）
+  const wsUrl = config?.bot_port || health?.bot_port
+    ? `ws://${window.location.hostname || '127.0.0.1'}:${portText(config, health)}/onebot/v11/ws`
+    : '';
 
   const copyWs = async () => {
+    if (!wsUrl) {
+      setMsg('先登录星群账号：反向地址里的端口存在服务器上，读到了才复制得对');
+      return;
+    }
     try {
       await navigator.clipboard.writeText(wsUrl);
       setMsg(`已复制：${wsUrl}`);
@@ -3648,7 +4693,7 @@ function AccessPage({ auth, config, health, services, onSaved, onMessages }) {
     )) return;
     try {
       await post('/api/wechat/relogin', {});
-      setMsg('已重启机器人，几秒后会出现新二维码；展开这张卡可以扫码并填配对码');
+      setMsg('已重启机器人，几秒后会出现新二维码。');
       setTimeout(loadWx, 4000);
     } catch (e) {
       setMsg(withAuthHint(e));
@@ -3656,13 +4701,13 @@ function AccessPage({ auth, config, health, services, onSaved, onMessages }) {
   };
 
   const wxSummary = !wxOn
-    ? '微信通道未开通：当前只有 QQ 通道，去账号中心即可开通'
+    ? '微信通道当前不可用：重启一次机器人再试'
     : wxErr === 'login'
-      ? `${LOGIN_HINT}：微信状态读不到`
+      ? '微信 · 状态读不到'
       : wxErr
         ? `微信状态读取失败：${wxErr}`
         : wx?.logged_in
-          ? `已登录 ClawBot${wx?.bot_id ? ` · Bot ${wx.bot_id}` : ''}，私聊会由 Agent 直接回复`
+          ? `已登录 iLink${wx?.bot_id ? ` · Bot ${wx.bot_id}` : ''}，私聊会由机器人直接回复`
           : wx?.qrcode_url
             ? `二维码待扫（${wx?.qrcode_age ?? 0}s 前生成，2 分钟一换）`
             : wx?.login_status
@@ -3674,27 +4719,43 @@ function AccessPage({ auth, config, health, services, onSaved, onMessages }) {
       id: 'qq',
       icon: 'qq',
       name: 'QQ',
-      meta: '第三方 OneBot 协议（协议端自行安装）· 反向 WS',
+      meta: 'QQ 官方机器人 / 第三方 OneBot 两种接法都在这张卡里',
       tone: qqTone,
       label: qqLabel,
-      body: <QQBody config={config} health={health} services={services} onSaved={onSaved} />,
+      body: (
+        <QQBody
+          config={config}
+          health={health}
+          services={services}
+          onSaved={onSaved}
+          officialApiOk={officialApiOk}
+          loggedIn={loggedIn}
+          wsUrl={wsUrl}
+        />
+      ),
       facts: (
         <>
           <div className="chan__fact">
-            <span className="chan__k">连接地址</span>
-            <code className="chan__v mono">{wsUrl}</code>
+            <span className="chan__k">官方机器人</span>
+            <span className="chan__v">
+              {official
+                ? (official.appid_set && official.secret_set
+                  ? `AppID / AppSecret 已填${official.enabled ? '，开关已开' : '，开关没开'}`
+                  : '还没填 AppID / AppSecret')
+                : (officialErr || '读取中…')}
+            </span>
+          </div>
+          <div className="chan__fact">
+            <span className="chan__k">第三方 OneBot</span>
+            <code className="chan__v mono">{wsUrl || NEED_LOGIN}</code>
             <button type="button" className="btn btn--ghost btn--sm" onClick={copyWs}>
               复制地址
             </button>
           </div>
-          <div className="chan__fact">
-            <span className="chan__k">协议端(OneBot)</span>
-            <span className="chan__v">LLOneBot / NapCat / Lagrange 等，自行安装并扫码登录小号</span>
-          </div>
           <p className="chan__hint">
             {qqLinked
               ? '已连上：QQ 消息现在会经这条通道进 Agent。'
-              : '未连上：在协议端新建「反向 WebSocket / WebSocket 服务端」，地址填上面的连接地址并启用，状态会自己变成「已连接」。'}
+              : '未连上：官方填凭证；第三方让协议端连上面的地址。'}
           </p>
         </>
       ),
@@ -3703,11 +4764,11 @@ function AccessPage({ auth, config, health, services, onSaved, onMessages }) {
       id: 'wx',
       icon: 'wechat',
       name: '微信',
-      meta: 'ClawBot 通道：个人私聊助手，不支持群聊',
+      meta: 'iLink 通道：个人私聊助手，不支持群聊',
       tone: wxOn ? (wx?.logged_in ? 'success' : 'warn') : 'warn',
       label: wxErr && wxOn
-        ? '已解锁 · 状态读不到'
-        : wxOn ? (wx?.logged_in ? '已解锁 · 已连接' : '已解锁 · 未登录') : '未解锁（免费版仅 QQ）',
+        ? '微信 · 状态读不到'
+        : wxOn ? (wx?.logged_in ? '微信 · 已连接' : '微信 · 未登录') : '微信 · 不可用',
       body: <WeChatBody auth={auth} onMessages={onMessages} />,
       facts: (
         <>
@@ -3720,7 +4781,7 @@ function AccessPage({ auth, config, health, services, onSaved, onMessages }) {
               type="button"
               className="btn btn--ghost btn--sm"
               disabled={!wxOn}
-              title="会清除微信登录态并重启机器人（约 10 秒离线），之后需要重新扫码授权"
+              title="会清除登录态并重启机器人，之后要重新扫码。"
               onClick={relogin}
             >
               重新扫码
@@ -3728,53 +4789,83 @@ function AccessPage({ auth, config, health, services, onSaved, onMessages }) {
           </div>
           <p className="chan__hint">
             {!wxOn
-              ? '未解锁：微信通道暂不可用，解锁后这里的二维码才会出现。'
+              ? '微信通道不可用：先重启一次机器人。'
               : wxErr === 'login'
                 ? `${LOGIN_HINT}：登录后这里才会显示真实的微信通道状态。`
                 : wx?.logged_in
-                  ? '已连上：扫码和配对码都在下面展开区里，出问题先「重新扫码」（会清登录态并重启机器人）。'
-                  : '未连上：点「重新扫码」，再展开这张卡用微信扫码授权、必要时填配对码。'}
+                  ? '已连上。出问题先点「重新扫码」。'
+                  : '未连上：点「重新扫码」，再展开这张卡扫码。'}
           </p>
         </>
       ),
     },
-    { id: 'feishu', icon: 'plane', name: '飞书', closed: true },
-    { id: 'telegram', icon: 'planeTilt', name: '纸飞机', closed: true },
+    {
+      id: 'feishu',
+      icon: 'plane',
+      name: '飞书',
+      meta: '飞书自建应用：长连接收消息，不用公网地址',
+      tone: feishuInfo.tone,
+      label: feishuInfo.label,
+      body: <FeishuCard />,
+      facts: (
+        <>
+          <div className="chan__fact">
+            <span className="chan__k">通道状态</span>
+            <span className="chan__v">{feishuSummary}</span>
+          </div>
+          <p className="chan__hint">
+            点「配置 ›」填凭证；缺适配器就点「装适配器」。
+          </p>
+        </>
+      ),
+    },
+    {
+      id: 'telegram',
+      icon: 'planeTilt',
+      name: '纸飞机',
+      planned: true,
+      label: '暂未开放 · 正在规划中',
+      meta: '还在规划中：现在没有接入方式',
+      body: <TelegramCard />,
+      facts: (
+        <p className="chan__hint">还在规划中，不用管它，点「说明 ›」看看怎么回事。</p>
+      ),
+    },
   ];
 
-  /* 一行通道卡：右侧操作槽固定宽度，所有通道的「配置 ›」落在同一条竖线上 */
+  /* 一行通道卡：右侧操作槽固定宽度，所有通道的「配置 ›」落在同一条竖线上。
+     planned = 规划中的通道（纸飞机）：徽标固定写「暂未开放 · 正在规划中」，
+     但**仍然能展开**看说明 —— 展开后那张卡里一个能填的控件都没有，不会装成能用。 */
   const renderChan = (ch) => (
     <div className="chan__item" key={ch.id}>
-      <section className={ch.closed ? 'card chan chan--closed' : 'card chan'}>
+      <section className={ch.planned ? 'card chan chan--closed' : 'card chan'}>
         <span className="chan__icon">
           <Icon name={ch.icon} size={18} />
         </span>
         <div className="chan__main">
           <div className="chan__head">
             <span className="chan__name">{ch.name}</span>
-            {ch.closed ? (
-              <span className="chan__closed">暂未开放 · 正在规划中</span>
+            {ch.planned ? (
+              <span className="chan__closed">{ch.label}</span>
             ) : (
               <StatusBadge tone={ch.tone}>{ch.label}</StatusBadge>
             )}
           </div>
-          {!ch.closed && <div className="chan__meta">{ch.meta}</div>}
-          {!ch.closed && <div className="chan__facts">{ch.facts}</div>}
+          <div className="chan__meta">{ch.meta}</div>
+          <div className="chan__facts">{ch.facts}</div>
         </div>
-        {!ch.closed && (
-          <div className="chan__side">
-            <button
-              type="button"
-              className="btn btn--ghost btn--sm chan__act"
-              aria-expanded={open === ch.id}
-              onClick={() => toggle(ch.id)}
-            >
-              {open === ch.id ? '收起' : '配置 ›'}
-            </button>
-          </div>
-        )}
+        <div className="chan__side">
+          <button
+            type="button"
+            className="btn btn--ghost btn--sm chan__act"
+            aria-expanded={open === ch.id}
+            onClick={() => toggle(ch.id)}
+          >
+            {open === ch.id ? '收起' : ch.planned ? '说明 ›' : '配置 ›'}
+          </button>
+        </div>
       </section>
-      {!ch.closed && open === ch.id && <div className="chan__body">{ch.body}</div>}
+      {open === ch.id && <div className="chan__body">{ch.body}</div>}
     </div>
   );
 
@@ -3783,18 +4874,18 @@ function AccessPage({ auth, config, health, services, onSaved, onMessages }) {
       <header className="page-head">
         <div>
           <h1>接入</h1>
-          <p>一个机器人挂多个平台，统一人格；每张卡直接给出关键信息，点「配置 ›」展开该通道的全部设置</p>
+          <p>想让机器人在哪个平台说话，就在这里接上；每张卡直接给出关键信息，点「配置 ›」展开该通道的全部设置</p>
         </div>
       </header>
 
       {/* 功能分组：组内 14px，组间 24px（组外 > 组内），不靠藏内容换留白 */}
       <div className="chan-grp">
-        {channels.filter((c) => !c.closed).map(renderChan)}
+        {channels.filter((c) => !c.planned).map(renderChan)}
       </div>
 
       <div className="chan-grp chan-grp--plan">
         <div className="chan-grp__title">规划中通道</div>
-        {channels.filter((c) => c.closed).map(renderChan)}
+        {channels.filter((c) => c.planned).map(renderChan)}
       </div>
 
       {msg && <div className="toast">{msg}</div>}
@@ -3834,6 +4925,12 @@ function MessageCenter({ loggedIn = true }) {
   const [platform, setPlatform] = useState('');
   const [msg, setMsg] = useState('');
   const [busy, setBusy] = useState(false);
+  /* 点一条会话 → 右侧/下面看它的内容（桌面端只列一行文本，控制台把这条会话有的字段
+     全部摊开：平台、群/好友、会话标识、条数、最近时间、最后一条消息）。
+     正文接口还没有（/api/messages/list 只透出标量字段），所以这里不编造聊天记录。 */
+  const [picked, setPicked] = useState('');
+  // 「清空」只清这个页面上的列表显示，机器人里的会话记录一条都不动
+  const [cleared, setCleared] = useState([]);
 
   const load = useCallback(async () => {
     if (!loggedIn) {                            // 别发这个必 401 的请求
@@ -3881,10 +4978,12 @@ function MessageCenter({ loggedIn = true }) {
       return { ...d, platform: 'qq', scene: isGroup ? 'group' : 'private', room, key, _dsh: true };
     })
     .filter((d) => !seenRooms.has(`qq:${d.room}`));
-  const all = [...(rows || []), ...dshRows];
+  const idOf = (c) => `${platOf(c)}:${roomOf(c) || String(c.key || '')}`;
+  const all = [...(rows || []), ...dshRows].filter((c) => !cleared.includes(idOf(c)));
   const shown = platform ? all.filter((c) => platOf(c) === platform) : all;
   const loading = rows === null;
   const has = shown.length > 0;
+  const current = all.find((c) => idOf(c) === picked) || null;
 
   /* 会话标题：后端给了 title/name 就直接用；否则用 platform + scene + room 拼出
      「QQ 群 123456 / QQ 好友 123456 / 微信 好友 xxx」—— 多个 QQ 会话因此能区分开。
@@ -3920,7 +5019,7 @@ function MessageCenter({ loggedIn = true }) {
       <header className="page-head">
         <div>
           <h1>消息中心</h1>
-          <p>跨平台会话列表：QQ 与 微信 ClawBot 的会话都在这里（数据来自机器人落盘的会话索引）</p>
+          <p>QQ 与微信 iLink 的会话都在这里。</p>
         </div>
       </header>
 
@@ -3936,6 +5035,28 @@ function MessageCenter({ loggedIn = true }) {
         <button type="button" className="btn" disabled={busy} onClick={refresh}>
           {busy ? '刷新中…' : '刷新'}
         </button>
+        <button
+          type="button"
+          className="btn"
+          disabled={!has}
+          title="只清这个页面的显示，机器人里的记录不动"
+          onClick={() => {
+            setCleared(all.map(idOf));
+            setPicked('');
+            setMsg('列表已清空（只清显示，记录没动）');
+          }}
+        >
+          清空列表
+        </button>
+        {cleared.length > 0 && (
+          <button
+            type="button"
+            className="btn btn--ghost"
+            onClick={() => { setCleared([]); setMsg('已读回会话列表'); }}
+          >
+            显示回来
+          </button>
+        )}
         <span className="msg-bar__stat">
           {loading ? '读取中…' : needLogin ? '' : `共 ${all.length} 个会话${platform ? `（当前筛选：${PLATFORM_LABELS[platform]}，${shown.length} 个）` : ''}`}
         </span>
@@ -3945,7 +5066,15 @@ function MessageCenter({ loggedIn = true }) {
         {has && (
           <div className="msg-list">
             {shown.map((c, i) => (
-              <div className="msg-item" key={`${platOf(c)}-${c.key || c.title || c.name || i}`}>
+              <div
+                className={picked === idOf(c) ? 'msg-item msg-item--on' : 'msg-item'}
+                key={`${platOf(c)}-${c.key || c.title || c.name || i}`}
+                role="button"
+                tabIndex={0}
+                title="点一下看这条会话的全部信息"
+                onClick={() => setPicked(idOf(c))}
+                onKeyDown={(ev) => { if (ev.key === 'Enter') setPicked(idOf(c)); }}
+              >
                 <div className="msg-item__head">
                   <span className="msg-item__who">{label(c)}</span>
                   <span className="msg-item__meta">{meta(c)}</span>
@@ -3955,6 +5084,72 @@ function MessageCenter({ loggedIn = true }) {
             ))}          </div>
         )}
       </section>
+
+      {/* 内容查看：把这条会话有的字段按人话摊开。没有字段就不编 —— 正文接口还没上，
+          这里照实说"只能看到最近一条"。 */}
+      {current && (
+        <section className="card card--wide msg-detail">
+          <h2 className="card__title">会话内容</h2>
+          <div className="stat-rows">
+            <div className="stat-row">
+              <span>会话</span>
+              <b>{label(current)}</b>
+            </div>
+            <div className="stat-row">
+              <span>平台</span>
+              <b>{PLATFORM_LABELS[platOf(current)] || '未知平台'}</b>
+            </div>
+            <div className="stat-row">
+              <span>场景</span>
+              <b>{SCENE_LABELS[sceneOf(current)] || '会话'}</b>
+            </div>
+            <div className="stat-row">
+              <span>会话标识</span>
+              <b className="mono">{String(current.key || roomOf(current) || '—')}</b>
+            </div>
+            <div className="stat-row">
+              <span>消息条数</span>
+              <b>{Number(current.count || 0) ? `${current.count} 条` : '—'}</b>
+            </div>
+            <div className="stat-row">
+              <span>最近一条</span>
+              <b>{when(current) || '—'}</b>
+            </div>
+          </div>
+          {(current.last_text || current.last) ? (
+            <p className="card__note">最后一条：{current.last_text || current.last}</p>
+          ) : (
+            <p className="card__note">这条会话只有条数和时间，看不到正文。</p>
+          )}
+          <div className="btn-row btn-row--6">
+            <button
+              type="button"
+              className="btn btn--ghost btn--sm"
+              title="复制列表里已有的信息"
+              onClick={async () => {
+                const text = [
+                  label(current),
+                  `平台：${PLATFORM_LABELS[platOf(current)] || '未知平台'}`,
+                  `会话标识：${String(current.key || roomOf(current) || '')}`,
+                  when(current) ? `最近一条：${when(current)}` : '',
+                  (current.last_text || current.last) ? `最后一条：${current.last_text || current.last}` : '',
+                ].filter(Boolean).join('\n');
+                try {
+                  await copyToClipboard(text);
+                  setMsg('已复制这条会话的信息');
+                } catch (err) {
+                  setMsg(`复制失败：${err.message}`);
+                }
+              }}
+            >
+              复制会话信息
+            </button>
+            <button type="button" className="btn btn--ghost btn--sm" onClick={() => setPicked('')}>
+              收起
+            </button>
+          </div>
+        </section>
+      )}
 
       {!has && !loading && (
         <div className="empty-state empty-state--messages">
@@ -3968,7 +5163,7 @@ function MessageCenter({ loggedIn = true }) {
               <div className="empty-state__title">读取失败</div>
               <div className="empty-state__hint">
                 {err}
-                （点上面「刷新」重试；一直失败就是后端接口的问题，不是你没有会话）
+                （点上面「刷新」重试）
               </div>
             </>
           ) : platform ? (
@@ -3983,7 +5178,7 @@ function MessageCenter({ loggedIn = true }) {
             <>
               <div className="empty-state__title">还没有会话记录</div>
               <div className="empty-state__hint">
-                机器人收到过消息后这里就会出现会话。刚部署好、还没人跟机器人说过话时是正常的。
+                机器人收到过消息后这里就会出现会话。
               </div>
             </>
           )}
@@ -3998,7 +5193,9 @@ function MessageCenter({ loggedIn = true }) {
 /* 全局管理（服务）：只回答「服务在不在跑」+ 每行一个动作。
    端口 / 目录 / 日志路径这些运维细节全部收进「运维细节」折叠区，默认不占版面。
    数据来自 /api/services/status（bot + dsh），动作走 /api/services/{start,stop,restart}。 */
-function ServicesPage({ config, health, services, onAccess, onLogs, onDeps }) {
+/* 全局管理（导出是为了让冒烟能直接渲染一遍：DSH 智能体块与那句说明要有断言锁着）。 */
+export function ServicesPage({ config, health, services, onAccess, onLogs, onDeps,
+                               loggedIn = true }) {
   const [msg, setMsg] = useState('');
   const [busy, setBusy] = useState('');
 
@@ -4038,7 +5235,8 @@ function ServicesPage({ config, health, services, onAccess, onLogs, onDeps }) {
           ? '已停止（已部署）'
           : '未部署（点启动会用部署脚本装好）';
   const botTone = services == null ? 'unknown' : botOn ? 'running' : 'stopped';
-  const botPort = config?.bot_port || health?.bot_port || 12113;
+  // 未登录时 config 是 null：不摆 12113 这个假端口（「配置归 0」的观感来源之一）
+  const botPort = portText(config, health);
   const dshState = services?.dsh?.state || '';
   const dshText = dshState === 'running' ? '运行中' : '暂未开放（待接入）';
 
@@ -4047,14 +5245,14 @@ function ServicesPage({ config, health, services, onAccess, onLogs, onDeps }) {
       <header className="page-head">
         <div>
           <h1>全局管理</h1>
-          <p>服务状态与开关；端口、路径、日志位置在下面的「运维细节」里</p>
+          <p>服务状态与开关。</p>
         </div>
       </header>
 
       <section className="card svc">
         <div className="svc__row">
           <div className="svc__main">
-            <div className="svc__name">机器人（NoneBot）</div>
+            <div className="svc__name">机器人</div>
             <div className="svc__meta">QQ / 微信 共用一个进程，重启会短暂离线约 10 秒</div>
           </div>
           <div className="svc__side">
@@ -4074,7 +5272,7 @@ function ServicesPage({ config, health, services, onAccess, onLogs, onDeps }) {
         <div className="svc__row">
           <div className="svc__main">
             <div className="svc__name">DSH 智能体</div>
-            <div className="svc__meta">服务器上的本地智能体，接入后会出现在这里</div>
+            <div className="svc__meta">本机的群聊智能体通道，接入后会出现在这里</div>
           </div>
           <div className="svc__side">
             <StatusBadge tone={dshState === 'running' ? 'running' : 'unknown'}>{dshText}</StatusBadge>
@@ -4111,7 +5309,7 @@ function ServicesPage({ config, health, services, onAccess, onLogs, onDeps }) {
               <button
                 type="button"
                 className="btn btn--ghost btn--sm"
-                title="无头端没有本地文件管理器：点这里复制路径，粘到 SSH / SFTP 里用"
+                title="点这里复制路径。"
                 onClick={() => copyServerPath(setMsg, '机器人目录', botEnvPathBase)}
               >
                 复制机器人目录
@@ -4143,6 +5341,10 @@ function ServicesPage({ config, health, services, onAccess, onLogs, onDeps }) {
         </div>
       </details>
 
+      {/* 日志保留：现在多少天、占多大、立刻清理 —— 与「日志」页共用同一个组件，
+          两处入口看到的永远是同一份数据，不做两套。 */}
+      <LogRetention onMsg={setMsg} />
+
       {msg && <div className="toast">{msg}</div>}
     </>
   );
@@ -4170,7 +5372,7 @@ const SETTING_TABS = [
   ['advanced', '高级'],
 ];
 
-function Settings({
+export function Settings({
   config,
   services,
   onSaved,
@@ -4184,13 +5386,21 @@ function Settings({
   appearance,
   onAppearance,
   onGo = () => {},
+  version = '',
+  tab: tabProp = '',
+  onTab = null,
+  /* 「锁定这台设备」用：App 的 lockConsole（退出控制台会话，**不动星群账号**）。
+     默认 null 时卡片自己会提示"没接上锁屏入口"，不会静默失效。 */
+  onLockConsole = null,
 }) {
   const [form, setForm] = useState(null);
   const [info, setInfo] = useState(null);
   const [msg, setMsg] = useState('');
-  const [tab, setTab] = useState('appearance');
-  const [email, setEmail] = useState('');
-  const [password, setPassword] = useState('');
+  /* 页签默认由这里管；App 传 tab/onTab 时以 App 为准（登录提示条的「去登录」
+     要能直接落到「账号」页签）。两种用法都留着，组件单用也不会坏。 */
+  const [localTab, setLocalTab] = useState('appearance');
+  const tab = tabProp || localTab;
+  const setTab = (v) => { setLocalTab(v); if (onTab) onTab(v); };
   const [latest, setLatest] = useState('');
   const [checkedAt, setCheckedAt] = useState('');
   // 未登录时 /api/status 与 console/dev-mode 都 401，组件里以前是 .catch(()=>{}) 静默吞掉：
@@ -4218,6 +5428,8 @@ function Settings({
   const isGlass = ap.theme === UI_THEME_OPTIONS[0];
 
   const todo = (what) => setMsg(`${what}：无头端暂不支持，请在服务器或桌面端操作`);
+  // 标题栏那个版本号（Linux 无头端自己的版本）在两处都要一致：没有就照实说读不到
+  const curVersion = version || '版本读取中';
   // 检查更新：桌面端是查签发站的 /license/version（同源，控制台就挂在 astroswarm.cn 下）。
   // 「打开 settings.json / 打开安装目录 / 导入旧版本 / 卸载」在无头端没有任何可做的事
   // （服务器上没有本地文件管理器，卸载也不该由网页按钮代劳），已从界面上删掉。
@@ -4231,7 +5443,10 @@ function Settings({
       if (!v) throw new Error('返回里没有版本号');
       setLatest(v);
       setCheckedAt(new Date().toLocaleString('zh-CN', { hour12: false }));
-      setMsg(v === APP_VERSION ? `已是最新版本 v${v}` : `有新版本 v${v}（当前 v${APP_VERSION}）${d.url ? '：' + d.url : ''}`);
+      // 站点上的版本号是**桌面包**的编号（1.2.x），和 Linux 端不是同一串：
+      // 以前拿它和写死的页面版本比大小，比出来的是假的。现在只报两个真值。
+      setMsg(`站点最新桌面版 v${v}；本机 Linux 端 ${curVersion}。`
+        + '要升级就按官网教程重装或更新这台机器。');
     } catch (e) {
       setMsg(`检查更新失败：${e.message}（页面不在 astroswarm.cn 下时跨域会被拦）`);
     }
@@ -4254,34 +5469,24 @@ function Settings({
       const saved = await put('/api/config', { port, bot_port: botPort });
       setForm({ ...f, ...saved });
       onSaved();
-      setMsg('端口已写入服务器：改端口需要重启服务生效（控制台端口重启控制台，机器人端口重启 NoneBot）');
+      setMsg('端口已保存：改端口要重启对应服务才生效');
     } catch (e) {
       setMsg(`端口未写入服务器（${e.message}）`);
     }
   };
+  /* 端口：NumberField 给的是数字，保存前 savePorts 自己会校验 1–65535 并给中文提示，
+     所以这里只要不把 NaN 写进 form 就行（NaN 会让按钮一直显示"未保存"却点不动）。 */
+  const setPortNum = (key) => (n) => setForm((cur) => ({ ...cur, [key]: Number.isFinite(n) ? n : cur[key] }));
   // 选择本地文件：浏览器拿不到真实路径，只能给个本次会话有效的 blob URL；
   // 要长期生效就把图片放到服务器上、在路径里填 URL（/bg.jpg 或 https://…）。
   const pickFile = (file) => {
     if (!file) return;
     set({ enabled: true, path: URL.createObjectURL(file) });
-    setMsg('已选本地文件（仅本次会话有效；要长期生效请在路径里填 URL）');
+    setMsg('已选本地文件（仅本次会话有效）');
   };
-  const login = async () => {
-    try {
-      const res = await post('/api/auth/login', { email, password });
-      // 后端没回 token 就不算登录成功（以前这种情况也会提示「登录成功」，然后界面还是未登录）
-      if (!res || !res.token) {
-        setMsg('登录没有成功：服务器没有返回登录态，请检查邮箱与密码');
-        return;
-      }
-      onToken(res.token);
-      setPassword('');
-      setMsg('登录成功');
-      await onChanged();
-    } catch (e) {
-      setMsg(String(e.message));
-    }
-  };
+  /* 这里的登录表单搬进了 LoginModal.jsx 的 LoginForm：弹窗与这个页签共用同一份实现。
+     逻辑（邮箱/密码、登录中禁用、后端没回 token 不算成功、失败原因怎么显示）
+     现在只有一处，改它两处一起变 —— 不再在这儿留第二份。 */
   /* 退出登录：/api/auth/logout 是**要鉴权**的接口（api.py 的 _require_auth），
      token 过期/被清时后端回 401 → post 抛错。以前没有 try/catch，于是 onToken('') 不执行、
      提示不显示、界面毫无反应 —— 用户只会觉得「退出登录按钮坏了」。
@@ -4294,7 +5499,7 @@ function Settings({
       await post('/api/auth/logout', {});
     } catch (e) {
       if (isAuthError(e)) {
-        note = '已退出登录（服务器说这个登录态早就过期了，本机已经清干净）';
+        note = '已退出登录。';
       } else {
         note = `已退出本地登录，但服务器没确认（${e.message}）：本机已经退出，可稍后再试一次`;
       }
@@ -4317,7 +5522,7 @@ function Settings({
       setMsg(String(e.message));
     }
   };
-  const acct = auth?.email ? `已登录：${auth.email}` : '未登录';
+  /* 控制台密码屏与星群账号是两码事，别把这两行合成一句（下面那张卡才是控制台密码）。 */
   // 行高按桌面端实测钉死：值的换行数（Qt 的 wordWrap sizeHint）决定了 32/48 的行，
   // 无头端数据不同、换行数也不同，所以宽度和高度都按实测值固定，保证整块版面一致。
   const row = (label, value, mod = '', vw = 0) => (
@@ -4332,7 +5537,7 @@ function Settings({
       <header className="page-head">
         <div>
           <h1>设置</h1>
-          <p>环境信息与外观背景；外观改动实时预览并即时保存在本浏览器，端口在「高级」页签里改</p>
+          <p>环境信息与外观背景，端口在「高级」页签里改。</p>
         </div>
       </header>
 
@@ -4356,10 +5561,13 @@ function Settings({
         <div className="tabpane">
           <section className="card">
             <h2 className="card__title">星群账号</h2>
+            {/* 这一行与下面「账号」那行、顶栏芯片、账号卡**同一个判据**（本地 token）：
+                以前这里看 auth.email，芯片看 token —— 两者一不一致就会出现
+                "上面写已登录、下面写未登录"的自相矛盾（老板截图里那种）。 */}
             <p className="card__note">
-              {auth?.email
-                ? `已登录：${auth.email}。通道开通与插件安装都跟着这个邮箱走。`
-                : '未登录：插件照常免费安装；微信通道的开通状态要登录后才能同步。'}
+              {loggedIn
+                ? `已登录${auth?.email ? `：${auth.email}` : ''}。这个邮箱用来在服务器上识别你这台机器。`
+                : '插件、能力包、QQ 与微信通道全部免费。'}
             </p>
             {loggedIn ? (
               <div className="p-row">
@@ -4371,41 +5579,28 @@ function Settings({
                 </button>
               </div>
             ) : (
-              <div className="p-row">
-                <input
-                  className="p-input"
-                  value={email}
-                  placeholder="邮箱"
-                  spellCheck={false}
-                  onChange={(e) => setEmail(e.target.value)}
-                />
-                <input
-                  className="p-input"
-                  type="password"
-                  value={password}
-                  placeholder="密码"
-                  onChange={(e) => setPassword(e.target.value)}
-                />
-                <button type="button" className="btn btn--primary" onClick={login}>
-                  登录
-                </button>
-              </div>
+              /* 与登录弹窗**同一个组件**（LoginModal.jsx 的 LoginForm）：
+                 两处行为一致，不会这边改了那边忘 */
+              <LoginForm onToken={onToken} onChanged={onChanged} onMsg={setMsg} />
             )}
+            {/* 头像 + 昵称（官网个人中心同一份数据）：登录后能改，改完各处立刻一致。
+                loggedIn 由 App 按**本地 token** 判断（这个组件里没有 token 这个名字）；
+                email 只用来在资料还没到时兜底显示，不当作登录判据。 */}
+            <AccountProfileBlock
+              loggedIn={Boolean(loggedIn)}
+              email={auth?.email || ''}
+              onMsg={setMsg}
+            />
             <div className="stat-rows">
               <div className="stat-row">
-                <span>套餐 / 权益</span>
+                <span>账号</span>
                 <b>
-                  {isMember(auth)
-                    ? `${isFull(auth) ? '已开通 · 全功能' : '已开通'}${auth?.plan ? `（${auth.plan}）` : ''}`
-                    : '未开通（仅 QQ）'}
+                  {loggedIn
+                    ? `已登录${auth?.plan ? `（${auth.plan}）` : ''}`
+                    : '未登录 · 功能不受影响'}
                 </b>
               </div>
             </div>
-            {!isMember(auth) && (
-              <a className="btn btn--ghost btn--self" href={ACTIVATE_URL} target="_blank" rel="noreferrer">
-                去账号中心开通（含微信通道）
-              </a>
-            )}
           </section>
 
           <section className="card">
@@ -4413,7 +5608,7 @@ function Settings({
             <div className="stat-rows">
               <div className="stat-row">
                 <span>当前版本</span>
-                <b>{health?.version || APP_VERSION}</b>
+                <b>{curVersion}</b>
               </div>
               <div className="stat-row">
                 <span>最新版本</span>
@@ -4427,10 +5622,12 @@ function Settings({
             <button type="button" className="btn btn--self" onClick={checkUpdate}>
               检查更新
             </button>
-            <p className="card__note">
-              客户端与全部插件源码在 GitHub 开源（Apache-2.0）：QQ 通道与能力包免费，微信通道为官方付费开通，也可以自己用仓库里的适配器接入（不含官方支持）。
-            </p>
           </section>
+
+          {/* 控制台密码（2026-10-10 老板："再在设置里做个登录web密码设置"）：
+              改密码 / 锁屏都在这里，不用再去服务器上删文件。
+              和上面「星群账号」是两件事，所以单独一张卡、字号一致。 */}
+          <ConsolePasswordCard onLock={onLockConsole} onMsg={setMsg} />
         </div>
       )}
 
@@ -4446,46 +5643,40 @@ function Settings({
             <p className="card__note">
               两个端口都要在 1–65535 之间；改完必须重启对应的服务才生效。
             </p>
-            <div className="kv-row">
-              <span>控制台端口</span>
-              <input
-                className="mono"
-                type="number"
-                min="1"
-                max="65535"
-                value={f.port ?? ''}
-                placeholder="7860"
-                onChange={(e) => setForm({ ...f, port: e.target.value })}
-              />
-            </div>
-            <div className="kv-row">
-              <span>机器人端口</span>
-              <input
-                className="mono"
-                type="number"
-                min="1"
-                max="65535"
-                value={f.bot_port ?? ''}
-                placeholder="12113"
-                onChange={(e) => setForm({ ...f, bot_port: e.target.value })}
-              />
-            </div>
+            <NumberField
+              className="numf--net"
+              label="控制台端口"
+              value={f.port ?? ''}
+              min={1}
+              max={65535}
+              hint="这个网页后台的端口（重启控制台进程生效）"
+              onChange={setPortNum('port')}
+            />
+            <NumberField
+              className="numf--net"
+              label="机器人端口"
+              value={f.bot_port ?? ''}
+              min={1}
+              max={65535}
+              hint="QQ 协议端反向连接用的端口（重启机器人生效）"
+              onChange={setPortNum('bot_port')}
+            />
             <p className="card__note">
               控制台端口 = 这个网页后台的端口（重启控制台进程生效）；
-              机器人端口 = QQ 协议端反向连接用的端口（重启 NoneBot 生效）。
+              机器人端口 = QQ 协议端反向连接用的端口（重启机器人生效）。
             </p>
             {!loggedIn && <p className="card__note">{LOGIN_HINT}（端口存在服务器上，读写都要登录）</p>}
             <div className="p-row">
-              <button type="button" className="btn btn--primary btn--sm" onClick={savePorts}>
+              <PillButton tone="primary" size="sm" onClick={savePorts}>
                 保存端口
-              </button>
+              </PillButton>
             </div>
           </section>
 
           <section className="card set-ai">
             <h2 className="card__title">AI 插件</h2>
             <p className="card__note">
-              内置 AI 插件已随程序自动安装到机器人，不可卸载，也没有开关：机器人启动时一定会加载它。
+              内置 AI 插件随程序自动安装，不可卸载。
               接口配置、平台开关、人格与 MCP 都请到「AI 大脑」页设置。
             </p>
             {/* 这里原来是一个「启用 AI 插件」的假勾选框（无 state、无 onChange），
@@ -4499,46 +5690,42 @@ function Settings({
 
           <section className="card set-boot">
             <h2 className="card__title">启动行为与开发者选项</h2>
-            <label className="check">
-              <input
-                type="checkbox"
-                checked={devMode}
-                onChange={async (e) => {
-                  const on = e.target.checked;
-                  try {
-                    const d = await post('/api/console/dev-mode', { on });
-                    setDevMode(Boolean(d.developer_mode));
-                    setMsg(on ? '开发者模式已开启：插件页可以从 PyPI 装第三方插件了' : '开发者模式已关闭');
-                  } catch (err) {
-                    setDevMode(!on);
-                    setMsg(withAuthHint(err));
-                  }
-                }}
-              />
-              <span>开发者模式（恢复第三方插件安装，后果自负）</span>
-            </label>
+            {/* 这三个都不折叠：开发者模式 = 安全相关的开关，小白模式 = 影响全站导航，
+                读不到状态的提示也必须常显（APG：能改变后果的开关不能藏）。 */}
+            <ToggleRow
+              checked={devMode}
+              label="开发者模式（恢复第三方插件安装，后果自负）"
+              desc="开了才能在插件页从 PyPI 装第三方插件；装进来的东西跑在服务器上。"
+              onChange={async (next) => {
+                try {
+                  const d = await post('/api/console/dev-mode', { on: next });
+                  setDevMode(Boolean(d.developer_mode));
+                  setMsg(next ? '开发者模式已开启：插件页可以从 PyPI 装第三方插件了' : '开发者模式已关闭');
+                } catch (err) {
+                  setDevMode(!next);
+                  setMsg(withAuthHint(err));
+                }
+              }}
+            />
             {devErr === 'login' && (
               <p className="card__note">
-                {LOGIN_HINT}：开发者模式的当前状态读不到，上面的勾选框显示的不一定是服务器上的真实值。
+                {LOGIN_HINT}：开发者模式的当前状态读不到，上面的开关显示的不一定是服务器上的真实值。
               </p>
             )}
             {devErr && devErr !== 'login' && (
               <p className="card__note">开发者模式状态读取失败：{devErr}（可稍后刷新页面重试）</p>
             )}
-            <label className="toggle">
-              <span>小白模式（只显示常用功能）</span>
-              <input
-                type="checkbox"
-                checked={Boolean(beginner)}
-                onChange={(e) => onBeginner(e.target.checked)}
-              />
-              <i className="toggle__pill" />
-            </label>
+            <ToggleRow
+              checked={Boolean(beginner)}
+              label="小白模式（只显示常用功能）"
+              desc="关掉后侧栏会多出消息中心 / 插件 / 日志 / 依赖这些高级入口。"
+              onChange={(next) => onBeginner(next)}
+            />
             {/* 这里原来还有「启动程序时自动启动全部服务」「开机自动启动 AstroSwarm」两个勾选框：
                 无 state、无 onChange，点一下变样、刷新就还原 —— 点了没用的假控件，已删除。
                 无头端这两个行为由 systemd 管，网页改不了，如实写在下面。 */}
             <p className="card__note">
-              开机自启 / 随程序自动启动全部服务：无头端由 systemd 管理，网页上不可改
+              开机自启由系统管理，网页上改不了。
               （在服务器上执行 systemctl enable / disable astroswarm-headless 生效）；
               桌面端才有上面那两个注册表开关。
             </p>
@@ -4570,13 +5757,13 @@ function Settings({
                   <p className="card__note">环境信息读取失败：{infoErr}</p>
                 )}
                 <p className="card__note">
-                  ⚠ 当前为 BETA 测试版，未经充分测试，可能存在不兼容或 Bug。如遇问题，请等待后续更新。
+                  ⚠ BETA 测试版，可能不稳定。
                 </p>
                 <div className="p-row">
                   <button
                     type="button"
                     className="btn btn--ghost btn--sm"
-                    title="无头端没有本地文件管理器：点这里复制路径，粘到终端或 SFTP 里用"
+                    title="点这里复制路径。"
                     onClick={() => copyServerPath(setMsg, '安装根目录', async () => (await get('/api/status')).data_home || (await get('/api/status')).config_home || '')}
                   >
                     复制安装目录
@@ -4609,97 +5796,9 @@ function Settings({
         <section className="card card--strong set-appr">
           <h2 className="card__title">外观与动态背景</h2>
           <p className="card__note">
-            背景只是氛围层，不影响任何后台任务；下面每一项改完立刻生效，并自动记在这个浏览器里。
+            下面每一项改完立刻生效，只记在这个浏览器里。
           </p>
-          <label className="check">
-            <input
-              type="checkbox"
-              checked={ap.enabled}
-              onChange={(e) => set({ enabled: e.target.checked })}
-            />
-            <span>启用背景（图片/视频）</span>
-          </label>
-
-          <div className="p-row p-row--top">
-            <input
-              className="p-input"
-              value={ap.path}
-              placeholder="背景图片 / 视频的 URL（如 /bg.jpg 或 https://…）"
-              spellCheck={false}
-              onChange={(e) => set({ path: e.target.value })}
-            />
-            <label className="btn" title="浏览器拿不到真实路径，选本地文件只在本次会话有效">
-              选择文件 ...
-              <input
-                type="file"
-                accept="image/*,video/*"
-                style={{ display: 'none' }}
-                onChange={(e) => pickFile(e.target.files && e.target.files[0])}
-              />
-            </label>
-            <button type="button" className="btn" onClick={() => set({ path: '' })}>
-              清除
-            </button>
-          </div>
-
-          <div className="p-row p-row--chk">
-            <label className="check">
-              <input type="checkbox" checked={ap.autoplay} onChange={(e) => set({ autoplay: e.target.checked })} />
-              <span>自动播放</span>
-            </label>
-            <label className="check">
-              <input type="checkbox" checked={ap.loop} onChange={(e) => set({ loop: e.target.checked })} />
-              <span>循环播放</span>
-            </label>
-          </div>
-
-          <div className="set-row set-row--slider">
-            <span>遮罩强度</span>
-            <input
-              type="range"
-              min="30"
-              max="95"
-              value={ap.mask}
-              onChange={(e) => set({ mask: Number(e.target.value) })}
-            />
-            <b>{(ap.mask / 100).toFixed(2)}</b>
-          </div>
-
-          <div className="set-box">
-            <div className="set-row set-row--slider">
-              <span>UI 不透明度</span>
-              <input
-                type="range"
-                min="10"
-                max="95"
-                value={ap.opacity}
-                onChange={(e) => set({ opacity: Number(e.target.value) })}
-              />
-              <b>{`${ap.opacity}%`}</b>
-            </div>
-          </div>
-
-          <div className="set-row set-row--slider">
-            <span>视频亮度</span>
-            <input
-              type="range"
-              min="-100"
-              max="100"
-              value={ap.bright}
-              onChange={(e) => set({ bright: Number(e.target.value) })}
-            />
-            <b>{String(ap.bright)}</b>
-          </div>
-
-          <label className="check">
-            <input
-              type="checkbox"
-              checked={ap.animations}
-              onChange={(e) => set({ animations: e.target.checked })}
-            />
-            <span>减少界面动效</span>
-          </label>
-
+          {/* 主题 / 强调色 / 质感：一眼就能看出效果的三项，常在表面 */}
           <div className="set-row">
             <span>UI 主题</span>
             <select
@@ -4744,11 +5843,103 @@ function Settings({
             </div>
           </div>
 
-          {/* 外观改动是「改一下就即时生效并存进本浏览器」的（App 里 useEffect → saveAppearance）。
+          <ToggleRow
+            checked={ap.animations}
+            label="减少界面动效"
+            desc="关掉转场与浮动动画（低配机器 / 远程桌面更跟手）。"
+            onChange={(next) => set({ animations: next })}
+          />
+
+          {/* 背景图/视频这一组是"配一次就不动"的低频项：收进折叠区。
+              它是外观层，不涉及安全与隐私，收起来不会出事故。 */}
+          <Collapse
+            storageKey="appearance-background"
+            title="背景图 / 视频"
+            summary={ap.enabled ? (ap.path ? `已启用 · ${String(ap.path).slice(0, 40)}` : '已启用但没填路径') : '未启用'}
+          >
+            <ToggleRow
+              checked={ap.enabled}
+              label="启用背景（图片/视频）"
+              desc="叠在界面最底层，不影响任何功能。"
+              onChange={(next) => set({ enabled: next })}
+            />
+
+            <div className="p-row p-row--top">
+              <input
+                className="p-input"
+                value={ap.path}
+                placeholder="背景图片 / 视频的 URL（如 /bg.jpg 或 https://…）"
+                spellCheck={false}
+                aria-label="背景图片或视频的 URL"
+                onChange={(e) => set({ path: e.target.value })}
+              />
+              <label className="pillbtn pillbtn--secondary pillbtn--md" title="选本地文件只在本次会话有效">
+                选择文件 ...
+                <input
+                  type="file"
+                  accept="image/*,video/*"
+                  style={{ display: 'none' }}
+                  onChange={(e) => pickFile(e.target.files && e.target.files[0])}
+                />
+              </label>
+              <PillButton tone="secondary" onClick={() => set({ path: '' })}>
+                清除
+              </PillButton>
+            </div>
+
+            <div className="p-row p-row--chk">
+              <ToggleRow
+                checked={ap.autoplay}
+                label="自动播放"
+                onChange={(v) => set({ autoplay: v })}
+              />
+              <ToggleRow
+                checked={ap.loop}
+                label="循环播放"
+                onChange={(v) => set({ loop: v })}
+              />
+            </div>
+
+            {/* 三个滑块以前是三套裸 input[type=range]，数值还用不同写法显示
+                （0.68 / 70% / 0）；现在统一成 NumberField 的滑杆形态，单位后缀写清楚。 */}
+            <NumberField
+              label="遮罩强度"
+              value={ap.mask}
+              min={30}
+              max={95}
+              slider
+              unit="%"
+              hint="背景越暗，界面文字越清楚"
+              onChange={(v) => set({ mask: v })}
+            />
+            <NumberField
+              label="UI 不透明度"
+              value={ap.opacity}
+              min={10}
+              max={95}
+              slider
+              unit="%"
+              hint="只影响极光玻璃主题的面板底色"
+              onChange={(v) => set({ opacity: v })}
+            />
+            <NumberField
+              label="视频亮度"
+              value={ap.bright}
+              min={-100}
+              max={100}
+              slider
+              hint="0 = 原样；负值压暗，正值提亮"
+              onChange={(v) => set({ bright: v })}
+            />
+          </Collapse>
+
+          {/* 外观改动是「改一下即时生效」的：本地镜像走 App 里 useEffect → saveAppearance，
+              同时 App 的 onAppearance 会写一遍服务器（/api/config 的 ui_* 键），
+              所以换浏览器登录后这些偏好还在；未登录时只在本机生效并给一句中文提示。
               原来这里还有个「保存设置」按钮，实际只写端口 —— 名字和做的事不一致，也和外面上面的
               「保存端口」重复。现在这一屏没有任何「保存」：改动即时生效，端口归「高级 → 网络端口」。 */}
           <p className="card__note">
-            以上外观改动都是即时生效的，并记在这个浏览器里，不需要点保存。
+            以上改动即时生效，不需要点保存；会同步到服务器，换浏览器登录后仍然生效。
             端口、依赖、服务开关在「高级」页签里。
           </p>
         </section>
@@ -4765,12 +5956,24 @@ function Deps() {
   const [checked, setChecked] = useState(0);
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState('');
+  // 安装输出：后端把 pip 的每一行都写进 /api/deps/status 的 log，这里照原样显示
+  // （桌面端任务面板里也是这份输出）。装不上时用户能拿着它找人看。
+  const [output, setOutput] = useState([]);
+  const [stage, setStage] = useState('');
 
   const absorb = (st) => {
     if (typeof st.checked === 'number') setChecked(st.checked);
     if (Array.isArray(st.missing)) setMissing(st.missing);
+    if (Array.isArray(st.log)) setOutput(st.log.map((l) => String(l)));
+    if (st.stage) setStage(String(st.stage));
     // st.error 是后端任务异常原文（可能含 pip 输出/路径）：先说人话，再附原文
     if (st.error) setMsg(`上一个依赖任务出错了，请把下面这段发给开发者：${st.error}`);
+  };
+  // 边跑边显示：轮询回调里既更新阶段文字，也把 log 追加出来
+  const onPoll = (s) => {
+    absorb(s);
+    setStage(String(s.stage || ''));
+    setMsg(String(s.stage || '执行中…'));
   };
 
   // 进页面先接一次状态：可能在插件页刚点过「重装缺失依赖」，结果要接上
@@ -4789,9 +5992,10 @@ function Deps() {
   const scan = async () => {
     setBusy(true);
     setMissing([]);
+    setOutput([]);
     setSummary('正在后台扫描插件依赖 ...');
     try {
-      const st = await runDeps('scan', (s) => setMsg(s.stage || '扫描中…'));
+      const st = await runDeps('scan', onPoll);
       absorb(st);
       const n = (st.missing || []).length;
       setSummary(`上次扫描：共检查 ${st.checked || 0} 项依赖，缺失 ${n} 项`);
@@ -4815,7 +6019,7 @@ function Deps() {
     }
     setBusy(true);
     try {
-      const st = await runDeps('install', (s) => setMsg(s.stage || '安装中…'));
+      const st = await runDeps('install', onPoll);
       setMissing([]);
       setSummary(`上次扫描：共检查 ${checked} 项依赖，缺失 0 项；缺失依赖已安装，建议重新扫描验证`);
       setMsg(st.error
@@ -4833,13 +6037,13 @@ function Deps() {
       <header className="page-head">
         <div>
           <h1>依赖管理</h1>
-          <p>扫描 src/plugins 下所有插件声明的依赖，检测缺失并一键安装（清华镜像，失败自动切官方源）</p>
+          <p>扫描插件依赖，缺什么一键装上。</p>
         </div>
       </header>
 
       <section className="card dep-scan">
         <p className="dep-value">{summary}</p>
-        <p className="card__note">扫描过程在后台任务中执行，页面不会卡顿；发现缺失依赖后会显示在下方清单中。</p>
+        <p className="card__note">扫描在后台进行，缺失的会列在下面。</p>
         <div className="p-row">
           <button type="button" className="btn btn--primary" onClick={scan} disabled={busy}>
             开始全量扫描
@@ -4876,8 +6080,42 @@ function Deps() {
         </div>
       </section>
 
-      {/* 这里原来是一张只有标题的「依赖任务」空卡片：页面顶部 dep-scan 已经写了
-          扫描状态与进度，再挂一张空壳卡片只是白占版面，所以直接删掉，不再保留空卡片。 */}
+      {/* 依赖任务输出：桌面端任务面板里的那份 pip 输出，控制台这里照原样显示。
+          这里原来是一张只有标题的空卡片，上一轮被删掉了；现在它有真内容（log），
+          所以重新加回来 —— 装不上时用户能拿着这段去找人看。 */}
+      <section className="card card--strong dep-log">
+        <h2 className="card__title">依赖任务输出</h2>
+        <p className="card__note">
+          {busy
+            ? `正在执行：${stage || '准备中…'}`
+            : stage
+              ? `上次执行：${stage}`
+              : '还没跑过任务，跑一次就有输出。'}
+        </p>
+        <pre className="install-log">
+          {output.length
+            ? output.slice(-40).join('\n')
+            : '（没有输出）'}
+        </pre>
+        <div className="p-row">
+          <button
+            type="button"
+            className="btn btn--ghost btn--sm"
+            disabled={!output.length}
+            onClick={() => setOutput([])}
+          >
+            清空输出
+          </button>
+          <button
+            type="button"
+            className="btn btn--ghost btn--sm"
+            title="去「日志」页看实时日志"
+            onClick={() => setMsg('实时日志在左侧「日志」页（小白模式下要先在「设置」里关掉小白模式）')}
+          >
+            去日志页
+          </button>
+        </div>
+      </section>
 
       {msg && <div className="toast">{msg}</div>}
     </>

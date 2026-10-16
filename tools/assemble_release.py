@@ -9,7 +9,7 @@
     AstroSwarm_Setup_<版本>.exe                     安装版
     AstroSwarm_v<版本>_Portable_<日期>.zip           便携版（客户目录整包）
     AstroSwarm_客户版/                              便携版解压后的样子
-        AstroSwarm.exe / uninstall.exe / 使用说明.docx / offline/（内置载荷，零联网部署）
+        AstroSwarm.exe / _internal/ / uninstall.exe / 使用说明.docx / offline/（内置载荷，零联网部署）
 
 为什么便携版也要带 offline/：
     安装版是 Inno 把载荷铺到 {app}\\offline；便携版没有安装器，只能自带。
@@ -91,13 +91,28 @@ def main() -> int:
     stamp = time.strftime("%Y%m%d")
     print(f"==> 版本 {version}（{stamp}）")
 
-    for name in ("AstroSwarm.exe", "uninstall.exe"):
-        src = DIST / name
-        if not src.exists():
-            print(f"[x] 缺 {src}，先跑 PyInstaller")
-            return 2
-        shutil.copy2(src, CLIENT / name)
-        print(f"    客户目录更新 {name} {src.stat().st_size} 字节")
+    # v1.2.16 起客户端是 onedir（AstroSwarm.exe + _internal\），便携版 = 整个目录。
+    app_dir = DIST / "AstroSwarm"
+    if (app_dir / "AstroSwarm.exe").is_file():
+        stale = CLIENT / "_internal"
+        if stale.is_dir():
+            shutil.rmtree(stale)  # 先清旧构建残留，别让过期文件混进便携包
+        shutil.copytree(app_dir, CLIENT, dirs_exist_ok=True)
+        files = [p for p in app_dir.rglob("*") if p.is_file()]
+        total = sum(p.stat().st_size for p in files)
+        print(f"    客户目录更新 AstroSwarm\\（onedir，{len(files)} 个文件 {total} 字节）")
+    elif (DIST / "AstroSwarm.exe").is_file():
+        shutil.copy2(DIST / "AstroSwarm.exe", CLIENT / "AstroSwarm.exe")
+        print("    客户目录更新 AstroSwarm.exe（onefile）")
+    else:
+        print(f"[x] 缺 {app_dir}\\AstroSwarm.exe，先跑 PyInstaller")
+        return 2
+    uninstall_src = DIST / "uninstall.exe"
+    if not uninstall_src.is_file():
+        print(f"[x] 缺 {uninstall_src}，先跑 PyInstaller")
+        return 2
+    shutil.copy2(uninstall_src, CLIENT / "uninstall.exe")
+    print(f"    客户目录更新 uninstall.exe {uninstall_src.stat().st_size} 字节")
 
     setup_src = DIST / "AstroSwarm_Setup.exe"
     if setup_src.exists():

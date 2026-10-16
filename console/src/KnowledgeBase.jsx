@@ -27,7 +27,7 @@ export default function KnowledgeBase() {
       setItems(d.items || []);
       setTotal(d.total || 0);
       setSel('');
-      setMsg(d.total ? '' : '知识库还是空的：添加文档后，群里问相关问题它会照着资料回答。');
+      setMsg(d.total ? '' : '知识库还是空的：添加文档后 AI 会照着资料回答。');
     } catch (e) {
       setMsg(`读取失败：${e.message}`);
     } finally {
@@ -40,7 +40,7 @@ export default function KnowledgeBase() {
   const pickFile = (file) => {
     if (!file) return;
     if (!/\.(txt|md|markdown|json|csv|log)$/i.test(file.name)) {
-      setMsg('只支持 txt / md / json / csv / log 这类纯文本文件。');
+      setMsg('只支持 txt / md 这类纯文本文件。');
       return;
     }
     if (file.size > 2 * 1024 * 1024) {

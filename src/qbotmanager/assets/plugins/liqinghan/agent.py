@@ -8,9 +8,10 @@ import re
 import time
 from collections import deque
 
-from . import games, voice
+from . import games, gates, voice
+from . import memory_bridge
 from .chat_archive import ChatArchive
-from .brain import Brain
+from .brain import Brain, ImageRejected
 from .config import Config
 from .memory import Store
 from .persona import build_system, extract_text, familiarity_stage
@@ -20,6 +21,11 @@ from .tools import Ctx, Tools
 
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# 回复队列的**结束哨兵**（2026-10-16，对抗性复核 D）：`_send_burst` 整轮说完时
+# 往队列插它；桥侧 wait_for_reply 见到它立刻收工 —— 不用再靠固定 3 秒窗口猜
+# "这一轮说完没有"（段间打字延迟最长 3.9 秒，尾段以前会超窗滞留队列）。
+_REPLY_DONE = object()
 
 _EMOJI_RE = re.compile(
     "["
@@ -211,6 +217,7 @@ class Agent:
         self._roles = {}             # (group_id,user_id) -> (role, ts) 成员角色缓存
         self._mem_scan = {}          # qq -> 上次记忆扫描时间
         self._reply_queues = {}      # session -> asyncio.Queue（微信桥取回复）
+        self._session_source = {}    # session -> 通道来源（发送前纠正 DispatchChannel）
 
     def _archive_message(self, session, role, qq, group_id, text):
         """归档一条消息（只写不读；任何异常都不影响主流程）。"""
@@ -250,11 +257,15 @@ class Agent:
                 g = str(g).strip()
                 if g and g not in self.cfg.groups:
                     self.cfg.groups.append(g)
+                if g and g not in self.cfg._learned_groups:
+                    self.cfg._learned_groups.append(g)
         except Exception:  # noqa: BLE001
             pass
 
     def _learn_group(self, group_id):
         """官方通道：被 @ 的群自动加入活跃群（openid 用户看不到，只能学习）。"""
+        if group_id not in self.cfg._learned_groups:
+            self.cfg._learned_groups.append(group_id)
         if group_id in self.cfg.groups:
             return
         self.cfg.groups.append(group_id)
@@ -262,12 +273,21 @@ class Agent:
         try:
             os.makedirs(os.path.dirname(self._known_groups_file), exist_ok=True)
             with open(self._known_groups_file, "w", encoding="utf-8") as f:
-                json.dump({"groups": self.cfg.groups}, f, ensure_ascii=False, indent=2)
+                # 只落"学到的群"：以前把 cfg.groups 整份写进去，结果配置里删掉的群
+                # 下次重启又从 groups.json 回来了（2026-10-11 热重载一起修）
+                json.dump({"groups": list(self.cfg._learned_groups)}, f,
+                          ensure_ascii=False, indent=2)
         except Exception as e:  # noqa: BLE001
             logging.warning("自动学习群保存失败：%s", e)
 
     async def on_event(self, data):
         try:
+            # 2026-10-15：共享开关（AI 总开关 / 档案开关）关着就**什么都不做** ——
+            # 连写记忆、记入群申请都不做（否则"关了之后它还在后台记事"更让人困惑）。
+            # 详见 gates 模块头：以前李清菡只读自己那份 .env，客户端把 AI 关掉了
+            # 它照旧回话、照旧主动插话，看着就是"关不干净"。
+            if gates.blocked_once():
+                return
             post_type = data.get("post_type")
             if post_type == "meta_event":
                 return
@@ -305,6 +325,9 @@ class Agent:
 
     def _is_addressed(self, data, text, segments):
         """被点名：@她 / 回复她的消息 / 消息里带称呼（李清菡/学姐/姐姐等）"""
+        # 通道层已经判好的标记优先（免去 id 体系不一致的坑，见 to_data 的 at_me）
+        if isinstance(data, dict) and data.get("at_me"):
+            return True
         for s in segments or []:
             if not isinstance(s, dict):
                 continue
@@ -381,6 +404,10 @@ class Agent:
         return random.random() < self._interject_probability(group_id)
 
     async def _maybe_interject(self, group_id, session, forced=False, state_desc=""):
+        # 主动插话也要过开关：关了 AI 还往群里搭话，是最容易被当成"没关掉"的表现
+        # （而且每次都是一次实打实的大模型调用）。
+        if gates.blocked_once():
+            return
         if not forced and not self._should_interject(group_id):
             logging.info("搭话机会未触发 group=%s", group_id)
             return
@@ -412,7 +439,14 @@ class Agent:
             logging.info("搭话机会 group=%s：AI 选择沉默", group_id)
 
     async def handle_message(self, data):
-        self.tools.set_source(data.get("source", "qq:c2c"))
+        # 主人 QQ / 群白名单 / 唤醒词（称呼）改了就重新读 —— 改完立即生效，
+        # 不用重启机器人（2026-10-11 热重载）。一次 os.stat，可忽略。
+        try:
+            if self.cfg.maybe_reload():
+                logging.info("配置已热重载（主人/群白名单/唤醒词改完立即生效，无需重启）")
+        except Exception as e:  # noqa: BLE001 —— 热重载失败绝不能挡住回话
+            logging.warning("配置热重载失败（继续用旧值）：%s", e)
+        self.tools.set_source(data.get("source", "qq_official:c2c"))
         msg_type = data.get("message_type")
         user_id = str(data.get("user_id", ""))
         group_id = str(data.get("group_id", "")) if msg_type == "group" else ""
@@ -439,12 +473,16 @@ class Agent:
         if not text and images:
             text = "[图片]"
         nickname = str(data.get("sender", {}).get("card") or data.get("sender", {}).get("nickname") or "")
-        self.store.touch_user(user_id, nickname)
+        # 顺手记下"这个人来自哪条通道"：内置记忆的 key 形态是 `平台:ID`，
+        # 而通道信息只有消息里有（官方 openid / 微信 id 不能一律当 QQ 号，见 store.user_source）
+        self.store.touch_user(user_id, nickname, source=str(data.get("source") or ""))
         self.store.reset_outreach(user_id)  # 对方先说话 = 打破僵局
 
         session = str(data.get("session_key") or "")
         if not session:
             session = f"g:{group_id}" if msg_type == "group" else f"p:{user_id}"
+        # 记下这条会话的来源：发送（连发/工具）时按它纠正全局通道（2026-10-15 审计 G）
+        self._remember_source(session, data.get("source", ""))
         # 新消息来了，先打断同会话正在连发的回复（伪实时：停掉没发完的）
         # INTERRUPT_ON_MESSAGE=false 时保留回复不打断，保证热闹的群里一定回得出来
         if self.cfg.interrupt_on_message:
@@ -624,22 +662,51 @@ class Agent:
             message_id=str(data.get("message_id", "")),
         )
         system = build_system(self.cfg, self.store, user_id, group_id, state_desc)
-        history = self.store.recent_user_context(user_id, session, 12)
+        speaker = self._display_name(user_id) if group_id else ""
+        history = None
+        if group_id:
+            history = self._group_history(session, 14, drop_last_text=text)
+        if history is None:
+            history = self.store.recent_user_context(user_id, session, 12)
         rounds = sum(1 for r in history if r["role"] == "assistant")
         rounds_note = f"你们这一阵已经聊了 {rounds} 轮了，聊得挺久了；" if rounds >= 6 else ""
-        img_note = ""
-        if images:
-            desc = await self._describe_images(ctx, images)
-            if desc:
-                img_note = f"\nTA 还发来了图片，内容：{desc}"
+        base_prompt = (
+            f"[现在时间：{self.cfg.now_str()}] "
+            + (f"这条是 {speaker} 说的（群里多人说话，别把别人的话当成同一个人说的）。" if speaker else "")
+            + f"这个人刚才跟你聊过，现在 TA 又发来：'{self._self_at(text)}'。"
+        )
+        if not images:
+            # 引用照片：图在这条消息之外，用本会话最近一张顶上
+            images = self._quoted_images(session, data.get("message", []))
+            if images:
+                logging.info("本条是引用且没有图段：用会话最近 %d 张图顶上", len(images))
+        if not images:
+            images = self._quoted_images(session, data.get("message", []))
+        prompt, img_urls = await self._vision_context(ctx, images, base_prompt)
+        if img_urls:
+            try:
+                self.tools.last_main_images[session] = time.time()
+            except Exception:  # noqa: BLE001
+                pass
         prompt = (
-            f"[现在时间：{self.cfg.now_str()}] 这个人刚才跟你聊过，现在 TA 又发来：'{self._self_at(text)}'。{img_note}"
-            f"{rounds_note}"
+            prompt
+            + f"{rounds_note}"
             "你对这个话题/这个人还感兴趣吗？感兴趣就自然简短地回一句（可以接着聊，也可以转个新话题）；"
             "不感兴趣、聊够了、或者现在不想理 TA，就只回复两个字：沉默。"
             "聊得差不多时别硬撑：回复短一点、不再开新话题、不再追问，自然地冷淡收住。"
         )
-        reply = await self.brain.think(system, history, prompt, self.tools.schemas, self._tool_exec(ctx))
+        try:
+            reply = await self.brain.think(system, history, prompt,
+                                           self.tools.schemas, self._tool_exec(ctx),
+                                           images=img_urls)
+        except ImageRejected:
+            desc = await self._describe_images(ctx, images)
+            fallback = (base_prompt + (f"\n（对方发来的图片内容：{desc}）" if desc
+                                       else "\n（这张图我这边看不到，别装作看见了）"))
+            reply = await self.brain.think(
+                system, history,
+                fallback + "你对这个话题/这个人还感兴趣吗？不感兴趣就只回复两个字：沉默。",
+                self.tools.schemas, self._tool_exec(ctx))
         key = f"{session}|{user_id}"
         if reply and reply.strip() not in ("沉默", "沉默。", "（沉默）"):
             await self._reply(session, msg_type, group_id, user_id, reply, split=True)
@@ -663,26 +730,187 @@ class Agent:
             message_id=str(data.get("message_id", "")),
         )
         system = build_system(self.cfg, self.store, user_id, group_id, state_desc)
-        history = self.store.recent_user_context(user_id, session, 12)
-        img_note = ""
-        if images:
+        speaker = self._display_name(user_id) if group_id else ""
+        # 群里用"带说话人的群历史"，私聊仍用该用户自己的上下文
+        history = None
+        if group_id:
+            history = self._group_history(session, 14, drop_last_text=text)
+        if history is None:
+            history = self.store.recent_user_context(user_id, session, 12)
+        who_note = (
+            f"这条消息是 {speaker} 说的（群里多人说话，历史和这条都标了名字，"
+            "别把别人的话当成同一个人说的）"
+        ) if speaker else ""
+        base_prompt = f"[现在时间：{self.cfg.now_str()}] {who_note} {self._self_at(text)}"
+        prompt, img_urls = await self._vision_context(ctx, images, base_prompt)
+        if img_urls:
+            # 记一笔：这张图已经直发主模型了，工具那边据此回答
+            try:
+                self.tools.last_main_images[session] = time.time()
+            except Exception:  # noqa: BLE001
+                pass
+        try:
+            reply = await self.brain.think(
+                system, history, prompt,
+                self.tools.schemas, self._tool_exec(ctx), images=img_urls,
+            )
+        except ImageRejected:
+            # ① 主模型不吃图 → ② 备用视觉模型 → ③ 如实说看不见
+            logging.info("主模型拒图，改用备用视觉模型 %s", session)
             desc = await self._describe_images(ctx, images)
             if desc:
-                img_note = f"\n（对方发来的图片内容：{desc}）"
-        reply = await self.brain.think(
-            system, history, f"[现在时间：{self.cfg.now_str()}] {self._self_at(text)}{img_note}",
-            self.tools.schemas, self._tool_exec(ctx),
-        )
+                prompt = base_prompt + f"\n（对方发来的图片内容：{desc}）"
+            else:
+                prompt = base_prompt + "\n（这张图我这边看不到，别装作看见了，如实说一句看不到）"
+            reply = await self.brain.think(
+                system, history, prompt,
+                self.tools.schemas, self._tool_exec(ctx),
+            )
         if not reply:
-            # 被直接点名却空回复：强制重试一次，不许沉默
+            # 被直接点名却空回复：强制重试一次，不许沉默（这次不带图，纯文本更容易过）
             logging.info("直接点名空回复，重试一次 %s", session)
             reply = await self.brain.think(
                 system, history,
-                f"[现在时间：{self.cfg.now_str()}] 有人直接叫你（{self._self_at(text)}{img_note}），你必须回一句，简短自然，别沉默",
+                f"{prompt} 有人直接叫你，你必须回一句，简短自然，别沉默",
                 self.tools.schemas, self._tool_exec(ctx),
             )
         if reply:
             await self._reply(session, msg_type, group_id, user_id, reply, split=True)
+
+    def _quoted_images(self, session, segments):
+        """本条消息是"引用/回复"且自身没有图时，用本会话最近一张图顶上。
+
+        2026-10-11 老板实测：引用一张照片问「看看这个」，图不在本条消息里
+        （只有文字 + reply 段），于是模型收到的是纯文本 → 回"看不见"。
+        """
+        reply_types = ("reply", "quote", "message_reference")
+        has_reply = any(
+            isinstance(s, dict) and str(s.get("type") or "") in reply_types
+            for s in (segments or [])
+        )
+        if not has_reply:
+            return []
+        try:
+            return list(self.tools.last_images.get(session) or [])
+        except Exception:  # noqa: BLE001
+            return []
+
+    def _display_name(self, qq: str) -> str:
+        """群成员的显示名（没有昵称就用短 id）—— 给模型看的，别让它对着 openid 猜人。"""
+        qq = str(qq or "")
+        if not qq:
+            return ""
+        name = ""
+        try:
+            u = self.store.get_user(qq)
+            if u is not None:
+                name = str(u["nickname"] or "") if "nickname" in u.keys() else ""
+        except Exception:  # noqa: BLE001
+            name = ""
+        short = qq[-6:] if len(qq) > 6 else qq
+        return f"{name}({short})" if name else f"成员{short}"
+
+    def _group_history(self, session, limit=14, drop_last_text=""):
+        """群维度的最近消息，**每条带上说话人**。
+
+        2026-10-10 修：原来用 recent_user_context(user_id, ...)（只取该用户自己的），
+        群里 A 的历史 + B 的当前消息会被模型当成同一个人 ——
+        老板实测："A 骂了它，B 发 666，它回『骂完人就666』"。
+        """
+        try:
+            rows = self.store.recent_messages(session, limit + 1) or []
+        except Exception:  # noqa: BLE001
+            return None
+        out = []
+        for r in rows:
+            role = "assistant" if str(r["role"]) == "assistant" else "user"
+            text = str(r["text"] or "")
+            if role == "user":
+                who = self._display_name(r["qq"])
+                text = f"{who}：{text}" if who else text
+            out.append({"role": role, "text": text})
+        # 当前这条消息刚才已经入库了，别让模型看到两遍
+        if (drop_last_text and out and out[-1]["role"] == "user"
+                and drop_last_text in out[-1]["text"]):
+            out.pop()
+        return out
+
+    async def _vision_context(self, ctx, images, base_prompt):
+        """识图三级降级，返回 (prompt, images_for_main)。
+
+        ① 优先把图直接发给主模型（老板的 deepseek 能看图）；
+        ② 主模型走不了（`ImageRejected`）→ 退回预留的备用视觉模型，把描述塞进提示词；
+        ③ 备用没配 / 也识别不了 → 提示词里如实说明"看不到这张图"，让回复诚实。
+        """
+        if not images:
+            return base_prompt, []
+        urls = await self._image_data_urls(ctx, images)
+        if urls:
+            return base_prompt, urls          # ① 主模型直发（拒图由调用方捕获）
+        desc = await self._describe_images(ctx, images)
+        if desc:
+            return base_prompt + f"\n（对方发来的图片内容：{desc}）", []   # ② 备用模型
+        return base_prompt + "\n（这张图我这边看不到，别装作看见了，如实说一句看不到）", []  # ③ 如实说
+
+    async def _image_data_urls(self, ctx, images):
+        """把当前消息里的图片读成 data URL，直接交给主模型（最多 3 张，单张 ≤4MB）。
+
+        老板的模型本来就能看图，这条路比"再配一个视觉模型"稳得多；
+        读不到字节就返回空列表，调用方会退回原来的描述路径。
+        """
+        if not images or not getattr(self.cfg, "main_vision", True):
+            return []
+        out = []
+        for img in images[:3]:
+            src = img.get("file") or img.get("url") or ""
+            if not src:
+                continue
+            try:
+                data, mime = await self.tools._load_image(src)
+            except Exception as e:  # noqa: BLE001
+                logging.warning("取图失败（%s）：%s", src[:60], e)
+                continue
+            if not data or not mime:
+                continue
+            if len(data) > 8 * 1024 * 1024:
+                logging.info("图片过大跳过直发主模型：%s 字节", len(data))
+                continue
+            data, mime = self._normalize_image(data, mime)
+            import base64 as _b64
+            out.append(f"data:{mime};base64," + _b64.b64encode(data).decode())
+            logging.info("图片直发主模型：%s %s 字节", mime, len(data))
+        if out:
+            logging.info("图片直发主模型：共 %d 张", len(out))
+        return out
+
+    @staticmethod
+    def _normalize_image(data, mime):
+        """把图统一成 JPEG（最长边 ≤1024，质量 90）——视觉接口对超大图/webp 常常"看不清"。
+
+        2026-10-11：老板实测"图直发了，模型还回看不清"，日志确认图确实送出去了，
+        所以怀疑是图本身规格（尺寸/格式）不友好。规格化后同样的图更好认；失败就原样返回。
+        """
+        try:
+            import io as _io
+
+            from PIL import Image as _Image
+
+            im = _Image.open(_io.BytesIO(data))
+            im.load()
+            if im.mode not in ("RGB", "L"):
+                im = im.convert("RGB")
+            if max(im.size) > 1024:
+                im.thumbnail((1024, 1024))
+            buf = _io.BytesIO()
+            im.save(buf, format="JPEG", quality=90)
+            out = buf.getvalue()
+            if out and len(out) < 8 * 1024 * 1024:
+                logging.info("图片规格化：%s %s → JPEG %s 字节 %s",
+                             im.format or "?", mime, len(out), im.size)
+                return out, "image/jpeg"
+        except Exception as e:  # noqa: BLE001 —— 没有 PIL 或不是标准图：原样发
+            logging.info("图片规格化跳过（%s）：原样发送 %s", type(e).__name__, mime)
+        return data, mime
 
     async def _describe_images(self, ctx, images):
         """把当前消息里的图片（最多 3 张）转成文字描述；失败返回空串，不阻塞正常回复"""
@@ -797,8 +1025,19 @@ class Agent:
             key = f"{session}|{user_id}" if user_id else session
             if self._bursts.get(key) is asyncio.current_task():
                 self._bursts.pop(key, None)
+            # 2026-10-16（对抗性复核 D）：整轮连发结束 → 往回复队列插一个**哨兵**。
+            # 桥那边（wait_for_reply）看到哨兵就知道"这一轮说完了"，不用再靠
+            # 固定 3 秒窗口硬等 —— 段间打字延迟最长 3.9 秒，以前会超窗把尾段
+            # 留在队列里、被下一条请求当回复取走（错位一格）。
+            self._publish_reply(session, _REPLY_DONE)
 
     async def _send_segment(self, session, msg_type, group_id, user_id, seg):
+        # 2026-10-15（审计 G）：发送前按**这条会话自己的来源**重新指定通道。
+        # DispatchChannel 的 _source 是全局单例字段，谁最后进来谁说了算 ——
+        # QQ 连发（段间 await 0.8~3 秒）期间来一条微信消息，后续段就被送进
+        # NoopChannel 静默丢掉（群里只发出第一条）；反过来微信的连发会被
+        # 拿去当官方动作执行。这里每次发送前纠正回来。
+        self._bind_source(session)
         if msg_type == "group":
             resp = await self.ob.action("send_group_msg", {"group_id": group_id, "message": seg})
         else:
@@ -815,7 +1054,10 @@ class Agent:
             self._last_group_reply[group_id] = time.time()
 
     def _publish_reply(self, session, text):
-        """把最终回复文本放进会话队列（微信桥等待取回）。"""
+        """把最终回复文本放进会话队列（微信桥等待取回）。
+
+        `text` 可以是字符串（一段正文），也可以是 `_REPLY_DONE` 哨兵（这一轮说完了）。
+        """
         q = self._reply_queues.get(session)
         if q is not None:
             try:
@@ -824,16 +1066,68 @@ class Agent:
                 pass
 
     async def wait_for_reply(self, session, timeout=180):
-        """等待 agent 对某会话生成回复（微信桥用），超时返回空串。"""
+        """等待 agent 对某会话生成回复（微信桥用），超时返回空串。
+
+        2026-10-15（审计 D）：一条回复可能被拆成**多段**连发（`_send_burst`），
+        每段都 `_publish_reply` 进队列 —— 桥这边一次请求只 `get()` 一条，于是
+        · 微信用户只收到第一段；
+        · 剩下几段赖在队列里，被**下一次**（往往是另一个话题的）请求当"回复"取走
+          → 微信对话从此错位一格，队列只进不出越积越多。
+        2026-10-16（对抗性复核 D）：光靠固定 3 秒窗口不够 —— 段间打字延迟最长
+        **3.9 秒**（3 段时第 3 段必超窗），尾段照样滞留。现在 `_send_burst`
+        结束时往队列里插一个 `_REPLY_DONE` 哨兵：见到哨兵立刻收工（单段回复
+        不用再白等 3 秒）；哨兵和窗口**谁先到算谁**（连发被新消息打断时没有哨兵，
+        退回窗口兜底）。
+        """
         q = self._reply_queues.setdefault(session, asyncio.Queue())
         try:
-            return await asyncio.wait_for(q.get(), timeout)
+            first = await asyncio.wait_for(q.get(), timeout)
         except (asyncio.TimeoutError, asyncio.QueueEmpty):
             return ""
+        if first is _REPLY_DONE:
+            return ""
+        parts = [str(first)]
+        deadline = time.time() + 3.0
+        while True:
+            remain = deadline - time.time()
+            if remain <= 0:
+                break
+            try:
+                item = await asyncio.wait_for(q.get(), remain)
+            except (asyncio.TimeoutError, asyncio.QueueEmpty):
+                break
+            if item is _REPLY_DONE:
+                break
+            parts.append(str(item))
+        return "\n".join(p for p in parts if p)
+
+    # ---- 通道来源（2026-10-15 审计 G）----
+    def _remember_source(self, session, source):
+        """记下"这条会话来自哪条通道"，发送时按它纠正 DispatchChannel。"""
+        if not session:
+            return
+        self._session_source[session] = str(source or "qq_official:c2c")
+        if len(self._session_source) > 500:
+            for key in list(self._session_source)[:200]:
+                if key != session:
+                    self._session_source.pop(key, None)
+
+    def _bind_source(self, session):
+        src = self._session_source.get(session or "")
+        if not src:
+            return
+        try:
+            self.ob.set_source(src)
+        except Exception:  # noqa: BLE001 —— 老通道没有这个方法也无所谓
+            pass
 
     def _tool_exec(self, ctx):
         async def exec_tool(name, args):
             sid = getattr(ctx, "session_key", "") or ""
+            # 2026-10-16（对抗性复核 G）：工具动作（禁言/撤回/语音/提醒…）也是
+            # 出站动作，走的是同一个全局 DispatchChannel —— 执行前同样按**这条会话
+            # 自己的来源**纠正一次，别让"此刻"的 source（可能是另一个平台刚翻的）做主。
+            self._bind_source(sid)
             start = time.time()
             ok, err = True, ""
             try:
@@ -859,13 +1153,24 @@ class Agent:
         """确保每个活跃群每天至少发言一次"""
         while True:
             await asyncio.sleep(1800)
-            if self.sleep.state != "awake":
-                continue
-            for gid in self.cfg.groups:
-                last = self._last_group_reply.get(gid)
-                if last and time.time() - last > self.cfg.min_daily_hours * 3600:
-                    logging.info("每日保底发言触发 group=%s", gid)
-                    await self._maybe_interject(gid, f"g:{gid}", forced=True)
+            # 2026-10-15（审计 C）：**整个循环体必须包异常兜底**。
+            # 以前这里裸着 —— `_maybe_interject` → brain.think → httpx 一次 4xx/5xx/
+            # 超时（150 秒）抛出来，这个协程是 run_tasks 里裸 create_task 起的、
+            # 没人 await、没人重启：**「每日保底发言」从此永久失效**（日志里最多
+            # 一条没人取回的 Task 异常）。同文件其它循环（life/outreach/memory/
+            # birthday/join_request）都带 except，就它漏了。
+            try:
+                if self.sleep.state != "awake":
+                    continue
+                for gid in self.cfg.groups:
+                    last = self._last_group_reply.get(gid)
+                    if last and time.time() - last > self.cfg.min_daily_hours * 3600:
+                        logging.info("每日保底发言触发 group=%s", gid)
+                        await self._maybe_interject(gid, f"g:{gid}", forced=True)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logging.exception("daily_minimum_loop 出错（这一轮跳过，循环继续）")
 
     async def _compose(self, instruction, state_desc=""):
         """让大脑单独写一条消息（早安/晚安/主动私聊用）"""
@@ -944,7 +1249,8 @@ class Agent:
                     "明天醒来你会看到它。"
                 )
                 if diary:
-                    self.store.save_diary(day, diary)
+                    # 有内置记忆就走内置（老库同名 diary 表，界面/导出都能读到）
+                    memory_bridge.save_diary(self.store, day, diary)
                     logging.info("今日日记已保存 %s", day)
         except Exception:  # noqa: BLE001
             logging.exception("写日记失败")
@@ -1040,9 +1346,19 @@ class Agent:
     # ---- 记忆自动沉淀：定期把聊天里的重点提炼成长期记忆 ----
     async def memory_loop(self):
         """每 25 分钟：扫描最近的聊天，把值得记住的事（生日/喜好/大事）自动存进记忆"""
+        # 第一次跑之前先把老李清菡记忆库导进内置库（只读旧库；只有智能档会真做）
+        try:
+            res = memory_bridge.migrate_if_needed()
+            if res and res.get("ran"):
+                logging.info("老记忆库导入：新增 %s 条（旧库 %s）",
+                             res.get("imported"), res.get("legacy"))
+        except Exception:  # noqa: BLE001
+            logging.exception("老记忆库导入失败（不影响记忆写入）")
         while True:
             await asyncio.sleep(25 * 60)
             try:
+                if not memory_bridge.extract_enabled():
+                    continue          # 无档位：连提炼都不做，保证零写入
                 cutoff = int(time.time()) - 4 * 3600
                 for qq in self.store.user_ids_since(cutoff):
                     last = self._mem_scan.get(qq, cutoff)
@@ -1055,13 +1371,16 @@ class Agent:
                         continue
                     facts = await self._extract_facts(qq, texts[-25:])
                     for f in facts:
-                        if self.store.remember_if_new(qq, f):
+                        if memory_bridge.remember(self.store, qq, f):
                             logging.info("自动记忆 qq=%s：%s", qq, f)
                         self._maybe_birthday(qq, f)
+                # 每天一轮整理（只有智能档真做：合并成印象档、过期事件标 expired）
+                memory_bridge.merge_after_scan()
             except Exception:  # noqa: BLE001
                 logging.exception("memory_loop 出错")
 
     async def _extract_facts(self, qq, texts):
+        # 提示词沿用原来的口径；智能档会多一句「不同则以最新为准、别提炼号证卡地址」
         system = (
             f"你是{self.cfg.persona_name}，负责从聊天记录里提炼值得长期记住的信息。"
             "只提炼：生日、姓名/昵称、职业、学校、爱好、讨厌的事、重大事件、约定承诺。"
@@ -1335,8 +1654,13 @@ class Agent:
                 logging.exception("join_request_loop 出错")
 
     def run_tasks(self):
-        """启动后台生命周期任务（NoneBot on_startup 调用）。"""
-        return [
+        """启动后台生命周期任务（NoneBot on_startup 调用）。
+
+        2026-10-15（审计 C）：每个任务挂一个 done 回调 —— 这些协程都是裸
+        create_task，一旦因为未捕获异常**静默退出**，日志里只在事件循环被回收时
+        才冒一句"Task exception was never retrieved"，没人知道"某个后台能力没了"。
+        """
+        tasks = [
             asyncio.create_task(
                 reminder_loop(self.cfg, self.store, self.ob,
                               self._compose_reminder)),
@@ -1346,6 +1670,19 @@ class Agent:
             asyncio.create_task(self.memory_loop()),
             asyncio.create_task(self.birthday_loop()),
         ]
+        for task in tasks:
+            task.add_done_callback(self._on_task_done)
+        return tasks
+
+    @staticmethod
+    def _on_task_done(task):
+        """后台任务意外结束：记一条 ERROR，别静默死掉。"""
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            logging.error("后台任务 %s 意外退出：%r", task.get_coro(), exc,
+                          exc_info=exc)
 
     async def _on_member_join(self, data):
         """新成员入群欢迎（AI 现编，李清菡风格）"""

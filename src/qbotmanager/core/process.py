@@ -149,6 +149,28 @@ def _assign_pid(pid, via_pid=None):
         ctypes.windll.kernel32.CloseHandle(h)
 
 
+def _collect_descendants(parent_map, pid):
+    """从 parent_map（pid → 父 pid）里挑出 pid 的所有后代。
+
+    必须带访问记录：Windows 的 PID 会被**立刻复用**，快照里出现
+    「A 的父是 B、B 的父是 A」这种环是常见的（进程刚死、PID 马上被新进程占用），
+    没有 seen 的话 while 循环永远走不完 —— job-sweep 线程会 100% 占一个核，
+    界面被 GIL 拖到像卡死（2026-10-01 用户报的「软件卡死无反应」就是它）。
+    """
+    result = []
+    # 起点先记进去：进程不是自己的后代；同时这一步就挡住了「自己当自己父亲」的脏条目
+    seen = {int(pid)}
+    stack = [int(pid)]
+    while stack:
+        cur = stack.pop()
+        for child, parent in parent_map.items():
+            if parent == cur and child not in seen:
+                seen.add(child)
+                result.append(child)
+                stack.append(child)
+    return result
+
+
 def _descendants(pid):
     """用 Toolhelp32 快照返回 pid 的所有后代 PID（含孙进程）。"""
     TH32CS_SNAPPROCESS = 0x2
@@ -165,15 +187,7 @@ def _descendants(pid):
                 parent_map[int(entry.th32ProcessID)] = int(entry.th32ParentProcessID)
                 if not kernel32.Process32NextW(snap, ctypes.byref(entry)):
                     break
-        result = []
-        stack = [int(pid)]
-        while stack:
-            cur = stack.pop()
-            for child, parent in parent_map.items():
-                if parent == cur:
-                    result.append(child)
-                    stack.append(child)
-        return result
+        return _collect_descendants(parent_map, pid)
     finally:
         kernel32.CloseHandle(snap)
 

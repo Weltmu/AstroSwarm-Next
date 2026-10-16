@@ -13,7 +13,19 @@ CHANNEL_CAPABILITIES = {
     "qq:group": {"chat", "memory", "voice", "image", "image_gen",
                  "proactive", "group_interject", "group_admin",
                  "recall", "tools"},
+    # ---- QQ 官方机器人（2026-10-15 补，与程序侧 core/agent_profile.py 对齐）----
+    # 2026-10-16（审计 platform/E #55）：李清菡的 source 标注已经统一改成
+    # `qq_official:*`（见 __init__.py），**走的就是这两条** —— 本矩阵对未知通道
+    # 返回空集（全部能力禁用），所以改了标注必须先有这两条，否则 enabled_tools
+    # 会把全部工具一次裁光、插件静默变傻。
+    # 按程序侧口径：官方通道**不给** proactive / group_interject（主动消息按日限额度）。
+    # 上面 qq:c2c / qq:group 两条留着只为兼容老数据（users.source 历史值），新流量不再用。
+    "qq_official:c2c": {"chat", "memory", "voice", "image", "image_gen",
+                        "recall", "tools"},
+    "qq_official:group": {"chat", "memory", "voice", "image", "image_gen",
+                          "group_admin", "recall", "tools"},
     "wechat:private": {"chat", "memory", "tools"},
+    "wechat:group": {"chat", "memory", "tools"},
     "feishu:private": {"chat", "memory", "tools"},
     "telegram:private": {"chat", "memory", "tools"},
 }
@@ -28,6 +40,7 @@ TOOL_CAPABILITIES = {
     "generate_image": "image_gen",
     "remember": "memory",
     "recall": "memory",
+    "forget": "memory",
     "recall_message": "recall",
 }
 

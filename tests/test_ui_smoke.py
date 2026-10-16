@@ -22,9 +22,23 @@ def test_qss():
     assert css_cyber != css_def
     css_slate = theme_mod.build_qss("glass", "default", "slate")
     assert css_slate != css_def
-    css_swiss = theme_mod.build_qss("swiss", "default", "default")
-    assert css_swiss and "QPushButton" in css_swiss
     print("OK ui smoke")
+
+
+def test_glass_panel_has_no_screenshot_backdrop():
+    """磨砂面板必须是纯自绘：抓窗口截图当底图会造成滚动残影 / 文字发糊。"""
+    from qbotmanager.ui import widgets as widgets_mod
+
+    panel = widgets_mod.GlassPanel
+    for gone in ("_fast_blur", "_backdrop", "_refresh_backdrop"):
+        assert not hasattr(panel, gone), f"GlassPanel 不应再有截屏底图机制：{gone}"
+    # 低透明度下也要压得住背景（否则列表文字发灰发糊）
+    theme_mod.UI_OPACITY = 0.1
+    assert widgets_mod._panel_alpha(120) >= 112
+    theme_mod.UI_OPACITY = 1.0
+    assert widgets_mod._panel_alpha(120) <= 248
+    theme_mod.UI_OPACITY = 0.7
+    print("OK glass panel self-drawn")
 
 
 def test_wizard_background_panel():
@@ -77,8 +91,7 @@ def test_theme_switch_keeps_page():
     assert win.stack.currentIndex() == win._page_index["设置"]
     assert theme_mod.CURRENT_GLASS == "liquid"
 
-    # 强制重建布局（模拟主题切换），当前页必须保持
-    theme_mod.UI_LAYOUT = "topnav" if theme_mod.UI_LAYOUT == "sidebar" else "sidebar"
+    # 强制重建布局（重挂载侧栏 + 页面堆栈），当前页必须保持
     win._apply_layout()
     app.processEvents()
     assert win.stack.currentIndex() == win._page_index["设置"]
@@ -147,11 +160,18 @@ def test_brain_page_memory_and_kb_controls():
 
 
 def test_brain_page_auto_restart_on_profile_change():
-    """切换智能体档案并保存后，应自动提交重启 NoneBot 任务以载入新档案。"""
+    """切换智能体档案：**必须重启一次机器人**（2026-10-15 审计 liqinghan/A）。
+
+    2026-10-11 一度改成"只刷热配置、不重启"；后来发现**档案开关是例外** ——
+    李清菡插件在 import 期判定 _ENABLED、注册 handler，热配置救不了：
+      · 打开档案：程序侧把 QQ/微信交给档案，插件却没注册 → 谁都不回话；
+      · 关掉档案：AI 插件热恢复处理 QQ/微信，李清菡 handler 还在 → 双回复。
+    所以现在「档案开关 / 档案 id」一变就提交重启任务并明说要重启；
+    人设/唤醒词那些仍是热读、不重启（走 _agent_restart_required 那条路）。
+    """
     from PySide6.QtWidgets import QApplication
 
     from qbotmanager.core.settings import Settings
-    from qbotmanager.tasks.workers import RestartBotTask
     from qbotmanager.ui.pages.brain_page import BrainPage
     from qbotmanager.ui.pages.common import PageContext
 
@@ -178,12 +198,9 @@ def test_brain_page_auto_restart_on_profile_change():
     bp.chk_agent_profile.setChecked(True)
     bp._save_config()
 
-    assert submitted, "切换档案后保存应自动提交重启任务"
-    name, category, task_cls = submitted[0][0]
-    assert task_cls is RestartBotTask, submitted[0][0]
-    assert "重启" in str(name)
-    assert any("自动" in str(t) or "重启" in str(t) for t in toasts), toasts
-    win = None
+    assert s.agent_profile_enabled is True, "切到预设应把档案开关写进配置"
+    assert submitted, "切档案必须提交重启任务（插件 import 期注册，热读救不了）"
+    assert any("重启一次机器人生效" in str(t) for t in toasts), toasts
     bp.deleteLater()
     print("OK ui brain_page_auto_restart_on_profile_change")
 
@@ -228,7 +245,7 @@ def test_plugins_page_restricts_third_party_install():
 
 def test_plugins_page_market_panel_exists():
     """插件页应有官方市场面板（分类/列表/安装/刷新）与状态提示。"""
-    from PySide6.QtWidgets import QApplication, QComboBox, QLabel, QListWidget, QPushButton
+    from PySide6.QtWidgets import QApplication, QLabel, QLineEdit, QListWidget, QPushButton
 
     from qbotmanager.core.settings import Settings
     from qbotmanager.tasks.task_manager import TaskManager
@@ -242,8 +259,12 @@ def test_plugins_page_market_panel_exists():
     s.save()
     ctx = PageContext(s, None, TaskManager(), {"show_toast": lambda *a: None})
     pp = PluginsPage(ctx)
-    assert isinstance(pp.market_combo, QComboBox)
     assert isinstance(pp.market_list, QListWidget)
+    # 改版后：分类是横排小标签 + 搜索框（原来只有一个"全部分类"下拉，找不到东西）
+    assert isinstance(pp.market_search, QLineEdit)
+    assert pp.market_search.placeholderText().startswith("搜索插件")
+    assert "" in pp._market_tags, pp._market_tags
+    assert pp._market_tags[""].text() == "全部"
     assert isinstance(pp.btn_market_install, QPushButton)
     assert isinstance(pp.btn_market_refresh, QPushButton)
     assert isinstance(pp.market_status, QLabel)
@@ -255,8 +276,11 @@ def test_plugins_page_market_panel_exists():
         "category": "功能扩展", "description": "每天一句",
         "url": "https://astroswarm.cn/plugins/daily-motto-1.0.0.zip", "sha256": "abc",
     }]})
-    assert pp.market_list.count() == 1, pp.market_list.count()
-    item = pp.market_list.item(0)
+    # 默认按分类分组：分组标题 + 卡片（标题行没有插件 id）
+    ids = [pp.market_list.item(i).data(Qt.UserRole)
+           for i in range(pp.market_list.count())]
+    assert "daily-motto" in ids, ids
+    item = pp.market_list.item(ids.index("daily-motto"))
     assert item.data(Qt.UserRole) == "daily-motto"
     pp.deleteLater()
     print("OK ui plugins_page_market_panel_exists")
@@ -313,6 +337,10 @@ def test_plugins_page_all_plugins_free():
         "plan": "none", "plan_expires_at": 0,
         "full": False, "owned_plugins": [],
     }
+    # 构造页面时会异步拉真实市场，回来会把这里的样例列表整个重建，
+    # 测试手里那个 QListWidgetItem 就成了野指针（libshiboken 报 already deleted）。
+    # 掐掉回调，测试只针对"全部免费"这段逻辑。
+    pp._on_market_loaded = lambda *_a, **_k: None
     pp._market_entries = {
         "free-a": {
             "id": "free-a", "name": "免费插件", "version": "1.0.0",
@@ -326,15 +354,17 @@ def test_plugins_page_all_plugins_free():
         },
     }
     pp._refresh_market_list()
-    assert pp.market_list.count() == 2
-    texts = [pp.market_list.item(i).text()
-             for i in range(pp.market_list.count())]
+    from PySide6.QtCore import Qt
+    rows = [pp.market_list.item(i) for i in range(pp.market_list.count())]
+    entries = [it for it in rows if it.data(Qt.UserRole)]        # 分组标题行没有插件 id
+    assert len(entries) == 2, [it.text() for it in rows]
+    texts = [it.text() for it in entries]
     assert all("[免费]" in t for t in texts), texts
     assert not any("买断" in t for t in texts), texts
-    for i in range(pp.market_list.count()):
-        pp.market_list.setCurrentRow(i)
+    for it in entries:
+        pp.market_list.setCurrentItem(it)
         app.processEvents()
-    pp.market_list.setCurrentRow(0)
+    pp.market_list.setCurrentItem(entries[0])
     app.processEvents()
     pp.deleteLater()
     print("OK ui plugins_all_free")
@@ -385,8 +415,6 @@ def test_main_window_account_corner_entry():
     win = MainWindow(s, tasks)
     app.processEvents()
     assert hasattr(win, "btn_account_side")
-    assert hasattr(win, "btn_account_top")
-    assert hasattr(win, "btn_account_rail")
     win._open_account_window()
     app.processEvents()
     assert win._account_window is not None
@@ -470,59 +498,16 @@ def test_settings_page_developer_mode_requires_confirm():
     print("OK ui settings_page_developer_mode_requires_confirm")
 
 
-def test_swiss_qss_styles_messagebox():
-    """瑞士极简主题必须给弹窗（QMessageBox/QDialog）白底深字，否则关闭弹窗黑底黑字。"""
-    import qbotmanager.ui.theme as theme_mod
-    orig_style = theme_mod.UI_STYLE
-    orig_cache = dict(theme_mod._QSS_CACHE)
-    try:
-        theme_mod.UI_STYLE = "swiss"
-        theme_mod._QSS_CACHE.clear()
-        qss = theme_mod.build_qss("swiss")
-        assert "QMessageBox" in qss, "瑞士 QSS 缺少 QMessageBox 样式"
-        assert "QDialog" in qss, "瑞士 QSS 缺少 QDialog 样式"
-        assert "background: #FFFFFF" in qss, "弹窗应为白底"
-        assert "color: #111111" in qss, "弹窗文字应为深色"
-    finally:
-        theme_mod.UI_STYLE = orig_style
-        theme_mod._QSS_CACHE.clear()
-        theme_mod._QSS_CACHE.update(orig_cache)
-    print("OK ui swiss_qss_styles_messagebox")
-
-
-def test_swiss_uses_selected_accent():
-    """瑞士极简的强调色必须跟随当前皮肤，而不是写死红色。"""
-    import qbotmanager.ui.theme as theme_mod
-    orig_style = theme_mod.UI_STYLE
-    orig_cache = dict(theme_mod._QSS_CACHE)
-    try:
-        theme_mod.UI_STYLE = "swiss"
-        theme_mod._QSS_CACHE.clear()
-        qss = theme_mod.build_qss("swiss", "default", "cyber")
-        assert "#22D3EE" in qss, "瑞士 QSS 未使用当前皮肤强调色"
-        assert "QPushButton#primary { background: #22D3EE" in qss, "瑞士 QSS 主按钮应使用当前强调色"
-        assert "QPushButton#primary { background: #E30613" not in qss, "瑞士 QSS 主按钮不应再写死红色"
-        assert "QPushButton#primary:hover" in qss, "瑞士 QSS 主按钮缺少 hover 态"
-    finally:
-        theme_mod.UI_STYLE = orig_style
-        theme_mod._QSS_CACHE.clear()
-        theme_mod._QSS_CACHE.update(orig_cache)
-    print("OK ui swiss_uses_selected_accent")
-
-
 def test_primary_disabled_uses_current_accent():
     """主按钮禁用态颜色必须跟随当前皮肤，不能写死默认蓝。"""
     import qbotmanager.ui.theme as theme_mod
-    orig_style = theme_mod.UI_STYLE
     orig_cache = dict(theme_mod._QSS_CACHE)
     try:
-        theme_mod.UI_STYLE = "glass"
         theme_mod._QSS_CACHE.clear()
         qss = theme_mod.build_qss("glass", "default", "midnight")
         assert "rgba(139,92,246,0.35)" in qss, "禁用态应使用当前强调色的半透明"
         assert "rgba(61,107,255,0.35)" not in qss, "禁用态不应写死默认蓝"
     finally:
-        theme_mod.UI_STYLE = orig_style
         theme_mod._QSS_CACHE.clear()
         theme_mod._QSS_CACHE.update(orig_cache)
     print("OK ui primary_disabled_uses_current_accent")
@@ -533,98 +518,16 @@ def test_theme_tokens_contrast_and_sidebar():
     import qbotmanager.ui.theme as theme_mod
     assert theme_mod.TEXT_3 == "#7E8A9C", "TEXT_3 应提升对比度"
     assert theme_mod.THEMES["slate"]["TEXT_3"] == "#7E8A9C", "slate 皮肤 TEXT_3 应同步"
-    orig_style = theme_mod.UI_STYLE
     orig_cache = dict(theme_mod._QSS_CACHE)
     try:
-        theme_mod.UI_STYLE = "glass"
         theme_mod._QSS_CACHE.clear()
         qss = theme_mod.build_qss("glass")
         assert "border-left: 3px solid" not in qss, "侧边栏不应再有左边框"
         assert "QPushButton:focus" in qss, "按钮应有键盘焦点态"
     finally:
-        theme_mod.UI_STYLE = orig_style
         theme_mod._QSS_CACHE.clear()
         theme_mod._QSS_CACHE.update(orig_cache)
     print("OK ui theme_tokens_contrast_and_sidebar")
-
-
-def test_terminal_qss():
-    """深空终端主题：等宽字体、实体面板、左侧竖线导航、强调色跟随皮肤。"""
-    import qbotmanager.ui.theme as theme_mod
-    orig_style = theme_mod.UI_STYLE
-    orig_cache = dict(theme_mod._QSS_CACHE)
-    try:
-        theme_mod.UI_STYLE = "terminal"
-        theme_mod._QSS_CACHE.clear()
-        qss = theme_mod.build_qss("terminal", "terminal", "cyber")
-        assert "Cascadia Mono" in qss, "终端主题应使用等宽字体"
-        assert "background: #11151A" in qss, "终端主题面板应为实体深色"
-        assert "border-left: 3px solid #22D3EE" in qss, "终端侧边栏选中态应为左侧荧光竖线"
-        assert "QListWidget#rail" in qss, "终端主题应带左侧图标栏（rail）样式"
-        assert "QPushButton#primary { background: #22D3EE" in qss, "主按钮应使用当前强调色"
-        assert "QMessageBox" in qss, "终端主题缺少弹窗样式"
-    finally:
-        theme_mod.UI_STYLE = orig_style
-        theme_mod._QSS_CACHE.clear()
-        theme_mod._QSS_CACHE.update(orig_cache)
-    print("OK ui terminal_qss")
-
-
-def test_terminal_rail_icons_centered():
-    """深空终端导航栏：14 个图标必须真的画出来，并且横向居中在 54px 栏里。
-
-    回归：PySide6 里 `icon = opt.icon` 拿到的是引用，delegate 随后
-    `opt.icon = QIcon()` 会把原图标一起清掉 —— 整条导航变成空白，
-    只剩选中项那 2px 强调色边线，看起来就是「导航按钮位置不对」。
-    """
-    from PySide6.QtCore import QPoint
-    from PySide6.QtWidgets import QApplication
-
-    from qbotmanager.core.settings import Settings
-    from qbotmanager.tasks.task_manager import TaskManager
-    from qbotmanager.ui import theme as theme_mod
-    from qbotmanager.ui.main_window import MainWindow
-
-    app = QApplication.instance() or QApplication([])
-    tmp = Path(tempfile.mkdtemp(prefix="qbm_rail_"))
-    s = Settings(tmp)
-    s.ensure_dirs()
-    s.bg_video_enabled = False
-    s.bg_image_enabled = False
-    s.beginner_mode = False
-    s.theme = "terminal"
-    s.save()
-    win = MainWindow(s, TaskManager())
-    win.resize(1180, 760)
-    win.show()
-    app.processEvents()
-    win.apply_skin(force=True)
-    app.processEvents()
-
-    assert theme_mod.UI_LAYOUT == "rail"
-    assert win.rail.width() == 54, win.rail.width()
-    lst = win.rail_list
-    assert lst.count() >= 10, lst.count()
-    img = win.grab().toImage()
-    org = lst.viewport().mapTo(win, QPoint(0, 0))
-    drawn = 0
-    centers = []
-    for i in range(lst.count()):
-        rect = lst.visualItemRect(lst.item(i))
-        xs = []
-        for y in range(max(0, rect.top()), min(lst.viewport().height(), rect.bottom() + 1)):
-            # 跳过最左侧：选中项有一条 2px 强调色边线，那不是图标
-            for x in range(6, 48):
-                c = img.pixelColor(org.x() + x, org.y() + y)
-                if c.red() + c.green() + c.blue() > 150:   # 背景 #0A0D10 ≈ 33
-                    xs.append(x)
-        if xs:
-            drawn += 1
-            centers.append((min(xs) + max(xs)) / 2)
-    assert drawn == lst.count(), f"{drawn}/{lst.count()} 个导航图标画出来了"
-    assert all(abs(c - 26.5) <= 4 for c in centers), centers
-    win.close()
-    print("OK ui terminal_rail_icons_centered")
 
 
 def test_beginner_mode_nav():
@@ -658,16 +561,18 @@ def test_beginner_mode_nav():
     # 通道详情页（飞书/微信/QQ/纸飞机）已收进「接入」：本来就不占侧栏一行
     assert win.nav_row_hidden("飞书"), "通道详情页不该单独占一行"
     assert win.nav_row_hidden("插件"), "小白模式应隐藏插件"
-    if win._rail_rows:
-        assert win.rail_list.isRowHidden(win._rail_rows["日志"]), "小白模式应隐藏日志"
+    assert win.nav_row_hidden("日志"), "小白模式应隐藏日志"
 
     home = win.pages[0]
     feishu_card = home._cards_layout.itemAt(2).widget()
     assert feishu_card is not None and feishu_card.isHidden(), "小白模式首页应隐藏飞书卡"
 
     brain = win.pages[6]
-    assert brain._agent_panel.isHidden(), "小白模式 AI 大脑应隐藏智能体档案"
-    assert brain._workshop_panel.isHidden(), "小白模式 AI 大脑应隐藏人设工坊"
+    # 2026-10-07 人设整合：智能体档案 / 人设工坊 并进了「人设与主动聊天」这张卡，
+    # 两个旧块不再是独立卡片，也不再由小白模式开关（谁显示由胶囊的预设/自定义决定）；
+    # 小白模式要藏的仍是记忆与 MCP 那一块。
+    assert not brain._persona_panel.isHidden(), "人设卡片不该被小白模式藏掉"
+    assert brain.persona_seg is not None, "人设卡片顶部要有胶囊分段控件"
     assert brain._mem_panel.isHidden(), "小白模式 AI 大脑应隐藏 MCP"
     assert brain.chk_feishu.isHidden(), "小白模式 AI 大脑应隐藏飞书平台开关"
 
@@ -683,17 +588,16 @@ def test_beginner_mode_nav():
     # 通过设置页滑块走完整 UI 链路切换，验证点击后立即生效
     sp.chk_beginner_mode.setChecked(False)
     app.processEvents()
+    # 入口都还在（2026-10-02 第一版藏了插件行，老板找不到，已改回各占一行）
     assert not win.nav_row_hidden("消息中心"), "关闭小白模式应显示消息中心"
     assert not win.nav_row_hidden("插件"), "关闭小白模式应显示插件"
     assert not feishu_card.isHidden(), "关闭小白模式首页应显示飞书卡"
-    assert not brain._agent_panel.isHidden(), "关闭小白模式 AI 大脑应显示档案"
-    assert not brain._workshop_panel.isHidden(), "关闭小白模式 AI 大脑应显示人设工坊"
     assert not brain._mem_panel.isHidden(), "关闭小白模式 AI 大脑应显示 MCP"
     assert not brain.chk_feishu.isHidden(), "关闭小白模式 AI 大脑应显示飞书平台开关"
 
     sp.chk_beginner_mode.setChecked(True)
     app.processEvents()
-    assert win.nav_row_hidden("消息中心"), "重新开启小白模式应再次隐藏消息中心"
+    assert win.nav_row_hidden("日志"), "重新开启小白模式应再次隐藏日志（收在全局管理里）"
     assert feishu_card.isHidden(), "重新开启小白模式首页应隐藏飞书卡"
 
     win.close()
@@ -746,8 +650,8 @@ def test_run_page_reverse_ws_panel():
     print("OK ui run_page_reverse_ws")
 
 
-def test_free_tier_pay_entries_exist():
-    """首页与微信页在未开通微信通道时应提供「开通微信通道」入口。"""
+def test_wechat_channel_is_free_for_everyone():
+    """微信通道已免费开放（2026-10-01）：界面不再有「开通」按钮，扫码登录直接可用。"""
     import tempfile
     from pathlib import Path
 
@@ -758,37 +662,46 @@ def test_free_tier_pay_entries_exist():
     from qbotmanager.ui.main_window import MainWindow
 
     app = QApplication.instance() or QApplication([])
-    tmp = Path(tempfile.mkdtemp(prefix="qbm_pay_"))
+    tmp = Path(tempfile.mkdtemp(prefix="qbm_wxfree_"))
     s = Settings(tmp)
     s.ensure_dirs()
     s.bg_video_enabled = False
     s.bg_image_enabled = False
     s.save()
-    # 隔离本机真实授权：测试环境固定为未开通（本机账号已是永久，直接读会误判）
+    # 隔离本机真实授权：这个测试要证明"没有任何授权也能用微信通道"
     from qbotmanager.core import license as lic
     orig_license_file = lic.license_file
-    lic.license_file = lambda: tmp / "license.json"
+    lic.license_file = lambda: tmp / "license.json"      # 不存在 = 无授权
     tasks = TaskManager()
     win = MainWindow(s, tasks)
     app.processEvents()
 
+    gate = lic.feature_gate()
+    assert gate["member"] is True, "没授权也必须能用微信通道"
+    assert "免费开放" in gate["reason"], gate
+
     home = win.pages[0]
-    assert hasattr(home, "wx_pay_btn"), "首页缺少开通微信通道按钮"
-    assert home.wx_pay_btn.text() == "开通微信通道"
+    assert not hasattr(home, "wx_pay_btn"), "首页不该再留「开通微信通道」按钮"
 
     wechat = next(
         (p for p in win.pages if type(p).__name__ == "WechatPage"), None
     )
-    assert wechat is not None and hasattr(wechat, "btn_pay"), "微信页缺少开通微信通道按钮"
-    assert "开通微信通道" in wechat.btn_pay.text()
+    assert wechat is not None
+    wechat.refresh_status()
+    app.processEvents()
+    assert wechat.btn_pay.isHidden(), "微信页的「开通」按钮不该出现"
+    assert wechat.gate_lock.isHidden(), "不该再显示「未开通」的提示条"
+    assert "未开通" not in wechat.qr_box.text(), wechat.qr_box.text()
+    assert wechat.btn_qr.isEnabled(), "扫码登录按钮要能用"
 
     sp = win.pages[win._page_index["设置"]]
-    assert sp.info_labels["license_status"].text() == "仅 QQ 通道"
+    assert "未开通" not in sp.info_labels["license_status"].text(), \
+        sp.info_labels["license_status"].text()
     assert "机器码" not in sp.info_labels["license_status"].toolTip()
 
     lic.license_file = orig_license_file
     win.close()
-    print("OK ui free_tier_pay_entries")
+    print("OK ui wechat_channel_free")
 
 
 def test_beginner_toggle_survives_appearance_error():
@@ -995,7 +908,7 @@ def test_brain_page_ai_memory_block():
 
 
 def test_nav_groups_match_console():
-    """侧栏分组与控制台一致（运行 / 能力 / 系统），「全局管理」是真页面不是占位。"""
+    """侧栏分组与控制台一致（机器人 / 工坊 / 人格 / 设置），「全局管理」是真页面不是占位。"""
     from PySide6.QtWidgets import QApplication
 
     from qbotmanager.core.settings import Settings
@@ -1013,19 +926,21 @@ def test_nav_groups_match_console():
     win = MainWindow(s, TaskManager())
     app.processEvents()
 
-    assert [t for t, _items in MainWindow.NAV_GROUPS] == ["运行", "能力", "系统"]
+    assert [t for t, _items in MainWindow.NAV_GROUPS] == ["机器人", "工坊", "人格", "设置"]
     visible = [n for _t, items in MainWindow.NAV_GROUPS for n in items]
-    # 侧栏只剩主线入口：通道详情页（微信/QQ/飞书/纸飞机）收进「接入」，不占行
-    assert visible == ["首页", "接入", "AI 大脑", "插件", "插件工坊",
+    # 2026-10-02 合并后：低频页收进父页（通道→接入、插件→工坊、消息中心/日志/依赖→全局管理）
+    assert visible == ["首页", "接入", "插件", "插件工坊", "AI 大脑",
                        "全局管理", "消息中心", "日志", "依赖", "设置"], visible
     assert set(MainWindow.SUB_NAV_PARENT) == {"微信", "QQ", "飞书", "纸飞机"}
     for child, parent in MainWindow.SUB_NAV_PARENT.items():
         assert child in MainWindow.PAGE_ORDER, child
         assert parent in visible, parent
     assert set(MainWindow.PAGE_ORDER) == set(visible) | set(MainWindow.SUB_NAV_PARENT)
-    # 组内顺序与控制台一致：能力组是「AI 大脑 / 插件」，系统组第一项是「全局管理」
-    assert MainWindow.NAV_GROUPS[1][1] == ("AI 大脑", "插件", "插件工坊")
-    assert MainWindow.NAV_GROUPS[2][1][0] == "全局管理"
+    # 组内顺序与控制台一致：工坊组是「插件 / 插件工坊」，设置组第一项是「全局管理」
+    assert MainWindow.NAV_GROUPS[0][1] == ("首页", "接入")
+    assert MainWindow.NAV_GROUPS[1][1] == ("插件", "插件工坊")
+    assert MainWindow.NAV_GROUPS[2][1] == ("AI 大脑",)
+    assert MainWindow.NAV_GROUPS[3][1][0] == "全局管理"
 
     # 页面下标必须与 PAGE_ORDER 一一对应（加页面时最容易被写歪的地方）
     assert len(win.pages) == len(MainWindow.PAGE_ORDER)
@@ -1035,19 +950,26 @@ def test_nav_groups_match_console():
     win.switch_page("全局管理")
     app.processEvents()
     assert win.stack.currentIndex() == win._page_index["全局管理"]
-    assert win.nav_lists[2].currentRow() == 0, "选中行要跟着切到系统组第一项"
+    assert win.nav_lists[3].currentRow() == 0, "选中行要跟着切到「设置」组第一项"
 
     # 进通道详情页：页面还在，但侧栏高亮归属的「接入」行（不再有独立行）
     win.switch_page("微信")
     app.processEvents()
     assert win.stack.currentIndex() == win._page_index["微信"]
     assert win.nav_lists[0].currentRow() == 1, "通道详情页要高亮「接入」那一行"
-    assert win.nav_lists[2].currentRow() == -1, "切到运行组后系统组不该还高亮"
+    assert win.nav_lists[3].currentRow() == -1, "切到机器人组后设置组不该还高亮"
+
+    # 收进父页的页面也要能高亮父页那行（插件 → 工坊）
+    win.switch_page("插件")
+    app.processEvents()
+    assert win.stack.currentIndex() == win._page_index["插件"]
+    assert win.nav_lists[1].currentRow() == 0, "插件页要收在「工坊」组里高亮"
 
     # 一次只有一组能高亮
     win.nav_lists[0].setCurrentRow(0)
     app.processEvents()
-    assert win.nav_lists[2].currentRow() == -1, "切回运行组后系统组不该还高亮"
+    assert win.nav_lists[3].currentRow() == -1, "切回机器人组后设置组不该还高亮"
+    assert win.nav_lists[1].currentRow() == -1, "切回机器人组后工坊组不该还高亮"
     assert win.stack.currentIndex() == win._page_index["首页"]
     win.deleteLater()
     print("OK ui nav_groups")
@@ -1455,6 +1377,101 @@ def test_channel_switch_turns_dsh_off():
     print("OK ui channel_switch_turns_dsh_off")
 
 
+def test_update_button_states():
+    """标题栏更新按钮：无新版隐藏 → 发现新版「有新版本」→ 检查中 → 已下好「立即更新」。"""
+    from PySide6.QtWidgets import QApplication
+
+    from qbotmanager.core.settings import Settings
+    from qbotmanager.tasks.task_manager import TaskManager
+    from qbotmanager.ui.main_window import MainWindow
+
+    app = QApplication.instance() or QApplication([])
+    tmp = Path(tempfile.mkdtemp(prefix="qbm_updbtn_"))
+    s = Settings(tmp)
+    s.ensure_dirs()
+    s.bg_video_enabled = False
+    s.bg_image_enabled = False
+    s.save()
+    win = MainWindow(s, TaskManager())
+    app.processEvents()
+
+    btn = win.titlebar.btn_update
+    assert btn.text() == "有新版本", btn.text()
+    assert not btn.property("state"), btn.property("state")
+    assert btn.isEnabled()
+    assert not btn.isVisibleTo(win), "没发现新版本时不该占标题栏"
+
+    win._update_info = {"ok": True, "newer": True, "latest": "9.9.9"}
+    win._set_update_button_state(newer=True)
+    assert btn.text() == "有新版本", btn.text()
+    assert btn.property("state") == "new", btn.property("state")
+    assert "9.9.9" in btn.toolTip(), btn.toolTip()
+    assert btn.isVisibleTo(win), "发现新版本要露出红色胶囊"
+
+    win._set_update_button_state(busy=True)
+    assert btn.text() == "检查中", btn.text()
+    assert btn.property("state") == "busy"
+    assert not btn.isEnabled(), "检查中不该让用户重复点"
+
+    win._set_update_button_state(ready=True)
+    assert btn.text() == "立即更新", btn.text()
+    assert btn.property("state") == "ready"
+    assert btn.isEnabled()
+
+    win._set_update_button_state()
+    assert btn.text() == "有新版本" and not btn.property("state")
+    assert not btn.isVisibleTo(win)
+
+    # 已知有新版本时点按钮：直接进更新流程（不重新联网）
+    offered = []
+    win._offer_update = lambda res: offered.append(res)
+    win._update_info = {"ok": True, "newer": True, "latest": "9.9.9"}
+    win.check_update_interactive()
+    app.processEvents()
+    assert offered and offered[0].get("latest") == "9.9.9", offered
+
+    # 测试模式（QBM_NO_UPDATE=1）下点一下只提示，不起线程、不弹框
+    win._update_info = {}
+    win.check_update_interactive()
+    app.processEvents()
+    assert not win._update_checking
+    assert win._update_dialog is None
+    win._update_info = {"ok": True, "newer": True, "latest": "9.9.9"}
+
+    # 进度卡片：下载按百分比，装到一半转"正在安装"（真卡片是点阵 splash，测试里换假的）
+    import threading
+
+    class _FakeCard:
+        def __init__(self):
+            self.progress = None
+            self.text = ""
+
+        def set_progress(self, value):
+            self.progress = value
+
+        def set_text(self, text):
+            self.text = text
+
+        def close_card(self):
+            self.text = "<closed>"
+
+    card = _FakeCard()
+    win._update_card = card
+    win._update_cancel_ev = threading.Event()
+    win._update_busy = True
+    win._on_update_progress(5 * 1024 * 1024, 10 * 1024 * 1024)
+    assert card.progress == 0.5, card.progress
+    assert "50%" in card.text, card.text
+    win._on_update_progress(0, 0)
+    assert card.progress == 1.0 and "正在安装" in card.text, (card.progress, card.text)
+    win._cancel_update()
+    assert win._update_cancel_ev.is_set(), "取消要把取消事件置位"
+    win._close_update_dialog()
+    assert win._update_card is None and not win._update_busy
+    win.close()
+    print("OK ui update_button_states")
+
+
 def test_dsh_control_buttons():
     """v1.2.8：dsh 卡片自带启停按钮 —— 装完就地启动，不用重启全部服务。"""
     import shutil as _shutil
@@ -1632,42 +1649,844 @@ def test_workshop_setup_gate():
     print("OK ui workshop_setup_gate")
 
 
+def test_wheel_not_trapped_by_dropdowns():
+    """滚轮：展开的下拉列表 / 闭合的下拉框都不许卡住页面滚动，也不许偷偷改值。
+
+    三种情形（离屏实测）：
+      1. 鼠标压着没展开的下拉框滚 → 页面滚，下拉框的值不动；
+      2. 滚展开的短列表（本来就滚不动）→ 列表收起，这一下滚轮落到页面上；
+      3. 滚展开的长列表（自己滚得动）→ 列表自己滚，页面不动。
+    """
+    from PySide6.QtCore import QPoint, QPointF, Qt
+    from PySide6.QtGui import QWheelEvent
+    from PySide6.QtWidgets import (
+        QApplication, QComboBox, QScrollArea, QVBoxLayout, QWidget,
+    )
+
+    from qbotmanager.ui.widgets import WheelGuard
+
+    app = QApplication.instance() or QApplication([])
+    guard = WheelGuard(app)
+    app.installEventFilter(guard)
+
+    def wheel(target, notches=-1):
+        ev = QWheelEvent(QPointF(4, 4), QPointF(4, 4), QPoint(0, 0),
+                         QPoint(0, int(notches * 120)), Qt.MouseButton.NoButton,
+                         Qt.KeyboardModifier.NoModifier,
+                         Qt.ScrollPhase.NoScrollPhase, False)
+        QApplication.sendEvent(target, ev)
+        app.processEvents()
+
+    page = QWidget()
+    area = QScrollArea()
+    area.setWidgetResizable(True)
+    body = QWidget()
+    body.setMinimumHeight(2400)
+    box = QVBoxLayout(body)
+    short_combo = QComboBox()
+    short_combo.addItems(["全部分类", "官方能力包", "智能体"])
+    long_combo = QComboBox()
+    long_combo.addItems([f"能力包 {i}" for i in range(80)])
+    edit_combo = QComboBox()          # 可编辑：滚轮常落在它内部的输入框上
+    edit_combo.setEditable(True)
+    edit_combo.addItems(["模型 A", "模型 B", "模型 C"])
+    box.addWidget(short_combo)
+    box.addWidget(long_combo)
+    box.addWidget(edit_combo)
+    for _ in range(30):
+        box.addWidget(QWidget())
+    area.setWidget(body)
+    outer = QVBoxLayout(page)
+    outer.addWidget(area)
+    page.resize(360, 320)
+    page.show()
+    app.processEvents()
+
+    bar = area.verticalScrollBar()
+    assert bar.maximum() > 0, "测试页自己得能滚，否则测不出东西"
+
+    bar.setValue(0)
+    wheel(short_combo)
+    assert bar.value() > 0, "鼠标压着闭合下拉框时，页面必须照样滚"
+    assert short_combo.currentIndex() == 0, "滚轮不许改下拉框的值"
+
+    # 1b) 可编辑下拉框：滚轮落在它内部的输入框上，同样不许拦页面、不许改值
+    bar.setValue(0)
+    wheel(edit_combo.lineEdit())
+    assert bar.value() > 0, "滚轮落在下拉框内部的输入框上也要能滚页面"
+    assert edit_combo.currentIndex() == 0, "滚轮不许改可编辑下拉框的值"
+
+    bar.setValue(0)
+    short_combo.showPopup()
+    app.processEvents()
+    view = short_combo.view()
+    assert view.window().windowFlags() & Qt.WindowType.Popup, "下拉浮层应当已展开"
+    wheel(view.viewport())
+    app.processEvents()
+    assert not view.window().isVisible(), "短列表滚一下就收起，别把页面卡住"
+    assert bar.value() > 0, "收起浮层后这一下滚轮要落到页面上"
+    assert short_combo.currentIndex() == 0
+
+    bar.setValue(0)
+    long_combo.showPopup()
+    app.processEvents()
+    long_view = long_combo.view()
+    long_view.verticalScrollBar().setValue(0)
+    wheel(long_view.viewport())
+    app.processEvents()
+    assert long_view.verticalScrollBar().value() > 0, "长列表自己得能滚"
+    assert bar.value() == 0, "列表自己滚得动时不该动页面"
+
+    app.removeEventFilter(guard)
+    page.close()
+    print("OK ui wheel guard")
+
+
+def _wait_until(app, predicate, timeout_s=3.0):
+    """等动画真的跑完再断言：整套冒烟一起跑时机器更忙，固定 sleep 会飘。"""
+    import time
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        app.processEvents()
+        if predicate():
+            return True
+        time.sleep(0.01)
+    return predicate()
+
+
+def test_motion_switch_controls_everything():
+    """设置里「减少界面动效」= 全软件总闸：勾上后折叠区/进度条都直接落位。"""
+    import time
+
+    from PySide6.QtWidgets import (
+        QApplication, QLabel, QVBoxLayout, QWidget,
+    )
+
+    from qbotmanager.ui import motion
+    from qbotmanager.ui.widgets import FoldSection, TaskProgressBar
+
+    app = QApplication.instance() or QApplication([])
+
+    body = QWidget()
+    lay = QVBoxLayout(body)
+    content = QLabel("内容" * 40)
+    content.setWordWrap(True)
+    sec = FoldSection("展开 ▾", "收起 ▴", content)
+    lay.addWidget(sec)
+    bar = TaskProgressBar()
+    lay.addWidget(bar)
+    body.resize(360, 240)
+    body.show()
+    app.processEvents()
+
+    try:
+        # 关掉动效：立刻落位，不留过渡
+        motion.set_enabled(False)
+        sec.set_expanded(True)
+        assert sec._anim is None, "关掉动效后不该还有动画在跑"
+        assert content.isVisible() and content.maximumHeight() > 1000
+        sec.set_expanded(False)
+        assert not content.isVisible() and content.maximumHeight() == 0
+        bar.set_smooth(-1)
+        assert bar.value() == 30, "忙碌态在关闭动效时给一个静止的三成高"
+        bar.set_smooth(66)
+        assert bar.value() == 66
+
+        # 打开动效：折叠区走 170ms 过场，结束后放开高度上限
+        motion.set_enabled(True)
+        sec.set_expanded(True)
+        assert sec._anim is not None, "开着动效时应当有过渡"
+        assert _wait_until(app, lambda: sec._anim is None), "展开过场应当自己跑完"
+        assert content.isVisible() and content.maximumHeight() > 1000
+        # 中途反向点一次，最终状态跟最后一次请求一致（不许卡在半路）
+        sec.set_expanded(False)
+        app.processEvents()
+        sec.set_expanded(True)
+        assert _wait_until(app, lambda: sec._anim is None)
+        assert sec._expanded is True and content.isVisible()
+    finally:
+        motion.set_enabled(True)
+        body.close()
+    print("OK motion switch")
+
+
+def test_toast_motion_and_gate():
+    """提示条进出场：动效开时滑上来、退出再滑下去；关掉直接落位，两种情况都不卡半路。"""
+    from PySide6.QtWidgets import QApplication
+
+    from qbotmanager.core.settings import Settings
+    from qbotmanager.tasks.task_manager import TaskManager
+    from qbotmanager.ui import motion
+    from qbotmanager.ui.main_window import MainWindow
+
+    app = QApplication.instance() or QApplication([])
+
+    tmp = Path(tempfile.mkdtemp(prefix="qbm_toast_"))
+    s = Settings(tmp)
+    s.ensure_dirs()
+    s.bg_video_enabled = False
+    s.bg_image_enabled = False
+    s.save()
+    win = MainWindow(s, TaskManager())
+    win.show()
+    app.processEvents()
+
+    try:
+        motion.set_enabled(False)
+        win.show_toast("关掉动效的提示", 3000)
+        assert win._toast.isVisible() and win._toast_shift == 0
+        win._hide_toast()
+        assert not win._toast.isVisible()
+
+        motion.set_enabled(True)
+        win.show_toast("开着动效的提示", 3000)
+        assert win._toast.isVisible()
+        assert win._toast_anim is not None, "开着动效时提示条应该有进场过程"
+        assert win._toast_shift > 0, "进场时应当还在往上滑"
+        assert _wait_until(app, lambda: win._toast_anim is None), "进场应当自己跑完"
+        assert win._toast.isVisible() and win._toast_shift == 0
+        win._hide_toast()
+        assert win._toast_anim is not None, "退出也应当有过程"
+        assert _wait_until(app, lambda: win._toast_anim is None), "退出应当自己跑完"
+        assert not win._toast.isVisible() and win._toast_shift == 0
+    finally:
+        motion.set_enabled(True)
+        win.deleteLater()
+    print("OK toast motion")
+
+
+def test_busy_dots_follow_long_tasks():
+    """长任务呼吸点：开始转、结束停；关掉动效仍然显示（状态信息不丢）。"""
+    from PySide6.QtWidgets import QApplication, QPushButton
+
+    from qbotmanager.ui import motion
+    from qbotmanager.ui.widgets import BusyDots, set_busy
+
+    app = QApplication.instance() or QApplication([])
+    btn = QPushButton("安装")
+    btn.resize(120, 36)
+    btn.show()
+    app.processEvents()
+
+    motion.set_enabled(True)
+    set_busy(btn, True)
+    dots = getattr(btn, "_busy_dots", None)
+    assert isinstance(dots, BusyDots) and dots.isVisible()
+    assert dots._timer.isActive(), "动效开着时应当在呼吸"
+
+    set_busy(btn, False)
+    assert not dots.isVisible() and not dots._timer.isActive()
+
+    # 关掉动效：点还在（这是状态信息，不是装饰），只是不再动
+    motion.set_enabled(False)
+    set_busy(btn, True)
+    assert dots.isVisible() and not dots._timer.isActive()
+    set_busy(btn, False)
+
+    # 长标题 / 窄按钮都不许把点顶出控件外
+    motion.set_enabled(True)
+    btn.setText("这是一个很长很长的按钮标题")
+    set_busy(btn, True)
+    app.processEvents()
+    placed = btn._busy_dots
+    assert 0 <= placed.x() <= max(0, btn.width() - placed.width())
+    set_busy(btn, False)
+    motion.set_enabled(True)
+    btn.close()
+    print("OK busy dots")
+
+
+def test_qq_card_follows_unsaved_channel_switch():
+    """切了「接入方式」还没保存时：卡片和小字也得跟着走，并明确标出「未保存」。
+
+    用户报的坑：切到官方后，状态卡还写着「QQ OneBot · 已停止」和协议端那段小字，
+    因为卡片原来只认已保存的配置，而周期刷新又把小字顶回旧文案。
+    """
+    from PySide6.QtWidgets import QApplication
+
+    from qbotmanager.core.settings import Settings
+    from qbotmanager.tasks.task_manager import TaskManager
+    from qbotmanager.ui.main_window import MainWindow
+
+    app = QApplication.instance() or QApplication([])
+    tmp = Path(tempfile.mkdtemp(prefix="qbm_qq_unsaved_"))
+    s = Settings(tmp)
+    s.ensure_dirs()
+    s.bg_video_enabled = False
+    s.bg_image_enabled = False
+    s.beginner_mode = False
+    s.qq_channel = "onebot"
+    s.qq_onebot_mode = "reverse"
+    s.save()
+    win = MainWindow(s, TaskManager())
+    app.processEvents()
+    rp = win.pages[win._page_index["QQ"]]
+    rp.refresh_status()
+    app.processEvents()
+    assert "协议端" in rp.qq_tip.text()
+
+    # 切到官方、故意不点保存，再走一次周期刷新
+    rp.combo_channel.setCurrentIndex(rp.combo_channel.findData("official"))
+    app.processEvents()
+    rp.refresh_status()
+    app.processEvents()
+    assert s.qq_channel == "onebot", "没点保存就不该动配置"
+    assert "官方通道不用扫码" in rp.qq_tip.text(), rp.qq_tip.text()
+    assert rp.qq_mode.text() == "QQ 官方机器人", rp.qq_mode.text()
+    assert rp.qq_appid_label.text() == "AppID", rp.qq_appid_label.text()
+    assert "未保存" in rp.qq_badge.label.text(), rp.qq_badge.label.text()
+    assert "还没保存" in rp.qq_state.text(), rp.qq_state.text()
+    assert "第三方 OneBot" in rp.qq_state.text(), "要说清现在实际跑的是哪一个"
+
+    # 再切回第三方（同样不保存）：文案跟着回来，未保存标记消失
+    rp.combo_channel.setCurrentIndex(rp.combo_channel.findData("onebot"))
+    app.processEvents()
+    rp.refresh_status()
+    app.processEvents()
+    assert "协议端" in rp.qq_tip.text(), rp.qq_tip.text()
+    assert rp.qq_mode.text().startswith("第三方 OneBot"), rp.qq_mode.text()
+    assert "OneBot" in rp.qq_badge.label.text(), rp.qq_badge.label.text()
+    assert "还没保存" not in rp.qq_state.text(), rp.qq_state.text()
+
+    win.deleteLater()
+    print("OK ui qq_card_follows_unsaved_switch")
+
+
+def test_qq_card_shows_group_message_mode():
+    """QQ 状态卡要显示"收消息模式"：全量 / 仅 @ / 还没收到过。
+
+    这三种在界面上原来完全看不出来，"群里 @ 没反应"就没法解释。
+    """
+    import json
+    import time
+
+    from PySide6.QtWidgets import QApplication
+
+    from qbotmanager.core import ai_config
+    from qbotmanager.core.settings import Settings
+    from qbotmanager.tasks.task_manager import TaskManager
+    from qbotmanager.ui.main_window import MainWindow
+
+    app = QApplication.instance() or QApplication([])
+    tmp = Path(tempfile.mkdtemp(prefix="qbm_qqmode_"))
+    s = Settings(tmp)
+    s.ensure_dirs()
+    s.bg_video_enabled = False
+    s.bg_image_enabled = False
+    s.beginner_mode = False
+    s.qq_channel = "official"      # 全量/仅@ 是官方通道才有的区别
+    s.save()
+    win = MainWindow(s, TaskManager())
+    app.processEvents()
+    rp = win.pages[win._page_index["QQ"]]
+    state_file = ai_config.qq_group_state_file(s)
+    state_file.parent.mkdir(parents=True, exist_ok=True)
+
+    rp.refresh_status()
+    app.processEvents()
+    assert "还没收到过" in rp.qq_group_mode.text(), rp.qq_group_mode.text()
+
+    state_file.write_text(json.dumps({"mode": "at_only", "last_ts": time.time()}),
+                          encoding="utf-8")
+    rp.refresh_status()
+    app.processEvents()
+    assert "仅 @ 消息" in rp.qq_group_mode.text(), rp.qq_group_mode.text()
+    assert "接收所有消息" in rp.qq_tip.text(), "仅@模式要顺手说清怎么开全量"
+
+    state_file.write_text(json.dumps({"mode": "full", "last_ts": time.time()}),
+                          encoding="utf-8")
+    rp.refresh_status()
+    app.processEvents()
+    assert rp.qq_group_mode.text().startswith("全量模式"), rp.qq_group_mode.text()
+    assert "接收所有消息" not in rp.qq_tip.text(), "已经全量了就别再提示去开"
+
+    # 第三方协议端没有"全量/仅@"之分：这一行要说的是"群里每条都能收到"
+    s.qq_channel = "onebot"
+    rp.combo_channel.setCurrentIndex(rp.combo_channel.findData("onebot"))
+    rp.refresh_status()
+    app.processEvents()
+    assert "第三方协议端" in rp.qq_group_mode.text(), rp.qq_group_mode.text()
+
+    win.deleteLater()
+    print("OK ui qq_group_message_mode")
+
+
+def test_qq_page_has_diagnose_button():
+    """QQ 页要有「官方通道体检」按钮，点开是逐条结论（✗ 需要处理）。"""
+    from PySide6.QtWidgets import QApplication, QDialog, QLabel
+
+    from qbotmanager.core.settings import Settings
+    from qbotmanager.tasks.task_manager import TaskManager
+    from qbotmanager.ui.main_window import MainWindow
+
+    app = QApplication.instance() or QApplication([])
+    tmp = Path(tempfile.mkdtemp(prefix="qbm_qqdiag_"))
+    s = Settings(tmp)
+    s.ensure_dirs()
+    s.bg_video_enabled = False
+    s.bg_image_enabled = False
+    s.beginner_mode = False
+    s.qq_channel = "official"
+    s.save()
+    win = MainWindow(s, TaskManager())
+    app.processEvents()
+    rp = win.pages[win._page_index["QQ"]]
+    assert hasattr(rp, "btn_qq_diag"), "QQ 页应当有体检按钮"
+    assert "体检" in rp.btn_qq_diag.text()
+
+    captured = []
+    original_exec = QDialog.exec
+
+    def fake_exec(self):
+        captured.append([w.text() for w in self.findChildren(QLabel)])
+        return 0
+
+    QDialog.exec = fake_exec
+    try:
+        rp.btn_qq_diag.click()
+    finally:
+        QDialog.exec = original_exec
+    assert captured, "点体检应当弹出窗口"
+    lines = "\n".join(captured[0])
+    assert "凭" in lines or "凭证" in lines, lines[:200]
+    assert any(m in lines for m in ("✓", "✗", "•")), lines[:200]
+
+    win.deleteLater()
+    print("OK ui qq_diagnose_button")
+
+
+def test_brain_group_list_checkboxes():
+    """AI 大脑页：把"收到过消息的群"列出来，取消勾选就只允许剩下的群回话。"""
+    import json
+    import time
+
+    from PySide6.QtWidgets import QApplication
+
+    from qbotmanager.core import ai_config
+    from qbotmanager.core.settings import Settings
+    from qbotmanager.tasks.task_manager import TaskManager
+    from qbotmanager.ui.main_window import MainWindow
+
+    app = QApplication.instance() or QApplication([])
+    tmp = Path(tempfile.mkdtemp(prefix="qbm_grouplist_ui_"))
+    s = Settings(tmp)
+    s.ensure_dirs()
+    s.bg_video_enabled = False
+    s.bg_image_enabled = False
+    s.beginner_mode = False
+    s.save()
+    state_file = ai_config.qq_group_state_file(s)
+    state_file.parent.mkdir(parents=True, exist_ok=True)
+    now = time.time()
+    state_file.write_text(json.dumps({
+        "mode": "full", "last_ts": now,
+        "groups": {"群A": {"last_ts": now, "count": 2},
+                   "群B": {"last_ts": now - 600, "count": 1}},
+    }, ensure_ascii=False), encoding="utf-8")
+
+    win = MainWindow(s, TaskManager())
+    win.switch_page("AI 大脑")
+    app.processEvents()
+    brain = win.pages[win._page_index["AI 大脑"]]
+
+    assert "不限群" in brain.group_list_lbl.text(), brain.group_list_lbl.text()
+    assert set(brain._group_checkboxes) == {"群A", "群B"}, brain._group_checkboxes
+    assert all(box.isChecked() for box in brain._group_checkboxes.values()), "默认全允许"
+
+    # 取消勾选"群B" → 只允许"群A"（写进机器人侧白名单）
+    brain._group_checkboxes["群B"].setChecked(False)
+    app.processEvents()
+    assert ai_config.allowed_groups(s) == ["群A"], ai_config.allowed_groups(s)
+    assert "只允许勾选的 1 个" in brain.group_list_lbl.text(), brain.group_list_lbl.text()
+
+    # 再勾回来 → 回到"不限群"
+    brain._group_checkboxes["群B"].setChecked(True)
+    app.processEvents()
+    assert ai_config.allowed_groups(s) == [], "全勾上就是不限群"
+
+    win.deleteLater()
+    print("OK ui brain_group_list")
+
+
+def test_brain_interject_controls_save_and_reload():
+    """AI 大脑页：群聊搭话开关 + 概率/间隔/条数要能存下来并读回来。"""
+    from PySide6.QtWidgets import QApplication
+
+    from qbotmanager.core import ai_config
+    from qbotmanager.core.settings import Settings
+    from qbotmanager.tasks.task_manager import TaskManager
+    from qbotmanager.ui.main_window import MainWindow
+
+    app = QApplication.instance() or QApplication([])
+    tmp = Path(tempfile.mkdtemp(prefix="qbm_interject_"))
+    s = Settings(tmp)
+    s.ensure_dirs()
+    s.bg_video_enabled = False
+    s.bg_image_enabled = False
+    s.beginner_mode = False
+    s.save()
+    ai_config.save_config(s, api_key="sk-test-123", api_url="https://api.deepseek.com",
+                          model="deepseek-chat")
+
+    win = MainWindow(s, TaskManager())
+    win.switch_page("AI 大脑")
+    app.processEvents()
+    brain = win.pages[win._page_index["AI 大脑"]]
+
+    # 默认关（插件侧默认也是 False，别一保存就把它打开）
+    assert brain.chk_interject.isChecked() is False
+    assert brain.ai_interject_probability.value() == 30
+    assert brain.ai_interject_history.value() == 10
+
+    brain.chk_interject.setChecked(True)
+    brain.ai_interject_probability.setValue(45)
+    brain.ai_interject_min.setValue(15)
+    brain.ai_interject_max.setValue(60)
+    brain.ai_interject_history.setValue(20)
+    brain._save_config()
+    app.processEvents()
+
+    saved = ai_config.read_interject(s)
+    assert saved["enabled"] is True
+    assert abs(saved["probability"] - 0.45) < 1e-6, saved
+    assert (saved["interval_min"], saved["interval_max"]) == (15, 60), saved
+    assert saved["history_count"] == 20
+
+    # 重开一次页面：控件要回填成已保存的值
+    brain.load_config()
+    app.processEvents()
+    assert brain.chk_interject.isChecked() is True
+    assert brain.ai_interject_probability.value() == 45
+    assert brain.ai_interject_min.value() == 15
+
+    win.deleteLater()
+    print("OK ui brain_interject")
+
+
+def _market_page(tmp_prefix="qbm_mktcard_"):
+    """建一个只装了插件页的测试环境（市场条目由用例自己塞）。"""
+    from PySide6.QtWidgets import QApplication
+
+    from qbotmanager.core.settings import Settings
+    from qbotmanager.tasks.task_manager import TaskManager
+    from qbotmanager.ui.pages.common import PageContext
+    from qbotmanager.ui.pages.plugins_page import PluginsPage
+
+    app = QApplication.instance() or QApplication([])
+    tmp = Path(tempfile.mkdtemp(prefix=tmp_prefix))
+    s = Settings(tmp)
+    s.ensure_dirs()
+    s.save()
+    ctx = PageContext(s, None, TaskManager(), {"show_toast": lambda *a: None})
+    return app, s, PluginsPage(ctx)
+
+
+def _market_entries_sample():
+    return {
+        "eva": {"id": "eva", "name": "EVA · 智能体包", "version": "1.4.2",
+                "category": "智能体", "description": "陪聊、扮演角色、按人设回话",
+                "url": "https://astroswarm.cn/plugins/eva.zip", "sha256": "a"},
+        "reply-rhythm": {"id": "reply-rhythm", "name": "回复节奏能力包", "version": "1.0.0",
+                         "category": "官方能力包", "description": "忙的时候晚点回、闲的时候秒回",
+                         "url": "https://astroswarm.cn/plugins/rr.zip", "sha256": "b"},
+    }
+
+
+def test_plugins_market_cards_show_description_and_installed_state():
+    """卡片要直接把说明写出来（不能只藏在悬停里），已装的显示「✓已装」+「配置」。"""
+    import json
+
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QLabel, QPushButton
+
+    app, s, pp = _market_page()
+    # 造一个"已装"的能力包：tool_packs/<id>/manifest.json
+    pack_dir = Path(s.root) / "tool_packs" / "eva"
+    pack_dir.mkdir(parents=True, exist_ok=True)
+    (pack_dir / "manifest.json").write_text(
+        json.dumps({"id": "eva", "name": "EVA · 智能体包", "version": "1.4.2",
+                    "kind": "persona-pack"}, ensure_ascii=False), encoding="utf-8")
+
+    pp._market_entries = _market_entries_sample()
+    pp._refresh_market_tags()
+    pp._refresh_market_list()
+    app.processEvents()
+
+    def card_of(entry_id):
+        for i in range(pp.market_list.count()):
+            item = pp.market_list.item(i)
+            if item.data(Qt.UserRole) == entry_id:
+                return pp.market_list.itemWidget(item)
+        raise AssertionError(f"没找到 {entry_id} 的卡片")
+
+    eva = card_of("eva")
+    texts = [w.text() for w in eva.findChildren(QLabel)]
+    assert any("陪聊" in t for t in texts), f"说明必须直接显示：{texts}"
+    assert "✓ 已装" in texts, texts
+    buttons = [b.text() for b in eva.findChildren(QPushButton)]
+    assert "配置" in buttons, buttons
+    assert "安装" not in buttons, "已装的卡片不该还给「安装」按钮"
+
+    rr = card_of("reply-rhythm")
+    rr_buttons = [b.text() for b in rr.findChildren(QPushButton)]
+    rr_texts = [w.text() for w in rr.findChildren(QLabel)]
+    assert "安装" in rr_buttons and "✓ 已装" not in rr_texts, (rr_buttons, rr_texts)
+    assert any("秒回" in t for t in rr_texts), rr_texts
+
+    pp.deleteLater()
+    print("OK ui plugins_market_cards")
+
+
+def test_plugins_market_search_and_category_filter():
+    """搜索按名字/说明过滤；分类标签按类别过滤；没有结果时列表清空。"""
+    from PySide6.QtCore import Qt
+
+    app, s, pp = _market_page("qbm_mktfilter_")
+    pp._market_entries = _market_entries_sample()
+    # 页面构造时会异步拉真实市场；结果回来会把样例覆盖掉（这条曾偶发失败）。
+    # 这里把回调掐掉，测试只针对"搜索/分类过滤"这两段逻辑。
+    pp._on_market_loaded = lambda *_a, **_k: None
+    pp._refresh_market_tags()
+    pp._refresh_market_list()
+    app.processEvents()
+
+    def visible_ids():
+        return [pp.market_list.item(i).data(Qt.UserRole)
+                for i in range(pp.market_list.count())
+                if pp.market_list.item(i).data(Qt.UserRole)]
+
+    assert set(visible_ids()) == {"eva", "reply-rhythm"}, visible_ids()
+
+    # 搜索：名字里的字
+    pp.market_search.setText("EVA")
+    app.processEvents()
+    assert visible_ids() == ["eva"], visible_ids()
+    # 搜索：只出现在说明里的字
+    pp.market_search.setText("秒回")
+    app.processEvents()
+    assert visible_ids() == ["reply-rhythm"], visible_ids()
+    # 搜不到：列表为空（不再显示一堆无关插件）
+    pp.market_search.setText("根本不存在的插件")
+    app.processEvents()
+    assert visible_ids() == [], visible_ids()
+    pp.market_search.setText("")
+    app.processEvents()
+
+    # 分类标签过滤
+    assert "官方能力包" in pp._market_tags and "智能体" in pp._market_tags
+    pp._market_tags["官方能力包"].click()
+    app.processEvents()
+    assert visible_ids() == ["reply-rhythm"], visible_ids()
+    pp._market_tags[""].click()          # 回到「全部」
+    app.processEvents()
+    assert set(visible_ids()) == {"eva", "reply-rhythm"}, visible_ids()
+
+    pp.deleteLater()
+    print("OK ui plugins_market_search_filter")
+
+
+def test_brain_points_to_session_pack():
+    """免@连续对话的参数归「连续对话能力包」：AI 大脑页不再重复放控件，只指路。"""
+    from PySide6.QtWidgets import QApplication, QLabel
+
+    from qbotmanager.core.settings import Settings
+    from qbotmanager.tasks.task_manager import TaskManager
+    from qbotmanager.ui.main_window import MainWindow
+
+    app = QApplication.instance() or QApplication([])
+    tmp = Path(tempfile.mkdtemp(prefix="qbm_sessionhint_"))
+    s = Settings(tmp)
+    s.ensure_dirs()
+    s.bg_video_enabled = False
+    s.bg_image_enabled = False
+    s.beginner_mode = False
+    s.save()
+    win = MainWindow(s, TaskManager())
+    win.switch_page("AI 大脑")
+    app.processEvents()
+    brain = win.pages[win._page_index["AI 大脑"]]
+
+    assert not hasattr(brain, "chk_session"), "参数已移到能力包，这里不该再有开关"
+    texts = [w.text() for w in brain.findChildren(QLabel)]
+    assert any("连续对话能力包" in t for t in texts), \
+        [t for t in texts if "连续" in t][:3]
+
+    win.deleteLater()
+    print("OK ui brain_session_pack_hint")
+
+
+def test_brain_persona_card_merged_with_segment():
+    """人设整合（2026-10-07 老板）：三块并成一张卡 + 胶囊切「预设 / 自定义」。
+
+    老板原话：智能体档案 / 人设工坊（本地）/ 人设与主动聊天 功能重合、设置框离得远，
+    要「整合到一个框里」+「胶囊按钮切换形态（胶囊里有圆形图标可以切换）」。
+
+    这条用例钉死四件事：
+      1) 只剩一张「人设与主动聊天」卡（旧的 _agent_panel / _workshop_panel 不再是独立卡片，
+         而是这张卡里的两段；文档里不许再出现两个旧标题）；
+      2) 胶囊正好两段，圆形滑块位置跟着选中的那段走（data 用 offset 表示）；
+      3) 切换即互斥：切「预设」停用本地人设 + 打开档案；切「自定义」关掉档案；
+      4) 状态行三种口径都对（本地人设《…》/ 预设档案 …/ 手写人设），且切换后有话说明。
+    """
+    from PySide6.QtWidgets import QApplication, QLabel
+
+    from qbotmanager.core import persona_workshop
+    from qbotmanager.core.settings import Settings
+    from qbotmanager.tasks.task_manager import TaskManager
+    from qbotmanager.ui.pages.brain_page import BrainPage, PersonaSegment
+    from qbotmanager.ui.pages.common import PageContext
+
+    app = QApplication.instance() or QApplication([])
+    tmp = Path(tempfile.mkdtemp(prefix="qbm_persona_card_"))
+    s = Settings(tmp)
+    s.ensure_dirs()
+    s.agent_profile_enabled = False
+    s.save()
+    toasts = []
+    ctx = PageContext(s, None, TaskManager(), {"show_toast": lambda *a: toasts.append(a)})
+    bp = BrainPage(ctx)
+    app.processEvents()
+
+    # 1) 一张卡：胶囊、形态容器、状态行都在同一张卡里
+    seg = bp.persona_seg
+    assert isinstance(seg, PersonaSegment), "人设卡片顶部要有胶囊分段控件"
+    assert hasattr(bp, "persona_mode_lbl") and hasattr(bp, "persona_switch_hint")
+    assert bp._persona_panel is not None
+    assert bp._agent_panel is not bp._persona_panel
+    assert bp._persona_panel.isAncestorOf(bp._agent_panel), "档案那一块要在人设卡片里"
+    assert bp._persona_panel.isAncestorOf(bp._workshop_panel), "本地人设那一块也要在人设卡片里"
+    titles = [w.text() for w in bp.findChildren(QLabel) if w.objectName() == "sectionTitle"]
+    assert titles.count("人设与主动聊天") == 1, titles
+    assert "智能体档案" not in titles and "人设工坊（本地）" not in titles, titles
+
+    # 2) 两段 + 圆形滑块跟着走
+    assert seg._labels == ("预设", "自定义"), seg._labels
+    bp.set_persona_mode("preset", animate=False)
+    assert seg.current() == "preset" and abs(seg.offset - 0.0) < 0.001, seg.offset
+    bp.set_persona_mode("custom", animate=False)
+    assert seg.current() == "custom" and abs(seg.offset - 1.0) < 0.001, seg.offset
+    # 键盘可达：左右方向键能换段（原生分段控件的操作习惯）
+    seg.set_current("preset", animate=False)
+    seg.setFocus()
+    from PySide6.QtCore import Qt as _Qt
+    from PySide6.QtGui import QKeyEvent
+    seg.keyPressEvent(QKeyEvent(QKeyEvent.Type.KeyPress, _Qt.Key_Right, _Qt.NoModifier))
+    assert seg.current() == "custom", "右方向键应切到下一段"
+
+    # 3) 切换即互斥：先在自定义态放一个本地人设并启用
+    card = {
+        "format": "astroswarm-persona", "version": "1.0", "id": "com.demo.rose",
+        "name": "玫瑰", "summary": "测试人设", "kind": "persona-pack", "description": "测试",
+        "adapters": ["qq_official"], "min_version": "0.4.0", "permissions": [], "tools": [],
+        "identity": {"name": "玫瑰", "worldview": "测试世界"},
+        "personality": {"traits": ["冷静"], "tone": "简洁"},
+        "speech": {"self_ref": "我"}, "directives": ["保护用户"],
+        "boundaries": ["不聊违法内容"], "system_prompt": "",
+    }
+    import json as _json
+    src = tmp / "rose.json"
+    src.write_text(_json.dumps(card, ensure_ascii=False), encoding="utf-8")
+    persona_workshop.install_persona(s, src)
+    bp._refresh_persona_list()
+    bp.persona_list.setCurrentRow(0)
+    bp._activate_persona()
+    app.processEvents()
+    assert s.local_persona_id == "com.demo.rose"
+    assert seg.current() == "custom"
+    assert bp.persona_mode_lbl.text() == "当前生效：本地人设《玫瑰》", bp.persona_mode_lbl.text()
+
+    # 点胶囊「预设」：停用本地人设 + 打开预设档案
+    bp.persona_seg._pick(0)          # 相当于用户点了左半段
+    app.processEvents()
+    assert s.agent_profile_enabled is True, "切到预设应打开智能体档案"
+    assert not s.local_persona_id, "切到预设应停用本地人设（互斥）"
+    assert bp.persona_mode_lbl.text().startswith("当前生效：预设档案 "), bp.persona_mode_lbl.text()
+    assert "已切到预设" in bp.persona_switch_hint.text(), bp.persona_switch_hint.text()
+    assert any("预设" in str(t) for t in toasts), toasts
+
+    # 点胶囊「自定义」：关掉预设档案
+    bp.persona_seg._pick(1)
+    app.processEvents()
+    assert s.agent_profile_enabled is False, "切到自定义应关掉预设档案（互斥）"
+    assert bp.persona_mode_lbl.text() == "当前生效：手写人设", bp.persona_mode_lbl.text()
+    assert "已切到自定义" in bp.persona_switch_hint.text(), bp.persona_switch_hint.text()
+
+    # 4) 老按钮一个都不能少（三块的功能都还在）
+    for attr in ("btn_persona_template", "btn_persona_guide", "btn_persona_import",
+                 "btn_persona_refresh", "btn_persona_activate", "btn_persona_deactivate",
+                 "btn_persona_uninstall", "chk_agent_profile", "agent_profile_combo",
+                 "chk_proactive", "ai_proactive_targets", "ai_proactive_groups",
+                 "chk_group_chat", "chk_vision", "chk_rich_parse", "chk_self_forge",
+                 "chk_cross_platform", "chk_interject"):
+        assert hasattr(bp, attr), f"整合后少了控件：{attr}"
+
+    # 5) 自定义态里的「人格设定」输入框 +「保存人设」：与控制台同款，
+    #    写的是「设置 → 高级 → 人格设定」**同一个字段**（ai_config.save_personality）
+    from qbotmanager.core import ai_config as _ai
+    assert hasattr(bp, "personality_edit") and hasattr(bp, "btn_persona_save")
+    assert bp._workshop_panel.isAncestorOf(bp.personality_edit), "输入框要在自定义那一段里"
+    bp.set_persona_mode("custom", animate=False)
+    bp.personality_edit.setPlainText("你是阿星，冷淡又靠谱。")
+    bp.btn_persona_save.click()
+    app.processEvents()
+    assert _ai.read_personality(s) == "你是阿星，冷淡又靠谱。", _ai.read_personality(s)
+    assert "人设已保存" in bp.persona_save_hint.text(), bp.persona_save_hint.text()
+    # 同一个字段：设置页那个框读出来也是这段（不是第二份存储）
+    assert bp._loaded_persona == "你是阿星，冷淡又靠谱。"
+    bp.load_config()
+    assert bp.personality_edit.toPlainText() == "你是阿星，冷淡又靠谱。", "重新载入应回填同一份"
+
+    bp.deleteLater()
+    print("OK ui brain_persona_card_merged_with_segment")
+
+
 if __name__ == "__main__":
     test_qss()
+    test_glass_panel_has_no_screenshot_backdrop()
     test_theme_switch_keeps_page()
     test_brain_page_agent_profile_controls()
     test_brain_page_memory_and_kb_controls()
     test_brain_page_auto_restart_on_profile_change()
     test_plugins_page_restricts_third_party_install()
     test_plugins_page_market_panel_exists()
+    test_plugins_market_cards_show_description_and_installed_state()
+    test_plugins_market_search_and_category_filter()
     test_plugins_page_developer_mode_enables_zip_install()
     test_plugins_page_all_plugins_free()
     test_account_window_top_left()
     test_main_window_account_corner_entry()
     test_llbot_tutorial_bundled()
     test_settings_page_developer_mode_requires_confirm()
-    test_swiss_qss_styles_messagebox()
-    test_swiss_uses_selected_accent()
     test_primary_disabled_uses_current_accent()
     test_theme_tokens_contrast_and_sidebar()
-    test_terminal_qss()
-    test_terminal_rail_icons_centered()
     test_beginner_mode_nav()
     test_beginner_toggle_survives_appearance_error()
     test_toggle_switch_click_area()
     test_run_page_reverse_ws_panel()
-    test_free_tier_pay_entries_exist()
+    test_wechat_channel_is_free_for_everyone()
     test_access_page_lists_all_channels()
     test_qq_official_channel_restored()
     test_access_page_channel_switch_survives_refresh()
     test_run_card_follows_qq_channel_switch()
     test_channel_switch_turns_dsh_off()
     test_brain_page_ai_memory_block()
+    test_brain_persona_card_merged_with_segment()
     test_nav_groups_match_console()
     test_services_page_controls()
     test_logs_export_writes_file()
     test_message_center_shows_scene_and_room()
     test_workshop_page_basics()
+    test_update_button_states()
     test_dsh_control_buttons()
     test_brain_setup_gate_and_model_combo()
     test_workshop_setup_gate()
+    test_wheel_not_trapped_by_dropdowns()
+    test_motion_switch_controls_everything()
+    test_toast_motion_and_gate()
+    test_busy_dots_follow_long_tasks()
+    test_qq_card_follows_unsaved_channel_switch()
+    test_qq_card_shows_group_message_mode()
+    test_qq_page_has_diagnose_button()
+    test_brain_group_list_checkboxes()
+    test_brain_interject_controls_save_and_reload()
+    test_brain_points_to_session_pack()

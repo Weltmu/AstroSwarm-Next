@@ -57,7 +57,7 @@ class DeployWizard(QDialog):
         super().__init__(parent)
         self.settings = None
         self.worker = None
-        self.setWindowTitle("AstroSwarm 星群 - 首次安装")
+        self.setWindowTitle("星巢 Nest - 首次安装")
         self.setMinimumSize(760, 580)
         self._bg = QPixmap(str(ASSET_BG)) if ASSET_BG.is_file() else QPixmap()
         self._build_ui()
@@ -76,7 +76,7 @@ class DeployWizard(QDialog):
         v.setContentsMargins(24, 24, 24, 24)
         v.setSpacing(14)
 
-        title = QLabel("欢迎使用 AstroSwarm 星群\n一键部署你的多平台机器人")
+        title = QLabel("欢迎使用 星巢 Nest")
         title.setObjectName("wizardTitle")
         title.setStyleSheet("font-size: 22px; font-weight: bold;")
         v.addWidget(title)
@@ -85,10 +85,8 @@ class DeployWizard(QDialog):
         self.page_choose = QWidget()
         pv = QVBoxLayout(self.page_choose)
 
-        tip = QLabel(
-            "点一下「一键开始」就装好了，全部用推荐设置：\n"
-            "运行环境已随安装包内置，不用联网、不用选路径、不用填任何东西。"
-        )
+        tip = QLabel("点「一键开始」就装好了，全用推荐设置。")
+        tip.setToolTip("不用联网、不用选路径、不用填任何东西。")
         tip.setWordWrap(True)
         pv.addWidget(tip)
 
@@ -120,17 +118,14 @@ class DeployWizard(QDialog):
         self.chk_auto_start_services.setChecked(False)
         cv.addWidget(self.chk_auto_start_services)
 
-        self.chk_autostart = QCheckBox("开机自动启动 AstroSwarm")
+        self.chk_autostart = QCheckBox("开机自动启动 星巢")
         # 安装包（Inno 附加任务）可能已经写过自启动注册表项：以实际状态为准，
         # 否则会出现「安装时勾了、程序里没勾」的矛盾
         self.chk_autostart.setChecked(autostart_mod.is_enabled())
         cv.addWidget(self.chk_autostart)
 
-        proto_tip = QLabel(
-            "QQ 机器人通过第三方 OneBot 协议接入：\n"
-            "协议端（如 LLOneBot / Lagrange）由你自己下载安装并扫码登录，"
-            "AstroSwarm 不内置、不分发任何协议端；使用第三方协议有账号风险，请自备小号。"
-        )
+        proto_tip = QLabel("用第三方协议有账号风险，请自备小号。")
+        proto_tip.setToolTip("QQ 可走第三方 OneBot，协议端自己装。")
         proto_tip.setWordWrap(True)
         proto_tip.setStyleSheet("color: #B9C3D4; font-size: 12px;")
         cv.addWidget(proto_tip)
@@ -139,7 +134,7 @@ class DeployWizard(QDialog):
 
         eula_row = QHBoxLayout()
         eula_row.setSpacing(8)
-        eula_tip = QLabel("点「一键开始」即表示同意《用户协议与免责声明》（含第三方协议端风险说明）")
+        eula_tip = QLabel("点「一键开始」即同意《用户协议与免责声明》。")
         eula_tip.setWordWrap(True)
         eula_tip.setStyleSheet("color: #B9C3D4; font-size: 12px;")
         btn_eula = QPushButton("查看协议")
@@ -266,7 +261,7 @@ class DeployWizard(QDialog):
         QMessageBox.information(
             self, "部署完成",
             "部署完成！\n\n接下来：\n1. 在「QQ 页」填写你的 OneBot 协议端地址并保存\n"
-            "2. 保存后点击「启动全部」\n3. 在微信页扫码连接 ClawBot（可选）",
+            "2. 保存后点击「启动全部」\n3. 在微信页扫码连接 iLink（可选）",
         )
 
     def _show_eula(self):
@@ -298,11 +293,11 @@ class DeployWizard(QDialog):
         ps = (
             "$d=[Environment]::GetFolderPath('Desktop');"
             "$s=(New-Object -ComObject WScript.Shell).CreateShortcut("
-            "$d+'\\AstroSwarm 星群.lnk');"
+            "$d+'\\星巢 Nest.lnk');"
             f"$s.TargetPath='{esc_target}';"
             f"$s.WorkingDirectory='{esc_workdir}';"
             f"$s.IconLocation='{esc_target},0';"
-            "$s.Description='AstroSwarm 星群';"
+            "$s.Description='星巢 Nest';"
             "$s.Save()"
         )
         try:

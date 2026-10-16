@@ -1,0 +1,26 @@
+{
+  "id": "music",
+  "name": "网易云点歌能力包",
+  "version": "1.0.0",
+  "kind": "tool-pack",
+  "tier": "free",
+  "description": "让 AI 帮你点歌：用户说“点歌”“放首歌”“想听××”，它会去网易云搜歌并发一张音乐卡片——QQ 里可以直接点开播放，其它通道退回歌名＋链接。",
+  "adapters": ["qq", "qq_official", "wechat_ilink", "app"],
+  "min_version": "0.4.0",
+  "permissions": ["network", "send_message"],
+  "tools": [
+    {
+      "name": "song_request",
+      "description": "点歌：按歌名/关键词到网易云搜一首歌，并发送音乐卡片。用户说“点歌”“放首歌”“想听××”“来首××”这类想听歌的请求时调用；keyword 传歌名或关键词（如“起风了”“周杰伦 晴天”）。搜不到返回 not_found，由你按人设回应。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "keyword": {"type": "string", "description": "歌名或关键词，如“起风了”“周杰伦 晴天”"}
+        },
+        "required": ["keyword"]
+      },
+      "permissions": ["network", "send_message"],
+      "lifecycle": "none"
+    }
+  ]
+}

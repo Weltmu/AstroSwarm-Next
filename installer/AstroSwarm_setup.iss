@@ -9,16 +9,19 @@
 ; 不带 /DEPLOYROOT 时，机器人环境默认装到安装目录下的「机器人」子文件夹（跟着安装目录走）。
 
 #define MyAppName "AstroSwarm 星群"
-#define MyAppVersion "1.2.15"
+; 用户看得见的软件名（2026-10-10 老板改名）：快捷方式/卸载项/应用列表都用它；
+; MyAppName 仍是内部标识（安装目录默认名、注册表键），别混用。
+#define MyAppDisplay "星巢 Nest"
+#define MyAppVersion "1.2.24"
 #define MyAppExeName "AstroSwarm.exe"
 
 [Setup]
 AppId={{D3A8B1C2-9F4E-4B7A-8C5D-1E2F3A4B5C6D}
-AppName={#MyAppName}
+AppName={#MyAppDisplay}
 AppVersion={#MyAppVersion}
 AppPublisher=AstroSwarm
 DefaultDirName={localappdata}\Programs\{#MyAppName}
-DefaultGroupName={#MyAppName}
+DefaultGroupName={#MyAppDisplay}
 DisableProgramGroupPage=yes
 DisableDirPage=no
 UsePreviousAppDir=no
@@ -41,7 +44,9 @@ Name: "autostart"; Description: "开机自动启动（登录 Windows 后自动�
 Name: "autoservices"; Description: "启动程序时自动启动全部服务"; GroupDescription: "附加任务："; Check: NeedsDeploy
 
 [Files]
-Source: "..\dist\AstroSwarm.exe"; DestDir: "{app}"; Flags: ignoreversion
+; v1.2.16 起客户端由 onefile 改为 onedir（AstroSwarm.exe + _internal\ 目录），
+; 冷启动从 22~30 秒降到 2 秒上下，用户看到的安装流程完全不变。
+Source: "..\dist\AstroSwarm\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "..\dist\uninstall.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\dist_package\AstroSwarm_客户版\使用说明.docx"; DestDir: "{app}"; Flags: ignoreversion
 ; 只用于"查看用户协议"按钮，按需展开（dontcopy 不随安装复制）
@@ -60,9 +65,9 @@ Source: "..\offline\dsh\*"; DestDir: "{app}\offline\dsh"; Flags: ignoreversion r
 #endif
 
 [Icons]
-Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
-Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
-Name: "{group}\卸载 {#MyAppName}"; Filename: "{app}\uninstall.exe"
+Name: "{group}\{#MyAppDisplay}"; Filename: "{app}\{#MyAppExeName}"
+Name: "{autodesktop}\{#MyAppDisplay}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
+Name: "{group}\卸载 {#MyAppDisplay}"; Filename: "{app}\uninstall.exe"
 
 [Registry]
 ; 与程序内「设置 → 开机自动启动」写的是同一个值名（HKCU\Software\Microsoft\Windows\CurrentVersion\Run\AstroSwarm），

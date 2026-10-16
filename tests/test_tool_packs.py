@@ -319,9 +319,106 @@ def test_store_tools_return_structured_data():
     print("OK pack tools_structured_data")
 
 
+def test_param_labels_translate_english_keys():
+    """只有英文 key 的能力包（回复节奏那个）要能翻成中文名 + 说明 + 范围。"""
+    from qbotmanager.core import tool_packs
+
+    fields = tool_packs.pack_fields({"behavior": {"reply-rhythm": {
+        "busy_long_probability": 0.35,
+        "busy_long_seconds": [180, 900],
+        "busy_short_seconds": [8, 40],
+        "idle_probability": 0.1,
+        "idle_seconds": [60, 180],
+        "some_unknown_key": 7,
+    }}})
+    by_key = {f["key"]: f for f in fields}
+
+    # 截图里那 5 个英文名，一个都不许再当标题显示
+    for key in ("busy_long_probability", "busy_long_seconds", "busy_short_seconds",
+                "idle_probability", "idle_seconds"):
+        assert by_key[key]["label"] != key, f"{key} 没有中文名"
+        assert by_key[key]["help"], f"{key} 缺一句人话说明"
+
+    assert by_key["busy_long_probability"]["label"] == "「忙很久」的出现概率"
+    assert by_key["busy_long_seconds"]["label"] == "「忙很久」的回复间隔"
+    assert by_key["busy_long_seconds"]["unit"] == "秒"
+    assert tool_packs.range_hint(by_key["busy_long_seconds"]) == "可填范围 0–3600"
+
+    # 默认值是 [最小, 最大] → 区间参数；概率类是普通数字
+    assert by_key["busy_long_seconds"]["type"] == "range"
+    assert by_key["idle_seconds"]["type"] == "range"
+    assert by_key["busy_long_probability"]["type"] == "number"
+
+    # 表里没有的 key 兜底显示原名，不许报错、不许空白
+    assert by_key["some_unknown_key"]["label"] == "some_unknown_key"
+
+
+def test_pack_supplied_chinese_label_wins():
+    """包里自己写了中文名就以它为准，映射表只补空缺。"""
+    from qbotmanager.core import tool_packs
+
+    fields = tool_packs.pack_fields({"config": {"fields": [
+        {"key": "busy_long_seconds", "label": "我自己起的名字", "type": "range",
+         "default": [1, 2]},
+        {"key": "idle_seconds", "label": "idle_seconds", "default": [60, 180]},
+    ]}})
+    assert fields[0]["label"] == "我自己起的名字", "包里写好的中文名不许被覆盖"
+    assert fields[1]["label"] == "空闲时的回复间隔", "label 还是英文 key 时要翻过来"
+
+
+def test_range_param_coerce_and_save():
+    """区间参数：能存成 [最小, 最大]，反着填 / 超范围要给中文报错。"""
+    from qbotmanager.core import tool_packs
+    from qbotmanager.core.settings import Settings
+
+    tmp = Path(tempfile.mkdtemp(prefix="qbm_range_"))
+    s = Settings(tmp)
+    s.ensure_dirs()
+    packs = tool_packs.packs_dir(s)
+    packs.mkdir(parents=True, exist_ok=True)
+    pack = packs / "rhythm"
+    pack.mkdir(parents=True, exist_ok=True)
+    (pack / "manifest.json").write_text(json.dumps({
+        "id": "rhythm", "name": "回复节奏能力包", "version": "1.0.0",
+        "kind": "behavior-pack", "behavior": {"reply-rhythm": {
+            "busy_long_seconds": [180, 900], "idle_seconds": [60, 180]}},
+    }, ensure_ascii=False), encoding="utf-8")
+
+    detail = tool_packs.pack_detail(s, "rhythm")
+    field = next(f for f in detail["fields"] if f["key"] == "busy_long_seconds")
+    assert field["type"] == "range"
+    assert detail["values"]["busy_long_seconds"] == [180, 900]
+
+    # 列表 / 字符串两种写法都认
+    assert tool_packs.coerce_field(field, [80, 900]) == [80, 900]
+    assert tool_packs.coerce_field(field, "80~900") == [80, 900]
+    # 反着填：报错要说中文名（截图那种英文名不该出现在报错里）
+    try:
+        tool_packs.coerce_field(field, [900, 80])
+        raise AssertionError("最小大于最大应当被拒绝")
+    except ValueError as exc:
+        assert "「忙很久」的回复间隔" in str(exc), str(exc)
+        assert "最小不能大于最大" in str(exc)
+    # 超范围也要拦
+    try:
+        tool_packs.coerce_field(field, [10, 99999])
+        raise AssertionError("超出上限应当被拒绝")
+    except ValueError as exc:
+        assert "不能大于 3600" in str(exc), str(exc)
+
+    res = tool_packs.save_pack_config(s, "rhythm", {"busy_long_seconds": [100, 500]})
+    assert res["changed"] == {"busy_long_seconds": [100, 500]}, res
+    saved = json.loads(tool_packs.pack_config_path(s, "rhythm").read_text(encoding="utf-8"))
+    assert saved["busy_long_seconds"] == [100, 500]
+    assert tool_packs.pack_detail(s, "rhythm")["values"]["busy_long_seconds"] == [100, 500]
+
+
 if __name__ == "__main__":
     test_install_uninstall_and_env()
     test_install_needs_no_entitlement()
     test_persona_pack_writes_personality()
     test_pack_env_reply_rhythm()
     test_store_tools_return_structured_data()
+    test_param_labels_translate_english_keys()
+    test_pack_supplied_chinese_label_wins()
+    test_range_param_coerce_and_save()

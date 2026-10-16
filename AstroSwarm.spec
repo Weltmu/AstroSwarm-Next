@@ -20,15 +20,22 @@ datas = [
     ('src/qbotmanager/assets/plugins/ai', 'qbotmanager/assets/plugins/ai'),
     ('src/qbotmanager/assets/plugins/liqinghan', 'qbotmanager/assets/plugins/liqinghan'),
     ('src/qbotmanager/assets/plugins/qbm_bridge_client', 'qbotmanager/assets/plugins/qbm_bridge_client'),
+    # 随软件自带的能力包（连续对话包等）：<机器人根>/tool_packs 由 ensure_* 同步过去
+    ('src/qbotmanager/assets/tool_packs', 'qbotmanager/assets/tool_packs'),
     ('src/qbotmanager/core/agent', 'qbotmanager/core/agent'),
     # 打包版 AgentRuntime 源码副本（qbotmanager 模块在 PYZ，无法从磁盘读；放 appr/ 下由 ensure_agent_runtime 拷贝）
+    # ⚠ 2026-10-15：这里以前是**逐个文件点名**，于是每新增一个 core 模块就漏一次，
+    #    每次症状都是"网关连上了却不回消息"：
+    #      v1.2.9 漏 core/agent_profile.py；
+    #      2026-10-04 漏 core/settings.py 与 core/workshop（skill_forge 自学要用）；
+    #      2026-10-11 漏 core/memory（装机版记忆三档静默失效）；
+    #      2026-10-12 漏 assets/plugins/ai（跨平台发送报「找不到 qbotmanager.assets」）。
+    #    病根是"得记得加一行"。现改成**整目录复制**，与 ensure_agent_runtime() 的
+    #    整目录同步逻辑对齐：以后 core/ 下新增任何模块都自动带上，不必再动这里。
     ('src/qbotmanager/__init__.py', 'appr/qbotmanager'),
-    ('src/qbotmanager/core/__init__.py', 'appr/qbotmanager/core'),
-    ('src/qbotmanager/core/knowledge_base.py', 'appr/qbotmanager/core'),
-    # v1.2.9：agent_profile.py 只进了同步清单、没进 appr/，打包版
-    # src.exists() 为假被静默跳过 —— 用户机器上照样 ModuleNotFoundError。
-    ('src/qbotmanager/core/agent_profile.py', 'appr/qbotmanager/core'),
-    ('src/qbotmanager/core/agent', 'appr/qbotmanager/core/agent'),
+    ('src/qbotmanager/core', 'appr/qbotmanager/core'),
+    # runtime 会 import 插件的 cross_platform/skill_forge，整目录带上
+    ('src/qbotmanager/assets/plugins/ai', 'appr/qbotmanager/assets/plugins/ai'),
     ('src/qbotmanager/assets/dsh_plugins', 'qbotmanager/assets/dsh_plugins'),
     ('src/qbotmanager/assets/llbot_tutorial', 'qbotmanager/assets/llbot_tutorial'),
     ('src/qbotmanager/assets/persona_template', 'qbotmanager/assets/persona_template'),
@@ -95,12 +102,17 @@ if _junk:
 
 pyz = PYZ(a.pure)
 
+# ---- v1.2.16：onefile → onedir（冷启动 22~30 秒 → 2 秒上下）----
+# onefile 每次启动都要把 ~451 MB 解压到 %TEMP%\_MEIxxxxxx，冷启动实测 22~30 秒，
+# 被任务管理器强杀还会在用户盘上留 450 MB 残留。改 onedir 后 exe 直接从
+# dist\AstroSwarm\_internal\ 加载，不再解压。
+# 用户侧安装体验不变：Inno 把 dist\AstroSwarm\ 整目录铺进 {app}，
+# 还是下载一个 AstroSwarm_Setup.exe 双击安装（便携版从单个 exe 变成一个文件夹）。
 exe = EXE(
     pyz,
     a.scripts,
-    a.binaries,
-    a.datas,
     [],
+    exclude_binaries=True,
     name='AstroSwarm',
     debug=False,
     bootloader_ignore_signals=False,
@@ -115,4 +127,14 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
     icon='D:/ai/QBotManager/assets/logo.ico',
+)
+
+coll = COLLECT(
+    exe,
+    a.binaries,
+    a.datas,
+    strip=False,
+    upx=True,
+    upx_exclude=[],
+    name='AstroSwarm',
 )

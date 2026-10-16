@@ -12,6 +12,7 @@
 """
 from . import (  # noqa: F401
     config,
+    estimator,
     generator,
     installer,
     prompts,
@@ -20,7 +21,7 @@ from . import (  # noqa: F401
     validator,
 )
 
-__all__ = ["config", "generator", "installer", "prompts", "validator",
+__all__ = ["config", "estimator", "generator", "installer", "prompts", "validator",
            "publisher", "repair",
            "active_channels", "status", "build", "install", "generated",
            "history", "rollback", "uninstall", "collect_existing",

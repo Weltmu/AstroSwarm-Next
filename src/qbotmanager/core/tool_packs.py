@@ -40,7 +40,7 @@ def _find_manifest(pack_dir: Path):
 FREE_PACK_IDS = {
     "eva", "liqinghan", "qweather",
     "proactive", "memory", "knowledge", "web-search",
-    "timer", "group-manager", "reply-rhythm",
+    "timer", "group-manager", "reply-rhythm", "session-chat", "music",
 }
 # 已无付费包；保留这个空集合，给外部脚本/旧代码一个稳定的判空入口
 PAID_PACK_IDS: set = set()
@@ -175,6 +175,9 @@ def pack_env(settings) -> dict:
     # 主动聊天能力包：装了并允许加载后让 ai 插件导入它的实现
     if "proactive" in allowed:
         env["ASTROSWARM_PACK_PROACTIVE"] = "1"
+    # 连续对话能力包：装了就让 ai 插件去读它的参数（免@连续对话的开关/模式/有效期）
+    if "session-chat" in allowed:
+        env["ASTROSWARM_PACK_SESSION_CHAT"] = "1"
     return env
 
 
@@ -200,11 +203,164 @@ def _read_json(path: Path) -> dict:
     return data if isinstance(data, dict) else {}
 
 
+# ---- 参数中文名 / 说明 / 取值范围 ----
+# 用户看到的是这一张表：英文 key 只当内部标识（排查时用）。
+# 表里没有的 key 就原样显示原名（不影响功能，加一行就能补上）。
+# 字段含义：label=中文名, help=一句人话, unit=单位, type=控件类型(range=区间),
+#           min/max/step=允许范围（号码类）, hint=额外提示
+PACK_PARAM_LABELS: dict = {
+    # 回复节奏能力包（manifest 里只有 behavior，没有中文名，界面上原来是一串英文）
+    "busy_long_probability": {
+        "label": "「忙很久」的出现概率", "help": "0~1 之间的小数，越大越常出现隔几分钟才回的情况。",
+        "type": "number", "min": 0, "max": 1, "step": 0.01,
+    },
+    "busy_long_seconds": {
+        "label": "「忙很久」的回复间隔", "unit": "秒",
+        "help": "填一个区间（最小~最大），例如 180~900：这类回复会在 3 到 15 分钟之间随机挑一个时间回。",
+        "type": "range", "min": 0, "max": 3600, "step": 1,
+    },
+    "busy_short_seconds": {
+        "label": "「忙一小会儿」的回复间隔", "unit": "秒",
+        "help": "区间，例如 8~40：偶尔慢半拍再回，别显得秒回很机械。",
+        "type": "range", "min": 0, "max": 3600, "step": 1,
+    },
+    "idle_probability": {
+        "label": "「空闲慢半拍」的出现概率", "help": "0~1 之间的小数，越大越常出现下面那个空闲间隔。",
+        "type": "number", "min": 0, "max": 1, "step": 0.01,
+    },
+    "idle_seconds": {
+        "label": "空闲时的回复间隔", "unit": "秒",
+        "help": "区间，例如 60~180：闲着的时候隔 1 到 3 分钟再回。",
+        "type": "range", "min": 0, "max": 3600, "step": 1,
+    },
+}
+
+
+# 行为块的中文名（详情页「功能」列表用；没有的块回落显示原名）
+PACK_BEHAVIOR_LABELS = {
+    "reply-rhythm": "回复节奏",
+    "session-chat": "连续对话（免 @ 也能接着聊）",
+}
+
+# 连续对话能力包的参数中文名（manifest 里已经写了中文 label，这里做兜底，
+# 万一哪天 manifest 只留了英文 key，界面也不会变成一串英文）
+PACK_PARAM_LABELS.update({
+    "enabled": {"label": "开启免 @ 连续对话", "type": "bool",
+                "help": "关掉后：群里只有 @ 它才回，其余消息一律不理。"},
+    "mode": {"label": "怎么判断该不该接话", "type": "enum",
+             "options": [
+                 {"value": "timeout", "label": "超时断开（推荐：说一会儿自动停）"},
+                 {"value": "api", "label": "读群聊天记录判断（每条都问一次 AI，费 token）"},
+             ]},
+    "expire_seconds": {"label": "连续对话有效期", "unit": "秒", "type": "number",
+                       "min": 30, "max": 300, "step": 10},
+    "unrelated_limit": {"label": "连着几句无关就停", "unit": "句", "type": "number",
+                        "min": 1, "max": 20, "step": 1},
+})
+
+
+def param_label(key: str) -> dict:
+    """取一个参数的中文名/说明/范围（没有就返回空 dict，界面兜底显示原名）。"""
+    return dict(PACK_PARAM_LABELS.get(str(key or "")) or {})
+
+
+def _looks_like_range(value) -> bool:
+    """默认值是 [最小, 最大] 这种两元列表 → 区间参数。"""
+    return (isinstance(value, (list, tuple)) and len(value) == 2
+            and all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in value))
+
+
+def decorate_field(field: dict) -> dict:
+    """给一个参数字段补上中文名/说明/范围；已经写好的（例如包里自带中文 label）不动。
+
+    规则：
+      · label 缺失、或者 label 就是英文 key → 用映射表里的中文名；
+      · help/unit/min/max/step 缺就补，绝不覆盖包里显式写好的值；
+      · type 缺失时：默认值是两元列表 → range，否则按 number/text。
+    """
+    out = dict(field or {})
+    key = str(out.get("key") or "")
+    meta = param_label(key)
+    label = str(out.get("label") or "").strip()
+    if not label or label == key:
+        out["label"] = str(meta.get("label") or label or key)
+    for name in ("help", "unit", "min", "max", "step"):
+        if out.get(name) in (None, "") and meta.get(name) not in (None, ""):
+            out[name] = meta[name]
+    ftype = str(out.get("type") or "").strip()
+    if not ftype:
+        if _looks_like_range(out.get("default")):
+            ftype = "range"
+        elif isinstance(out.get("default"), bool):
+            ftype = "bool"
+        elif isinstance(out.get("default"), (int, float)):
+            ftype = "number"
+        else:
+            ftype = "text"
+    if ftype == "number" and _looks_like_range(out.get("default")):
+        ftype = "range"                      # 值本身是区间 → 按区间编辑
+    if ftype == "number" and str(meta.get("type") or "") == "range":
+        ftype = "range"
+    out["type"] = ftype
+    return out
+
+
+def split_range(raw, field: dict | None = None) -> tuple:
+    """把区间值拆成 (最小, 最大)。
+
+    认这几种写法：[80, 900] / "80~900" / "80-900" / "80,900" / (80, 900)；
+    认不出来时回落到字段的 min/max（再不行给 0/0），保证界面不会崩。
+    """
+    f = field or {}
+    lo_fallback = f.get("min")
+    hi_fallback = f.get("max")
+    nums = []
+    if isinstance(raw, (list, tuple)) and len(raw) >= 2:
+        nums = list(raw[:2])
+    elif isinstance(raw, str):
+        text = raw.replace("，", ",").replace("—", "-").replace("－", "-")
+        for sep in ("~", "-", ",", " "):
+            if sep in text:
+                nums = [p for p in text.replace("-", "~").split("~") if p.strip()] if sep == "-" else \
+                       [p for p in text.split(sep) if p.strip()]
+                break
+    out = []
+    for idx in range(2):
+        value = None
+        if idx < len(nums):
+            try:
+                value = float(str(nums[idx]).strip())
+            except (TypeError, ValueError):
+                value = None
+        if value is None:
+            fallback = lo_fallback if idx == 0 else hi_fallback
+            value = float(fallback) if isinstance(fallback, (int, float)) else 0.0
+        out.append(value)
+    return (out[0], out[1])
+
+
+def range_hint(field: dict) -> str:
+    """"可填范围 60–900" 这种提示；没有范围就返回空串。"""
+    f = field or {}
+    lo, hi = f.get("min"), f.get("max")
+    if not isinstance(lo, (int, float)) or not isinstance(hi, (int, float)):
+        return ""
+    def fmt(v):
+        return str(int(v)) if float(v) == int(v) else str(v)
+    return f"可填范围 {fmt(lo)}–{fmt(hi)}"
+
+
+
 def pack_fields(manifest: dict) -> list:
-    """参数 schema：manifest.config.fields（没有就按 behavior 的键造一份）。"""
+    """参数 schema：manifest.config.fields（没有就按 behavior 的键造一份）。
+
+    两种情况都会过一遍 `decorate_field`：包里写了中文名就尊重它，
+    只写了英文 key（回复节奏那个包就是）就用映射表翻成中文 + 说明 + 范围。
+    默认值是 [最小, 最大] 的自动认成区间参数（range）。
+    """
     fields = ((manifest or {}).get("config") or {}).get("fields") or []
     if fields:
-        return list(fields)
+        return [decorate_field(f) for f in fields if isinstance(f, dict)]
     out = []
     for _, block in ((manifest or {}).get("behavior") or {}).items():
         if isinstance(block, dict):
@@ -213,9 +369,12 @@ def pack_fields(manifest: dict) -> list:
                     kind = "bool"
                 elif isinstance(value, (int, float)):
                     kind = "number"
+                elif _looks_like_range(value):
+                    kind = "range"
                 else:
                     kind = "text"
-                out.append({"key": key, "label": key, "type": kind, "default": value})
+                out.append(decorate_field(
+                    {"key": key, "label": key, "type": kind, "default": value}))
     return out
 
 
@@ -229,8 +388,10 @@ def pack_features(manifest: dict) -> list:
                           "desc": str(tool.get("description") or "")})
     for name, block in (manifest.get("behavior") or {}).items():
         if isinstance(block, dict):
-            feats.append({"title": str(name),
-                          "desc": "行为参数：" + "、".join(block.keys())})
+            # 「功能」这一行人也要说中文：以前直接列英文参数名，等于换个地方再糊一次脸
+            names = [str(param_label(k).get("label") or k) for k in block.keys()]
+            feats.append({"title": PACK_BEHAVIOR_LABELS.get(str(name), str(name)),
+                          "desc": "可调参数：" + "、".join(names)})
     for name, block in (manifest.get("schedule") or {}).items():
         if isinstance(block, dict):
             feats.append({"title": f"计划任务 · {name}",
@@ -302,6 +463,18 @@ def coerce_field(field: dict, raw):
         if val == int(val) and float(field.get("step") or 1) >= 1:
             return int(val)
         return val
+    if ftype in ("range", "range_pair"):
+        lo, hi = split_range(raw, field)
+        lo_bound, hi_bound = field.get("min"), field.get("max")
+        for name, val in (("最小", lo), ("最大", hi)):
+            if lo_bound is not None and val < float(lo_bound):
+                raise ValueError(f"{label}：{name}不能小于 {lo_bound}")
+            if hi_bound is not None and val > float(hi_bound):
+                raise ValueError(f"{label}：{name}不能大于 {hi_bound}")
+        if lo > hi:
+            raise ValueError(f"{label}：最小不能大于最大（现在填的是 {lo:g} 和 {hi:g}）")
+        integral = float(field.get("step") or 1) >= 1
+        return [int(lo), int(hi)] if integral else [lo, hi]
     if ftype in ("enum", "select"):
         options = field.get("options") or []
         vals = [o.get("value") if isinstance(o, dict) else o for o in options]

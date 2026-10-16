@@ -7,7 +7,7 @@ from PySide6.QtWidgets import (
 
 from ...tasks.workers import CheckDepsTask, InstallPluginTask
 from ..theme import TEXT_3
-from ..widgets import GlassPanel
+from ..widgets import GlassPanel, set_busy
 from .common import PageContext, TaskPanel
 
 DEPS_TASK_NAMES = ("检查插件依赖", "安装依赖")
@@ -31,7 +31,7 @@ class DepsPage(QWidget):
 
         title = QLabel("依赖管理")
         title.setObjectName("pageTitle")
-        sub = QLabel("扫描 src/plugins 下所有插件声明的依赖，检测缺失并一键安装（清华镜像，失败自动切官方源）")
+        sub = QLabel("扫描插件依赖，缺什么一键装上。")
         sub.setObjectName("pageSub")
         outer.addWidget(title)
         outer.addWidget(sub)
@@ -43,7 +43,7 @@ class DepsPage(QWidget):
         self.summary = QLabel("尚未扫描")
         self.summary.setObjectName("value")
         sv.addWidget(self.summary)
-        hint = QLabel("扫描过程在后台任务中执行，页面不会卡顿；发现缺失依赖后会显示在下方清单中。")
+        hint = QLabel("扫描在后台进行，缺失的会列在下面。")
         hint.setWordWrap(True)
         hint.setStyleSheet(f"color: {TEXT_3}; font-size: 12px;")
         sv.addWidget(hint)
@@ -102,10 +102,15 @@ class DepsPage(QWidget):
             self._task_tid = tid
             self.task_panel.bind(tid)
             self.task_panel.setVisible(True)
+            # 扫依赖 / 装依赖都要等，给个在跑的信号
+            set_busy(self.summary, True)
+            set_busy(self.btn_install, True)
 
     def _on_task_finished(self, tid, status, result):
         if tid != self._task_tid:
             return
+        set_busy(self.summary, False)
+        set_busy(self.btn_install, False)
         self.task_panel.bind(tid)
         st = self.ctx.tasks.get(tid)
         name = st.task_name if st else ""

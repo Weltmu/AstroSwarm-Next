@@ -10,6 +10,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -75,7 +76,9 @@ def test_to_data_c2c():
     assert data["message_type"] == "private"
     assert data["user_id"] == "o_openid_1"
     assert data["message_id"] == "msg_abc123"
-    assert data["source"] == "qq:c2c"
+    # 2026-10-16：标注统一成 qq_official:*（审计 platform/E #55）—— 本插件只收官方
+    # QQ 事件，旧标签 `qq:c2c` 是 OneBot 的号，能力矩阵/记忆 key 会跟着走错行。
+    assert data["source"] == "qq_official:c2c"
     assert data["raw_message"] == "你好呀"
     assert data["sender"]["nickname"] == "小李"
     assert data["message"][0]["type"] == "text"
@@ -88,7 +91,7 @@ def test_to_data_group_injects_at_when_to_me():
     data = qq.to_data(ev, bot_qq="bot_id")
     assert data["message_type"] == "group"
     assert data["group_id"] == "o_group_9"
-    assert data["source"] == "qq:group"
+    assert data["source"] == "qq_official:group"
     ats = [s for s in data["message"] if s["type"] == "at"]
     assert ats and ats[0]["data"]["qq"] == "bot_id"
 
@@ -322,6 +325,41 @@ def test_capabilities_qq_group_keeps_admin():
     assert set(tools) == {"mute_user", "mute_all", "recall_message", "game_guess", "remember"}
 
 
+def test_config_persona_extra_accepts_prefixed_key(tmp_path, monkeypatch):
+    """档案页写的「.env 里用 QBM_AGENT_PERSONA_EXTRA 追加人设补充」必须真认这个键。
+
+    2026-10-16：以前 `persona_extra` 只认裸键 PERSONA_EXTRA —— 说明与实现对不上
+    （和 2026-10-11 修过的 OWNER_QQ/ADDRESS_WORDS 一模一样的坑）。现在带前缀的
+    键优先、裸键继续兼容。
+    """
+    for k in ("QBM_AGENT_PERSONA_EXTRA", "AGENT_PERSONA_EXTRA"):
+        monkeypatch.delenv(k, raising=False)
+    cfgmod = _load_module("lqh_cfg_extra", "config.py")
+    env = tmp_path / ".env"
+    env.write_text("QBM_AGENT_PERSONA_EXTRA=说话要短、别啰嗦\n", encoding="utf-8")
+    assert cfgmod.Config(env).persona_extra == "说话要短、别啰嗦"
+    env2 = tmp_path / ".env2"
+    env2.write_text("PERSONA_EXTRA=裸键也认\n", encoding="utf-8")
+    assert cfgmod.Config(env2).persona_extra == "裸键也认"
+
+
+def test_capabilities_official_channel_has_admin_but_no_proactive():
+    """官方通道行（qq_official:*）与程序侧口径对齐：群管给、主动不给（2026-10-16）。
+
+    · `group_admin`：给 —— 李清菡只接官方 QQ，事件带 member_role，安全闸在 _mute；
+    · `proactive`：**不给** —— 官方主动消息按日限额度（core/agent_profile.py 同口径），
+      所以 `set_reminder`（到点主动发消息）在官方通道上要被裁掉；
+    · 顺带确认 `qq_official:group` 这条真的在上面的表里：矩阵对未知通道返回空集，
+      少了它 enabled_tools 会把工具全裁光（插件静默变傻）。
+    """
+    caps = _load_module("lqh_caps3", "capabilities.py")
+    tools = caps.enabled_tools("qq_official:group", [
+        "mute_user", "mute_all", "set_reminder", "recall_message", "game_guess", "remember"])
+    assert set(tools) == {"mute_user", "mute_all", "recall_message", "game_guess", "remember"}
+    tools_c2c = caps.enabled_tools("qq_official:c2c", ["set_reminder", "game_guess"])
+    assert tools_c2c == ["game_guess"]
+
+
 # ---------------------------------------------------------------- 程序侧接线
 def test_agent_profile_drops_qq_face():
     """官方 QQ 无 CQ 表情代码，qq_face 能力与 send_face 工具应被裁剪。"""
@@ -412,7 +450,7 @@ def test_qq_adapter_enabled_with_agent_and_dsh():
 
 
 def test_qq_adapter_not_enabled_for_star_helper():
-    """星群助手档案不接管 QQ：dsh 开启时仍由 dsh 接管，不应注册 QQ 适配器。"""
+    """星巢助手档案不接管 QQ：dsh 开启时仍由 dsh 接管，不应注册 QQ 适配器。"""
     from qbotmanager.core import bot
     tmp = Path(tempfile.mkdtemp(prefix="qbm_star_"))
     s = _agent_settings(tmp)
@@ -546,9 +584,74 @@ def test_config_persona_name_follows_mode():
     }, clear=False):
         assert config_mod.Config(None).persona_name == "李清菡"
     with mock.patch.dict(os.environ, {
-        "QBM_AGENT_PERSONA_NAME": "星群助手",
+        "QBM_AGENT_PERSONA_NAME": "星巢助手",
     }, clear=False):
-        assert config_mod.Config(None).persona_name == "星群助手"
+        assert config_mod.Config(None).persona_name == "星巢助手"
+
+
+def test_config_reads_prefixed_keys_from_env_file(tmp_path):
+    """**只写 .env、不设进程环境变量**时，主人 QQ / 唤醒词也必须生效。
+
+    2026-10-11 修的真 bug：程序侧 `core.bot.write_env()` 往机器人 `.env` 写的是
+    `QBM_AGENT_OWNER_QQ=` / `QBM_AGENT_ADDRESS_WORDS=`，而 `Config` 原来只查
+    `raw.get("OWNER_QQ")` —— 两个名字对不上，这条路上主人 QQ / 唤醒词**从来没生效过**
+    （界面改了、.env 也写了，机器人读到的还是空/内置默认）。这条用例把它钉住。
+    """
+    from unittest import mock
+
+    config_mod = _load_module("qbm_liqinghan_config_prefixed", "config.py")
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "ENVIRONMENT=prod\n"
+        "QBM_AGENT_PROFILE_ENABLED=1\n"
+        "QBM_AGENT_OWNER_QQ=1000000002\n"
+        "QBM_AGENT_ADDRESS_WORDS=李清菡,学姐,菡菡\n"
+        "QBM_AGENT_BOT_ID=1000000001\n",
+        encoding="utf-8",
+    )
+    # 关键：进程环境变量里**一个都没有**（只靠 .env 文件）
+    clear = {k: "" for k in ("QBM_AGENT_OWNER_QQ", "OWNER_QQ",
+                             "QBM_AGENT_ADDRESS_WORDS", "ADDRESS_WORDS",
+                             "QBM_AGENT_BOT_ID", "BOT_QQ")}
+    with mock.patch.dict(os.environ, clear, clear=False):
+        cfg = config_mod.Config(str(env_file))
+    assert cfg.owner_qq == "1000000002", "只写 .env 时主人 QQ 没生效"
+    assert cfg.address_words == ["李清菡", "学姐", "菡菡"], \
+        f"只写 .env 时唤醒词没生效：{cfg.address_words}"
+    assert cfg.bot_qq == "1000000001", "只写 .env 时机器人自己的 id 没生效"
+
+    # 热重载这条路也要认（改 .env 立即生效，不用重启）
+    env_file.write_text(
+        "QBM_AGENT_OWNER_QQ=9999999999\n"
+        "QBM_AGENT_ADDRESS_WORDS=热重载探针词\n",
+        encoding="utf-8",
+    )
+    os.utime(env_file, (time.time() + 5, time.time() + 5))
+    with mock.patch.dict(os.environ, clear, clear=False):
+        assert cfg.maybe_reload() is True
+        assert cfg.owner_qq == "9999999999"
+        assert "热重载探针词" in cfg.address_words
+
+
+def test_config_prefixed_key_wins_over_bare_key(tmp_path):
+    """两种键名同时存在时**带前缀的优先**（那是程序侧真正写进去的那个）。"""
+    from unittest import mock
+
+    config_mod = _load_module("qbm_liqinghan_config_prio", "config.py")
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "OWNER_QQ=1111111111\n"
+        "QBM_AGENT_OWNER_QQ=1000000002\n"
+        "ADDRESS_WORDS=旧称呼\n"
+        "QBM_AGENT_ADDRESS_WORDS=李清菡\n",
+        encoding="utf-8",
+    )
+    clear = {k: "" for k in ("QBM_AGENT_OWNER_QQ", "OWNER_QQ",
+                             "QBM_AGENT_ADDRESS_WORDS", "ADDRESS_WORDS")}
+    with mock.patch.dict(os.environ, clear, clear=False):
+        cfg = config_mod.Config(str(env_file))
+    assert cfg.owner_qq == "1000000002"
+    assert cfg.address_words == ["李清菡"]
 
 
 def test_eva_persona_defines_peer_line():

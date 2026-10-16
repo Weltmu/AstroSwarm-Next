@@ -37,7 +37,7 @@ class MessageCenterPage(QWidget):
 
         title = QLabel("消息中心")
         title.setObjectName("pageTitle")
-        sub = QLabel("跨平台会话时间线：QQ 群/私聊 与 微信 ClawBot 统一查看")
+        sub = QLabel("QQ 群、私聊与微信 iLink 会话都在这里。")
         sub.setObjectName("pageSub")
         outer.addWidget(title)
         outer.addWidget(sub)
@@ -71,9 +71,10 @@ class MessageCenterPage(QWidget):
             "QListWidget::item{padding:7px 10px;border-bottom:1px solid rgba(42,58,82,0.4);}"
         )
         gv.addWidget(self.list)
-        outer.addWidget(glass, 1)
+        # 空态放进面板内部居中显示：原来挂在页面底部，会被窗口下边缘裁掉半行字
         self.empty = EmptyState("暂无会话", "机器人尚未产生对话记录（需启用内置 AI 插件）")
-        outer.addWidget(self.empty)
+        gv.addWidget(self.empty, 1)
+        outer.addWidget(glass, 1)
 
     def refresh(self):
         platform = self.filter_combo.currentData() or ""

@@ -90,6 +90,68 @@ export function StatsPanel({ loggedIn = true }) {
 }
 
 /**
+ * 首页「今日数据」（与桌面端 home_page.py 同一个标题、同一套行项目）：
+ * 消息总数 / AI 调用 / MCP 服务器 / 记忆条数 / 身份绑定。
+ *
+ * 数据源还是 GET /api/stats/summary（同一份真数据）。无头端没有"AI 调用次数"这个计数，
+ * 照桌面端的做法显示「—」，不编一个数字出来；未登录/读不到就照实说，不留白屏。
+ */
+export function TodayStats({ loggedIn = true }) {
+  const [st, setSt] = useState(null);
+  const [err, setErr] = useState('');
+  // 未登录时第一帧就写「登录后显示」，不要先闪一下「读取中…」（那个请求本来就不会发）
+  const [needLogin, setNeedLogin] = useState(!loggedIn);
+
+  useEffect(() => {
+    let alive = true;
+    if (!loggedIn) {                       // 没登录就别发这个必 401 的请求
+      setSt(null);
+      setErr('');
+      setNeedLogin(true);
+      return undefined;
+    }
+    get('/api/stats/summary')
+      .then((d) => { if (alive) { setSt(d); setErr(''); setNeedLogin(false); } })
+      .catch((e) => {
+        if (!alive) return;
+        setSt(null);
+        if (isAuthError(e)) { setNeedLogin(true); setErr(''); } else { setNeedLogin(false); setErr(e.message); }
+      });
+    return () => { alive = false; };
+  }, [loggedIn]);
+
+  // 读不到时不留空：每一行都说清楚是「读取中」还是「暂不可用」
+  const note = err ? '暂不可用' : needLogin ? '登录后显示' : '读取中…';
+  const rows = st
+    ? [
+        ['消息总数', String(st.messages ?? 0)],
+        ['AI 调用', '—'],
+        ['MCP 服务器', `${st.mcp_servers ?? 0} 个${st.mcp_enabled ? '（已开启）' : '（未开启）'}`],
+        ['记忆条数', `${st.memory_global ?? 0} 条 · ${st.memory_users ?? 0} 个用户`],
+        ['身份绑定', String(st.identity_binds ?? 0)],
+      ]
+    : [
+        ['消息总数', note],
+        ['AI 调用', note],
+        ['MCP 服务器', note],
+        ['记忆条数', note],
+        ['身份绑定', note],
+      ];
+
+  return (
+    <div className="stat-rows">
+      {rows.map(([label, value]) => (
+        <div className="stat-row" key={label}>
+          <span>{label}</span>
+          <b>{value}</b>
+        </div>
+      ))}
+      {err && <p className="card__note">{`今日数据读取失败：${err}`}</p>}
+    </div>
+  );
+}
+
+/**
  * 最近消息（P4）。
  *
  * 数据源：GET /api/messages/list（message_store 的会话索引，只回标量字段）。
@@ -149,7 +211,7 @@ export function RecentMessages({ onOpen, loggedIn = true }) {
           </button>
         ))
       ) : (
-        <div className="recent-list__empty">还没有消息记录：机器人收到过消息后这里会出现会话。</div>
+        <div className="recent-list__empty">还没有消息记录。</div>
       )}
     </div>
   );

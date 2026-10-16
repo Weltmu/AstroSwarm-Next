@@ -210,3 +210,77 @@ def test_memory_concurrent_deletes_do_not_lose_updates(env):
     # 没有被删重（还是 42 条互不相同的记录）
     assert len(set(data["global"])) == 42
     assert [p.name for p in env["mem"].parent.glob("*.tmp*")] == []
+
+
+# ---- 内置记忆（程序侧三档那套）：/api/memory/builtin ----
+# 这一组是 2026-10-11 新增的：控制台「现在记住了什么」读的是内置记忆库，
+# 不是上面那个 aichat_memory.json。**必须喂真数据跑一遍**——空库跑不出
+# 「SELECT DISTINCT qq ... ORDER BY MAX(id)」那种 SQL 错误（线上真踩过）。
+
+def test_builtin_memory_requires_auth():
+    assert client.get("/api/memory/builtin").status_code == 401
+    assert client.post("/api/memory/builtin/forget", json={"qq": "1"}).status_code == 401
+
+
+@pytest.fixture()
+def builtin(tmp_path, monkeypatch):
+    from qbotmanager.core import memory as memory_mod
+    db = tmp_path / "astroswarm_memory.db"
+    monkeypatch.setenv("ASTROSWARM_MEMORY_DB", str(db))
+    monkeypatch.setenv("ASTROSWARM_MEMORY_LEVEL", "smart")
+    memory_mod.reset_store(db)
+    # 与上面那组同一个套路：账号配置里放一个真 token，_require_auth 才认
+    headless_config.save({**headless_config.load(), "account_token": TOKEN})
+    yield memory_mod
+    memory_mod.reset_store(None)
+    memory_mod.set_level("basic")
+
+
+def _auth_headers():
+    return {"Authorization": f"Bearer {TOKEN}"}
+
+
+def test_builtin_memory_overview_with_real_rows(builtin, tmp_path, monkeypatch):
+    """有真数据时也要 200：条数对得上、按人分组、档位说明齐全。"""
+    builtin.remember("10001", "他妈妈住院了需要人陪", weight=4)
+    builtin.remember("10001", "他答应我周三把书还我")
+    builtin.remember("10002", "她喜欢喝美式咖啡")
+    res = client.get("/api/memory/builtin", headers=_auth_headers())
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert body["level"] == "smart" and body["level_label"] == "智能"
+    assert body["total"] == 3 and body["promises"] == 1
+    assert {r["qq"] for r in body["rows"]} == {"10001", "10002"}
+    assert len([r for r in body["rows"] if r["qq"] == "10001"]) == 2
+    assert body["level_note"] and len(body["options"]) == 3
+    # 只看某个人
+    one = client.get("/api/memory/builtin", params={"qq": "10002"},
+                     headers=_auth_headers()).json()
+    assert [r["fact"] for r in one["rows"]] == ["她喜欢喝美式咖啡"]
+
+
+def test_builtin_memory_forget_endpoint(builtin):
+    builtin.remember("10001", "他讨厌香菜这件事")
+    res = client.post("/api/memory/builtin/forget",
+                      json={"qq": "10001", "fact": "他讨厌香菜这件事"},
+                      headers=_auth_headers())
+    assert res.status_code == 200, res.text
+    assert res.json()["count"] == 1
+    left = client.get("/api/memory/builtin", params={"qq": "10001"},
+                      headers=_auth_headers()).json()
+    assert left["rows"] == []
+    # 缺 qq → 400（真删接口不能猜对象）
+    assert client.post("/api/memory/builtin/forget", json={},
+                       headers=_auth_headers()).status_code == 400
+
+
+def test_builtin_memory_off_level_reports_empty(builtin):
+    builtin.remember("10001", "这条在写的时候就得先关掉档位")
+    builtin.set_level("off")
+    builtin.remember("10001", "off 档不该写进去")
+    body = client.get("/api/memory/builtin", headers=_auth_headers()).json()
+    assert body["level"] == "off" and body["rows"] == []
+    # off 档下的「忘掉」要明确拒绝，而不是假装删了
+    res = client.post("/api/memory/builtin/forget", json={"qq": "10001"},
+                      headers=_auth_headers())
+    assert res.status_code == 400

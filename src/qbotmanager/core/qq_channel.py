@@ -9,6 +9,8 @@
    不分发任何协议端；账号风险由用户自担）。
 """
 import ctypes
+import os
+import sys
 from abc import ABC, abstractmethod
 
 from . import bot as bot_mod
@@ -16,8 +18,24 @@ from .exceptions import CancelledError
 
 
 def _pid_alive(pid) -> bool:
+    """进程是否还活着（Windows: OpenProcess；Linux: os.kill(pid, 0)）。
+
+    2026-10-11 Linux 同步：原实现只有 `ctypes.windll.kernel32`，Linux 上
+    `ctypes.windll` 不存在 → 异常被吞 → **永远返回 False**（按端口兜底清理
+    与运行记录停进程都会因此静默失效）。Windows 分支一个字未改。
+    """
     if not pid:
         return False
+    if not sys.platform.startswith("win"):
+        try:
+            os.kill(int(pid), 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True          # 存在但没权限发信号
+        except Exception:        # noqa: BLE001
+            return False
+        return True
     try:
         PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
         h = ctypes.windll.kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))

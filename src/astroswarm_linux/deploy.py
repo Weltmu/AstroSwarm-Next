@@ -164,6 +164,13 @@ def build_settings() -> Settings:
     s.qq_onebot_path = cfg.get("qq_onebot_path") or "/onebot/v11/ws"
     s.qq_onebot_token = cfg.get("qq_onebot_token") or ""
     s.qq_onebot_listen_host = cfg.get("qq_onebot_listen_host") or "127.0.0.1"
+    # 飞书通道（2026-10-04 加）：这 5 个键以前没映射，控制台里填了也进不了机器人 .env
+    # （机器人侧要在 build_env_text 里拼 FEISHU_BOTS），表现为"填好了却不生效"。
+    s.feishu_enabled = bool(cfg.get("feishu_enabled"))
+    s.feishu_app_id = str(cfg.get("feishu_app_id") or "")
+    s.feishu_app_secret = str(cfg.get("feishu_app_secret") or "")
+    s.feishu_encrypt_key = str(cfg.get("feishu_encrypt_key") or "")
+    s.feishu_verification_token = str(cfg.get("feishu_verification_token") or "")
     s.agent_profile_enabled = bool(cfg.get("agent_profile_enabled"))
     s.agent_profile_id = cfg.get("agent_profile_id") or "star_helper"
     # 桌面端字段名是 agent_owner_openid（官方通道存 openid，OneBot 通道就是 QQ 号），
@@ -171,7 +178,9 @@ def build_settings() -> Settings:
     s.agent_owner_openid = str(
         cfg.get("agent_owner_qq") or cfg.get("agent_owner_openid") or ""
     )
-    _words = str(cfg.get("agent_address_words") or "").replace("，", ",")
+    # 控制台「唤醒词」写的是 agent_wake_words（与桌面端同名字段）；
+    # agent_address_words 是旧键，兼容保留。（2026-10-12 Windows->Linux 同步）
+    _words = str(cfg.get("agent_wake_words") or cfg.get("agent_address_words") or "").replace("，", ",")
     if _words.strip():
         s.agent_wake_words = [w.strip() for w in _words.split(",") if w.strip()]
     s.ai_enabled = bool(cfg.get("ai_api_key"))
@@ -277,6 +286,13 @@ def _env(settings: Settings) -> dict:
     except Exception:  # noqa: BLE001
         pass
     env["ASTROSWARM_TOOL_PACKS"] = str(platform_info.data_home() / "tool_packs")
+    # 机器人目录（2026-10-12 加）：ai 插件里的 friend_requests 要把"待处理好友申请"
+    # 落一份盘（<bot>/data/friend_requests.json），控制台（另一个进程）读它做只读展示。
+    # 不注入的话插件只能按"配置文件往上找 bot"猜路径，两边有对不上的风险。
+    try:
+        env["ASTROSWARM_BOT_DIR"] = str(settings.bot_dir)
+    except Exception:  # noqa: BLE001
+        pass
     _packs = _allowed_packs()
     env["ASTROSWARM_TOOL_PACKS_ALLOWED"] = ",".join(_packs)
     # 主动聊天能力包（2026-09 起随主仓库开源）：装上并允许加载时开开关；
@@ -403,6 +419,14 @@ def start(log=print) -> dict:
         log(f"bot 已在运行 pid={running}，跳过启动")
         return {"ok": True, "already_running": True, "pid": running}
     s = ensure_bot(log=log)
+    # 机器人侧热配置（.env + 有效开关快照）：起机器人前刷一遍，保证进程一上来
+    # 读到的就是当前设置（2026-10-11 热重载）。控制台保存设置时也会刷
+    # （api.put_config / console_ext._refresh_bot_hot_config），这里是保险。
+    # 注意别放进 _env()：那个函数每次 status() 都会被调，会白白写盘。
+    try:
+        bot_mod.refresh_hot_config(s, log=log)
+    except Exception as exc:  # noqa: BLE001
+        log(f"刷新机器人热配置失败（回退读环境变量）：{exc}")
     log_path = bot_log_path()
     log_path.parent.mkdir(parents=True, exist_ok=True)
     log_path.write_text("", encoding="utf-8")  # 每次启动清空，状态判断只看本次运行

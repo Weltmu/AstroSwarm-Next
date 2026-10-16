@@ -2,20 +2,23 @@ import json
 import getpass
 import os
 import sys
+import time
 import ctypes
 import threading
 from ctypes import wintypes
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import QApplication, QDialog, QMessageBox
 
 from .core import migrate as migrate_mod
 from .core import process as process_mod
 from .core import cleanup as cleanup_mod
+from .constants import APP_VERSION
 from .core.settings import Settings
 from .tasks.task_manager import TaskManager
 from .ui.main_window import MainWindow
 from .ui import press_scale as _press_scale  # noqa: F401  # 全局按钮按压缩放反馈
+from .ui.widgets import WheelGuard
 from .ui.theme import build_qss
 from .ui.wizard import DeployWizard
 
@@ -62,8 +65,29 @@ def _single_instance(app, name: str | None = None) -> bool:
     return True
 
 
-def _activate_existing_window():
-    """把已运行实例的主窗口恢复到前台（找不到就静默）。"""
+def _force_foreground(hwnd):
+    """把窗口强制拉到最前（Windows 只让前台进程抢焦点，这里借用前台线程的输入权）。"""
+    user32 = ctypes.windll.user32
+    kernel32 = ctypes.windll.kernel32
+    user32.ShowWindow(hwnd, 9)  # SW_RESTORE：最小化的先还原
+    fg = user32.GetForegroundWindow()
+    tid_fg = user32.GetWindowThreadProcessId(fg, None) if fg else 0
+    tid_cur = kernel32.GetCurrentThreadId()
+    attached = False
+    if tid_fg and tid_fg != tid_cur:
+        attached = bool(user32.AttachThreadInput(tid_cur, tid_fg, True))
+    user32.BringWindowToTop(hwnd)
+    user32.SetForegroundWindow(hwnd)
+    if attached:
+        user32.AttachThreadInput(tid_cur, tid_fg, False)
+    if user32.GetForegroundWindow() != hwnd:
+        user32.FlashWindow(hwnd, True)  # 兜底：拉不动就闪任务栏图标
+        return False
+    return True
+
+
+def _activate_existing_window() -> bool:
+    """把已运行实例的主窗口恢复到前台；成功返回 True，找不到窗口返回 False。"""
     try:
         user32 = ctypes.windll.user32
         kernel32 = ctypes.windll.kernel32
@@ -83,18 +107,31 @@ def _activate_existing_window():
             user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
             if pid.value == current_pid:
                 return True
-            if "AstroSwarm" in buf.value or "QBotManager" in buf.value:
+            if ("星巢" in buf.value or "AstroSwarm" in buf.value
+                    or "QBotManager" in buf.value):
                 found.append(hwnd)
                 return False
             return True
 
         user32.EnumWindows(_enum_cb, 0)
-        if found:
-            hwnd = found[0]
-            user32.ShowWindow(hwnd, 9)  # SW_RESTORE
-            user32.SetForegroundWindow(hwnd)
+        if not found:
+            return False
+        return _force_foreground(found[0])
     except Exception:  # noqa: BLE001
-        pass
+        return False
+
+
+def _warn_already_running():
+    """没能把已有窗口拉到前台时的兜底提示：置顶显示，2.5 秒自动关，不留下卡住的进程。"""
+    box = QMessageBox()
+    box.setWindowTitle("星巢 Nest")
+    box.setIcon(QMessageBox.Information)
+    box.setText("星巢已经在运行。")
+    box.setInformativeText("没切过去的话，点任务栏上的星巢图标就行。")
+    box.setStandardButtons(QMessageBox.Ok)
+    box.setWindowFlag(Qt.WindowStaysOnTopHint, True)
+    QTimer.singleShot(2500, box.accept)
+    box.exec()
 
 
 def run_gui():
@@ -111,14 +148,16 @@ def run_gui():
     app = QApplication(sys.argv)
     app.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
     app.setStyleSheet(build_qss())
+    # 滚轮别偷偷改下拉框/数值框（页面滚动时鼠标扫过就会改，用户以为是程序乱跳）
+    _wheel_guard = WheelGuard(app)
+    app.installEventFilter(_wheel_guard)
     app.setApplicationName("AstroSwarm")
     app.setOrganizationName("AstroSwarm")
 
     if not _single_instance(app):
-        _activate_existing_window()
-        QMessageBox.information(
-            None, "AstroSwarm 星群",
-            "AstroSwarm 已在运行，已切换到已有窗口。")
+        # 双击图标时把已有窗口拉前台；拉不动才弹提示（提示会自动消失，不留后台残留进程）
+        if not _activate_existing_window():
+            _warn_already_running()
         return 0
 
     root = Settings.find_root()
@@ -143,6 +182,24 @@ def run_gui():
                     return 0
                 settings = wizard.settings
 
+    # 启动动画：纯色卡 + 文字 logo（「减少界面动效」关掉时整段跳过）
+    splash = None
+    try:
+        from .ui import motion as motion_mod
+        from .ui.splash import LaunchSplash, fade_window  # noqa: F401
+
+        motion_mod.set_enabled(bool(getattr(settings, "animations_enabled", True)))
+        if motion_mod.enabled():
+            splash = LaunchSplash(APP_VERSION).begin()
+            _splash_t0 = time.time()
+            # 关键：这里必须把文字 logo 动画**真正播完**再往下走。
+            # 下面建 MainWindow 会独占主线程十几秒，不把动画先演完的话，
+            # 卡片窗口虽然"显示"了却一帧都画不出来（屏幕上看不见），
+            # 或者停在第一帧、像死机。play_intro() 内部自己泵事件循环。
+            splash.play_intro()
+    except Exception:  # noqa: BLE001 —— 动画出问题绝不能挡住启动
+        splash = None
+
     # 启动时后台清理日志/临时文件/消息缓存/过期会话，不阻塞主界面
     threading.Thread(
         target=lambda: cleanup_mod.run(settings),
@@ -150,8 +207,69 @@ def run_gui():
     ).start()
 
     tasks = TaskManager()
-    win = MainWindow(settings, tasks)
+    try:
+        win = MainWindow(settings, tasks)
+    except BaseException as e:  # noqa: BLE001 —— 建主窗口失败要让人看得见原因
+        import traceback as _tb
+        from pathlib import Path as _P
+
+        # 1) 先把启动卡收掉：不然报错框会被它盖在最下面，点不着也看不清
+        try:
+            if splash is not None:
+                splash.abort()
+        except Exception:  # noqa: BLE001
+            pass
+        # 2) 写崩溃日志（打包版没控制台，这是唯一现场）
+        detail = _tb.format_exc()
+        try:
+            _log = _P(os.environ.get("TEMP", ".")) / "ast nest crash.log"
+            _log.write_text(detail, encoding="utf-8")
+        except Exception:  # noqa: BLE001
+            _log = None
+        # 3) 给人看的报错框（可复制）
+        try:
+            box = QMessageBox()
+            box.setWindowTitle("星巢启动失败")
+            box.setIcon(QMessageBox.Critical)
+            box.setText("程序启动时出错，已停下。")
+            box.setInformativeText(
+                f"{type(e).__name__}: {e}\n\n"
+                + (f"详细信息已写入：{_log}" if _log else "详细信息见程序目录下的日志。"))
+            box.setDetailedText(detail[-4000:])
+            box.exec()
+        except Exception:  # noqa: BLE001
+            pass
+        return 1
+    
+    if splash is not None:
+        # 主窗口先透明，等启动动画收尾时再淡入（收不掉时下面还有兜底强制恢复）
+        try:
+            win.setWindowOpacity(0.0)
+        except Exception:  # noqa: BLE001
+            pass
     win.show()
+    if splash is not None:
+        # 最短显示：主窗口秒开时也别让动画"一闪而过"（老板反馈显示太短）
+        try:
+            from .ui.splash import MIN_ONSCREEN as _min_on
+
+            while time.time() - _splash_t0 < _min_on:
+                app.processEvents()
+                time.sleep(0.01)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            from .ui.splash import fade_window as _fade
+
+            splash.finish(on_done=lambda: _fade(win, 0.0, 1.0, 240,
+                                                on_done=lambda: win.setWindowOpacity(1.0)))
+            # 兜底：动画被打断/异常时，1 秒后强制恢复不透明，别让窗口看不见
+            QTimer.singleShot(1000, lambda: win.setWindowOpacity(1.0))
+        except Exception:  # noqa: BLE001
+            try:
+                win.setWindowOpacity(1.0)
+            except Exception:  # noqa: BLE001
+                pass
     return app.exec()
 
 

@@ -61,6 +61,17 @@ ACTIONS = """\
 | reminder_add | minutes, text, target? | timer | N 分钟后提醒（群里会带上昵称；微信只有 30 分钟窗口，失败会如实报错） |
 | mute_user / mute_all | group_id, user_id?, minutes | group_admin | 仅 QQ 官方群聊；官方接口没有该能力时返回 unsupported_by_channel，禁止谎报成功 |
 | recall_message | group_id?, message_id | group_admin | 撤回消息（QQ 官方） |
+| send_image | url（公网图片地址或本地路径）, caption? | media | 发一张图片。通道不支持时返回 unsupported_by_channel，要如实告诉用户，别假装发了 |
+| send_file | url, name? | media | 发一个文件（小文件；大文件平台可能拒收） |
+| send_voice | url | media | 发一条语音 |
+| send_music_card | url（歌曲链接）, title?, singer? | media | 分享一首歌（QQ 官方会发成文本卡片；别的通道退化成"歌名+链接"） |
+| send_buttons | text, buttons:[{id,label,data}], per_row? | media | 发一条**带按钮**的消息（QQ 官方键盘，最多 12 个）。用户点了按钮会以"用户点了按钮：<data>"回到 AI 那边；通道不支持时自动降级成"1. xxx"的文字选项（返回里的 clickable=false），要如实告诉用户"打字回复" |
+| send_to_my_platform | platform（qq / qq_official / wechat）, text | send_message | 发到**同一个人的另一个平台**（只认身份绑定关系，不用白名单）。对方没绑定时返回 not_bound，要如实告诉他怎么绑 |
+| send_to | target（形如 group:123 / user:abc）, text | send_message | 主动发到别的群/私聊某人。**只在机器人主人配了白名单时才允许**，没配或不在名单里会返回 target_not_allowed |
+| expand_link | url | network | 展开短链，返回真实地址（{ok, url, changed}） |
+| fetch_text | url, limit? | network | 抓网页正文（去标签的纯文本，默认最多 2 万字） |
+| download_file | url, name?, max_bytes? | network | 下载小文件到机器人数据目录（默认上限 2MB，返回 {ok, path, bytes}） |
+| compress_image | path 或 url, max_side?, quality? | 无 | 把图片压小（最长边默认 1280，JPEG 质量 82），返回 {ok, path, bytes} |
 """
 
 SANDBOX_RULES = """\
@@ -220,3 +231,51 @@ def repair_prompt(files: dict, issues: list) -> str:
         + "\n\n当前文件：\n" + _json.dumps(readable, ensure_ascii=False, indent=2)
         + "\n\n请输出修好的完整文件（不要只给片段）。"
     )
+
+
+# ---- 分文件模式（2026-10-13：大于等于 3 个工具、或整包输出被截断时用）----
+# 大工程整包一次输出会顶到模型输出上限、JSON 截断 → 拆成"先出 manifest，
+# 再一个文件一次"地写：每次输出都小，稳定得多。
+
+MANIFEST_SYSTEM = (
+    "你是星群（AstroSwarm）插件工坊的架构师。现在**只输出 manifest.json 的内容**"
+    "（一个 JSON 对象），不要输出代码、不要解释。\n\n"
+    + PLUGIN_CONTRACT + "\n" + CHANNEL_TABLE + "\n" + SANDBOX_RULES + "\n" + QUALITY_RULES
+)
+
+FILE_SYSTEM = (
+    "你是星群（AstroSwarm）插件工坊的资深 Python 工程师。现在**只写一个文件**。"
+    "只输出这个文件的完整代码（建议用 ```python 代码块包住），不要 JSON、不要解释。\n\n"
+    + PLUGIN_CONTRACT + "\n" + CONTEXT_API + "\n" + ACTIONS + "\n"
+    + SANDBOX_RULES + "\n" + CHANNEL_TABLE + "\n" + QUALITY_RULES + "\n" + EXAMPLES
+)
+
+
+def manifest_prompt(need: str, plan: dict) -> str:
+    import json as _json
+
+    return (
+        "用户需求：" + str(need).strip()[:2000]
+        + "\n\n已经确认的方案：\n" + _json.dumps(plan, ensure_ascii=False, indent=2)
+        + "\n\n只输出 manifest.json：id / name / version / kind / description / "
+        "adapters / permissions / sandbox / tools。\n"
+        + "要求：version 固定 1.0.0，kind 固定 tool-pack，sandbox 固定 true；"
+        + "工具数量必须和方案一致（≤3）；tools[].parameters 必须是完整可用的 JSON Schema"
+        + "（中文 description、required 写准、给 example_args 对得上的参数）。"
+    )
+
+
+def file_prompt(need: str, plan: dict, name: str, files: list, issues: list | None = None) -> str:
+    import json as _json
+
+    text = (
+        "用户需求：" + str(need).strip()[:2000]
+        + "\n\n方案：\n" + _json.dumps(plan, ensure_ascii=False, indent=2)
+        + "\n\n整个插件的文件清单：" + "、".join(str(f) for f in files)
+        + f"\n\n现在只写这一个文件：tools/{name}.py。"
+        + "直接输出这个文件的完整代码；文件内不要引用清单里没有的其它文件。"
+    )
+    if issues:
+        text += ("\n\n上一版没通过的问题（这一版逐条改掉）：\n"
+                 + _json.dumps(issues, ensure_ascii=False, indent=2)[:2000])
+    return text

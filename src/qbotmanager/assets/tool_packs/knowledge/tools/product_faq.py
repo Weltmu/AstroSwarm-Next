@@ -2,10 +2,10 @@
 import json
 
 _FAQ = {
-    "价格": "客户端和插件都开源免费：插件市场里的能力包全部免费，直接装就行；源码在 GitHub（Weltmu/AstroSwarm）。微信通道走腾讯官方 iLink，需要单独开通。",
+    "价格": "客户端和插件都开源免费：插件市场里的能力包全部免费，直接装就行；源码在 GitHub（Weltmu/AstroSwarm）。微信通道走腾讯官方 iLink，已免费开放，扫码即用。",
     "购买": "插件不用购买，控制台「插件管理」或官网插件市场直接装即可；整套源码在 GitHub Weltmu/AstroSwarm，也可以自己编译。",
-    "安装": "Windows 解压运行 AstroSwarm.exe；Linux 运行 install.sh 后浏览器打开控制台。",
-    "微信": "微信通道走腾讯官方 iLink，开通后才能扫码登录。",
+    "安装": "Windows 打开星巢（Nest）；Linux 运行 install.sh 后浏览器打开控制台。",
+    "微信": "微信通道走腾讯官方 iLink，已免费开放，扫码即可登录。",
     "激活": "邮箱登录即授权，不需要激活码。",
 }
 

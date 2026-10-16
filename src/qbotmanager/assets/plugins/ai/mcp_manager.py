@@ -1,21 +1,46 @@
 import asyncio
+import os
 from contextlib import AsyncExitStack
-from mcp import ClientSession
-from mcp.client.sse import sse_client
-from mcp.client.stdio import stdio_client
 from nonebot import logger
 from .manager import chat_manager
 
+# 2026-10-11 启动加速：`mcp` 这个包 import 要 ~0.7 秒（实测），而它**只在用户真的
+# 开了 MCP 工具时**才用得到（默认关，服务器上就是关的）。以前它在 import 期就
+# 把 mcp 拉进来，等于每次重启机器人白等 0.7 秒 —— 而"重启要快"正是老板这轮的诉求。
+# 现在改成**用到才导入**（第一次真调 MCP 时多花 0.7 秒，没人会察觉）。
+_MCP_IMPORT_ERROR = ""
+
+
+def _mcp():
+    """按需导入 mcp 客户端；导入失败返回 None 并把原因记下来（只在日志里说一次）。"""
+    global _MCP_IMPORT_ERROR
+    try:
+        from mcp import ClientSession
+        from mcp.client.sse import sse_client
+        from mcp.client.stdio import stdio_client
+
+        return ClientSession, sse_client, stdio_client
+    except Exception as e:  # noqa: BLE001 —— 没装 mcp 也不能让插件加载失败
+        if _MCP_IMPORT_ERROR != str(e):
+            _MCP_IMPORT_ERROR = str(e)
+            logger.warning("MCP 客户端不可用（没装 mcp 或版本不对）：%s", e)
+        return None
+
+
 class TransientMCPClient:
     """一次性MCP客户端，每次调用都重新连接"""
-    
+
     def __init__(self):
         self.tools_cache = {}  # 缓存工具列表，避免重复发现
 
     async def _create_session(self, config, exit_stack):
         """根据配置创建MCP会话并正确管理上下文"""
         server_type = config.get("type", "sse")
-        
+        libs = _mcp()
+        if libs is None:
+            raise RuntimeError("MCP 客户端不可用：" + (_MCP_IMPORT_ERROR or "未安装 mcp 包"))
+        ClientSession, sse_client, stdio_client = libs
+
         try:
             if server_type == "sse":
                 # SSE传输方式 - 正确使用异步上下文管理器

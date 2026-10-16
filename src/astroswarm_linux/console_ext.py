@@ -19,6 +19,18 @@
     POST /api/persona/deactivate    停用本地人设（人格回内置默认）
     POST /api/persona/uninstall     卸载本地人设（必须 confirm=true）
 
+2026-10-04 补齐的通道与日志接口（与桌面端飞书页 / QQ 页 / 服务页对齐）：
+
+    GET  /api/feishu/status         飞书通道状态（只有 *_set 布尔，凭证永不回显）
+    PUT  /api/feishu/config         写飞书凭证（空串 = 不改，__clear__ = 清空）
+    POST /api/feishu/install-adapter 装飞书适配器（nonebot-adapter-feishu）
+    GET  /api/telegram/status       纸飞机通道（桌面端只有占位页，这里如实回 supported:false）
+    GET  /api/qq/official           QQ 官方凭证 / 收消息模式 / 群名单与回话白名单
+    PUT  /api/qq/official           写官方凭证与通道（secret 规则同飞书）
+    GET  /api/logs/retention        日志保留天数 + 占用 + 已归档文件名
+    PUT  /api/logs/retention        改保留天数（1~365，默认 10 天）
+    POST /api/logs/cleanup-now      立刻归档 + 清理过期日志
+
 安装方式（api.py 末尾、StaticFiles 挂载之前）：
 
     from . import console_ext
@@ -32,6 +44,9 @@
 config_home/console.json 里，这个模块就能自洽，不用再动 api.py。
 """
 import base64
+import time
+import urllib.request
+import functools
 import json
 import re
 import shutil
@@ -358,7 +373,40 @@ def _ilink_dir() -> Path:
     return Path(_settings().bot_dir) / "data" / "nonebot_adapter_ilink"
 
 
+def _qq_events_module():
+    """拿 core/qq_events（拿不到就返回 None，调用方自己降级）。"""
+    try:
+        from qbotmanager.core import qq_events
+    except Exception:  # noqa: BLE001
+        return None
+    return qq_events
+
+
+def _humanize_lines(lines) -> list:
+    """把日志里的英文事件名翻成人话（和桌面端日志页同一套 core/qq_events）。
+
+    控制台前端不用改：后端翻好，前端照样一行一行显示。
+    """
+    qq_events = _qq_events_module()
+    if qq_events is None:
+        return list(lines)
+    return [qq_events.humanize_line(line) for line in lines]
+
+
 def _read_json(path: Path) -> dict:
+    """读一个 JSON 文件（带缓存）。
+
+    无头端是按 HTTP 请求触发的，本来没有桌面端那种 2 秒心跳；但控制台一次会拉好几个
+    状态（服务/依赖/权限/账号），每次直读盘在慢盘上一样拖响应。
+    统一走共用的 core/json_cache（按 修改时间+大小 命中），文件被改过照样立刻重读；
+    缓存模块拿不到就退回直读，功能不受影响。
+    """
+    try:
+        from qbotmanager.core import json_cache
+    except Exception:  # noqa: BLE001
+        json_cache = None
+    if json_cache is not None:
+        return json_cache.load_json(path)
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
         return data if isinstance(data, dict) else {}
@@ -942,12 +990,72 @@ def uninstall_persona(pid: str, confirm: bool) -> dict:
 def register(app: FastAPI) -> None:
     """把这些路由挂到 api.py 的 app 上（必须在 StaticFiles 之前调用）。"""
 
+    # 飞书凭证 / 日志保留天数存在无头配置里，而 deploy.build_settings() 不认识这几个键：
+    # 补一层（幂等），否则控制台存得进去、机器人启动时读不到（详见函数注释）。
+    install_settings_bridge()
+
     @app.get("/api/plugins/entitlement")
     def plugins_entitlement(authorization: str = Header("", alias="Authorization")):
         # 这里回的是邮箱 / 套餐 / 已购插件，正好是 /api/auth/status 刚被加固要藏的那份数据，
         # 未登录不能再给（控制台本来就是带 token 调它）。
         _require_auth(authorization)
         return entitlement_state()
+
+    @app.get("/api/plugins/market")
+    def plugins_market(authorization: str = Header("", alias="Authorization")):
+        """官网插件市场：和桌面端「插件」页同一份数据（core.plugin_market）。
+
+        老板 2026-10-04 要求控制台与桌面端 100% 对齐：桌面端能在应用里逛市场、一键装，
+        控制台以前只能传 zip。返回字段与桌面端 _refresh_market_list 用的一致。
+        市场拉不到/签名不过不算崩溃：回 ok:false + 中文原因，前端显示"暂不可用"。
+        """
+        _require_auth(authorization)
+        from qbotmanager.core import plugin_market
+
+        try:
+            raw, sig = plugin_market.fetch_market()
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": "market_unreachable", "entries": [],
+                    "why": f"插件市场连不上：{str(exc)[:120]}"}
+        if not raw:
+            return {"ok": False, "error": "market_unreachable", "entries": [],
+                    "why": "插件市场没有返回内容（检查服务器网络）"}
+        try:
+            if not plugin_market.verify_manifest(raw, sig or ""):
+                return {"ok": False, "error": "bad_signature", "entries": [],
+                        "why": "市场签名校验没过，为安全起见不显示列表"}
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": "verify_failed", "entries": [],
+                    "why": f"签名校验出错：{str(exc)[:120]}"}
+        try:
+            text = raw.decode("utf-8") if isinstance(raw, (bytes, bytearray)) else str(raw)
+            entries = plugin_market.parse_market(text)
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": "bad_market", "entries": [],
+                    "why": f"市场清单格式不对：{str(exc)[:120]}"}
+        try:
+            ent = entitlement_state()
+        except Exception:  # noqa: BLE001
+            ent = {}
+        out = []
+        for item in entries or []:
+            if not isinstance(item, dict):
+                continue
+            try:
+                access = plugin_market.plugin_access(item, ent)
+            except Exception:  # noqa: BLE001
+                access = {}
+            out.append({
+                # id 必须带上：控制台「官网市场」的「安装」按钮要靠它调
+                # POST /api/plugins/install（那个接口也认 name 作兜底，见 api.py）。
+                "id": str(item.get("id") or ""),
+                "name": str(item.get("name") or item.get("id") or ""),
+                "desc": str(item.get("desc") or item.get("description") or ""),
+                "version": str(item.get("version") or ""),
+                "category": str(item.get("category") or "其它"),
+                "access": access,
+            })
+        return {"ok": True, "entries": out, "count": len(out)}
 
     @app.post("/api/plugins/redeem")
     def plugins_redeem(body: dict, authorization: str = Header("", alias="Authorization")):
@@ -1182,7 +1290,31 @@ def register(app: FastAPI) -> None:
         if not path.exists():
             return {"ok": True, "name": src, "lines": []}
         text = logs.tail(path, max(1, min(int(n), 2000)))
-        return {"ok": True, "name": src, "lines": text.splitlines()}
+        logs.prune_old()   # 顺手按保留天数清旧日志（默认 10 天；失败不影响返回）
+        return {"ok": True, "name": src, "lines": _humanize_lines(text.splitlines())}
+
+    @app.get("/api/logs/official")
+    def logs_official(n: int = 500, name: str = logs.LOG_FILE_DEFAULT,
+                      authorization: str = Header("", alias="Authorization")):
+        """只挑官方通道那些行（与桌面端日志页的「官方通道」筛选项同一套判断）。
+
+        排查"群里 @ 它不回"时最有用：一眼看到机器人到底收到了什么事件、模式是全量还是仅 @。
+        """
+        _require_auth(authorization)
+        try:
+            src, path = logs.resolve_log(name)
+        except ValueError:
+            raise HTTPException(400, f"未知的日志名，只能是：{logs.LOG_NAME_LIST}") from None
+        if not path.exists():
+            return {"ok": True, "name": src, "lines": [], "total": 0}
+        lines = logs.tail(path, max(1, min(int(n), 5000))).splitlines()
+        qq_events = _qq_events_module()
+        if qq_events is None:
+            picked = []
+        else:
+            picked = [line for line in lines if qq_events.is_official_line(line)]
+        return {"ok": True, "name": src, "total": len(picked),
+                "lines": _humanize_lines(picked)}
 
     # ---------------------------------------------------------- 人设工坊（本地）
     @app.get("/api/persona/template")
@@ -1298,6 +1430,27 @@ def register(app: FastAPI) -> None:
         _require_auth(authorization)
         return memory_clear(bool((body or {}).get("confirm")))
 
+    # ---- 内置记忆（程序侧三档那套）：现在记住了什么 / 忘掉一条 ----
+    # 与上面 /api/memory/* 的区别：上面读的是 AI 插件自己的 aichat_memory.json，
+    # 这里读的是内置记忆库（qbotmanager.core.memory），也就是「无/基础/智能」那一档的库。
+    @app.get("/api/memory/builtin")
+    def memory_builtin_list_route(qq: str = "",
+                                  authorization: str = Header("", alias="Authorization")):
+        """现在记住了什么：档位 + 条数 + 明细（按人分组，最多 200 条）。"""
+        _require_auth(authorization)
+        return builtin_memory_overview(str(qq or ""))
+
+    @app.post("/api/memory/builtin/forget")
+    def memory_builtin_forget_route(body: dict,
+                                    authorization: str = Header("", alias="Authorization")):
+        """「忘掉这件事」：**真删**。qq 必填；fact 留空 = 清掉这个人的全部记忆。"""
+        _require_auth(authorization)
+        data = body or {}
+        target = str(data.get("qq") or "").strip()
+        if not target:
+            raise HTTPException(400, "必须给 qq（要忘掉谁的事）")
+        return builtin_memory_forget(target, str(data.get("fact") or ""))
+
     # ---- 本地知识库（与桌面端 BrainPage 的「本地知识库」对应）----
     @app.get("/api/knowledge/list")
     def knowledge_list_route(authorization: str = Header("", alias="Authorization")):
@@ -1363,6 +1516,451 @@ def register(app: FastAPI) -> None:
             str(data.get("content_b64") or ""),
             bool(data.get("confirm")),
         )
+
+    # ===== 机器人侧 AI 设置（与桌面端「AI 大脑」页同源）=====
+    # 这些值都存在**机器人侧** aichat_manager.json（不是控制台自己的 config.json），
+    # 所以统一走 qbotmanager.core.ai_config 的读写函数，别写进 headless_config.SAFE_KEYS。
+
+    @app.get("/api/ai/settings")
+    def ai_settings(authorization: str = Header("", alias="Authorization")):
+        """群聊回话总开关 / 引用解析 / 群名单 / 主动搭话 / 免@连续对话。"""
+        _require_auth(authorization)
+        ai_config = _ai_config_module()
+        s = _settings()
+        return {
+            "group_chat_enabled": ai_config.read_group_chat_enabled(s),
+            "rich_parse_enabled": ai_config.read_rich_parse_enabled(s),
+            "allowed_groups": ai_config.allowed_groups(s),
+            "known_groups": ai_config.known_groups(s),
+            "interject": ai_config.read_interject(s),
+            "session": ai_config.read_session(s),
+            # 2026-10-02 新增：入群欢迎开关 + 插件主动发送白名单（与桌面端同一份配置）
+            "group_welcome_enabled": ai_config.read_group_welcome(s),
+            "allowed_send_targets": ai_config.read_send_targets(s),
+            # 2026-10-04 新增：识图 / 聊天里自学 / 跨平台互通（与桌面端同一份配置）
+            "image_recognition_enabled": ai_config.read_image_recognition(s),
+            "self_forge_enabled": ai_config.read_self_forge(s),
+            "cross_platform_enabled": ai_config.read_cross_platform(s),
+            "identity_bindings": ai_config.read_identity_bindings(s),
+            # 2026-10-11 新增：内置记忆三档（无/基础/智能）+ 那一句中文说明
+            "memory_enabled": ai_config.read_memory_enabled(s),
+            "memory_level": ai_config.read_memory_level(s),
+            "memory_level_note": ai_config.MEMORY_LEVEL_NOTE,
+            "memory_level_options": ai_config.memory_level_info()["options"],
+            # 2026-10-11 新增：空 @ 行为 + 上文回溯上限（老板报的"空@答了一小时前的内容"）
+            "empty_at_action": ai_config.read_empty_at(s),
+            "empty_at_info": ai_config.empty_at_info(),
+            "context_window_minutes": ai_config.read_context_window_minutes(s),
+            "context_window_note": ai_config.CONTEXT_WINDOW_NOTE,
+            "context_window_default": ai_config.CONTEXT_WINDOW_DEFAULT,
+            "context_window_min": ai_config.CONTEXT_WINDOW_MIN,
+            "context_window_max": ai_config.CONTEXT_WINDOW_MAX,
+            # 2026-10-12 新增：单条正文上限（H-13 落地时只有后端、界面上一直没有输入框）
+            "max_incoming_chars": ai_config.read_max_incoming_chars(s),
+            "max_incoming_chars_info": ai_config.max_incoming_chars_info(),
+            # 2026-10-12 新增：分条发送（像人一样分几条发；改完立即生效）
+            "multi_message": ai_config.read_multi_message(s),
+            "multi_message_info": ai_config.multi_message_info(),
+            # 2026-10-12 新增（与桌面端 brain_page.py:673-695 同源）：
+            # 自动通过好友申请 + Agent 模式。**能力不在就不显示开关** ——
+            # 桌面端的判据是 ai_config.has_capability，这里回两个布尔给前端用同一个口径。
+            "auto_approve_friend": ai_config.read_auto_approve_friend(s),
+            "agent_mode_enabled": ai_config.read_agent_mode(s),
+            "has_approve_friend": ai_config.has_capability(s, "approve_friend"),
+            "has_agent_tools": ai_config.has_capability(s, "send_to"),
+            # 「这次改动要不要重启」的唯一口径（前端标注按钮/提示都用它）
+            "restart_policy": _restart_policy().summary(),
+        }
+
+    @app.put("/api/ai/settings")
+    def ai_settings_save(body: dict, authorization: str = Header("", alias="Authorization")):
+        """只写传进来的字段；一个都不传就当没改过（避免误清空）。"""
+        _require_auth(authorization)
+        ai_config = _ai_config_module()
+        s = _settings()
+        data = body or {}
+        done = []
+        if "group_chat_enabled" in data:
+            ai_config.save_group_chat_enabled(s, bool(data["group_chat_enabled"]))
+            done.append("group_chat_enabled")
+        if "rich_parse_enabled" in data:
+            ai_config.save_rich_parse_enabled(s, bool(data["rich_parse_enabled"]))
+            done.append("rich_parse_enabled")
+        if "allowed_groups" in data:
+            groups = data["allowed_groups"]
+            if not isinstance(groups, list):
+                raise HTTPException(400, "allowed_groups 要是数组（空数组 = 不限群）")
+            ai_config.save_allowed_groups(s, [str(g) for g in groups])
+            done.append("allowed_groups")
+        if "interject" in data:
+            payload = data["interject"]
+            if not isinstance(payload, dict):
+                raise HTTPException(400, "interject 要是对象")
+            current = ai_config.read_interject(s)
+            current.update(payload)
+            ai_config.save_interject(s, current)
+            done.append("interject")
+        if "session" in data:
+            payload = data["session"]
+            if not isinstance(payload, dict):
+                raise HTTPException(400, "session 要是对象")
+            current = ai_config.read_session(s)
+            current.update(payload)
+            ai_config.save_session(s, current)
+            done.append("session")
+        if "group_welcome_enabled" in data:
+            ai_config.save_group_welcome(s, bool(data["group_welcome_enabled"]))
+            done.append("group_welcome_enabled")
+        if "allowed_send_targets" in data:
+            targets = data["allowed_send_targets"]
+            if not isinstance(targets, list):
+                raise HTTPException(400, "allowed_send_targets 要是数组（空数组 = 一个都不许发）")
+            ai_config.save_send_targets(s, targets)
+            done.append("allowed_send_targets")
+        # 2026-10-04：识图 / 自学 / 跨平台互通（和桌面端同一份读写）
+        if "image_recognition_enabled" in data:
+            ai_config.save_image_recognition(s, bool(data["image_recognition_enabled"]))
+            done.append("image_recognition_enabled")
+        if "self_forge_enabled" in data:
+            ai_config.save_self_forge(s, bool(data["self_forge_enabled"]))
+            done.append("self_forge_enabled")
+        if "cross_platform_enabled" in data:
+            ai_config.save_cross_platform(s, bool(data["cross_platform_enabled"]))
+            done.append("cross_platform_enabled")
+        # 2026-10-11：内置记忆三档（无/基础/智能）。写的是机器人侧同一份
+        # aichat_manager.json；**改完立即生效，不用重启机器人** ——
+        # 机器人进程每次调用都热读这份配置（core/memory/policy.py::level()），
+        # 再加上这里刷新的热配置快照（bot.write_live_gates）。
+        if "memory_level" in data:
+            raw = str(data["memory_level"] or "").strip().lower()
+            allowed = set(ai_config.MEMORY_LEVELS) | set(ai_config.MEMORY_LEVEL_LABELS.values())
+            if raw not in allowed:
+                raise HTTPException(400, "记忆档位只能是 off / basic / smart（无 / 基础 / 智能）")
+            ai_config.save_memory_level(s, raw)
+            done.append("memory_level")
+            _refresh_bot_hot_config()
+        # 2026-10-11：空 @ 行为 + 上文回溯上限 T（都是热读，改完立即生效）
+        if "empty_at_action" in data:
+            value = ai_config.normalize_empty_at(data["empty_at_action"])
+            ai_config.save_empty_at(s, value)
+            done.append("empty_at_action")
+        if "context_window_minutes" in data:
+            try:
+                minutes = int(data["context_window_minutes"])
+            except (TypeError, ValueError):
+                raise HTTPException(400, "上文回溯上限要是整数（分钟）")
+            if not (ai_config.CONTEXT_WINDOW_MIN - 1 <= minutes
+                    <= ai_config.CONTEXT_WINDOW_MAX + 1):
+                raise HTTPException(
+                    400, "上文回溯上限要在 %d~%d 分钟之间"
+                         % (ai_config.CONTEXT_WINDOW_MIN, ai_config.CONTEXT_WINDOW_MAX))
+            ai_config.save_context_window_minutes(s, minutes)
+            done.append("context_window_minutes")
+        # 2026-10-12：单条正文上限（H-13 的后端一直都在，界面上一直没有输入框）
+        if "max_incoming_chars" in data:
+            try:
+                chars = int(data["max_incoming_chars"])
+            except (TypeError, ValueError):
+                raise HTTPException(400, "单条正文上限要是整数（字；0 = 不限制）")
+            if chars != 0 and not (ai_config.MAX_INCOMING_CHARS_MIN - 1 <= chars
+                                   <= ai_config.MAX_INCOMING_CHARS_MAX + 1):
+                raise HTTPException(
+                    400, "单条正文上限要在 %d~%d 字之间，或填 0 表示不限制"
+                         % (ai_config.MAX_INCOMING_CHARS_MIN,
+                            ai_config.MAX_INCOMING_CHARS_MAX))
+            ai_config.save_max_incoming_chars(s, chars)
+            done.append("max_incoming_chars")
+        # 2026-10-12：分条发送（模式 + 最多几条 + 每条字数 + 每字延迟 + 单条间上限）。
+        # 五个值机器人侧都是**每条消息现读**，所以改完立即生效、不用重启机器人。
+        if "multi_message" in data:
+            payload = data["multi_message"]
+            if not isinstance(payload, dict):
+                raise HTTPException(400, "multi_message 要是对象（只传要改的键）")
+            unknown = [k for k in payload
+                       if k not in ("mode", "max_parts", "max_part_chars",
+                                    "part_delay_ms", "part_delay_max_ms")]
+            if unknown:
+                raise HTTPException(400, "multi_message 里不认识的键：%s" % "、".join(unknown))
+            if "mode" in payload:
+                raw = str(payload["mode"] or "").strip().lower()
+                if raw not in ("", "off", "auto", "always", "关", "关闭", "单条",
+                               "一条", "自动", "总是", "总是分条", "强制",
+                               "single", "none", "force", "all", "on", "smart"):
+                    raise HTTPException(
+                        400, "分条模式只能是 off / auto / always（关 / 自动 / 总是）")
+            ai_config.save_multi_message(s, payload)
+            done.append("multi_message")
+        # 2026-10-12（桌面端 brain_page.py:677-695 同源）：自动通过好友申请 + Agent 模式。
+        # 两个都是机器人侧每条消息/每个事件现读 aichat_manager.json 的键 →
+        # 改完立即生效，不用重启机器人（机器人收消息时 chat_manager.maybe_reload()）。
+        if "auto_approve_friend" in data:
+            ai_config.save_auto_approve_friend(s, bool(data["auto_approve_friend"]))
+            done.append("auto_approve_friend")
+        if "agent_mode_enabled" in data:
+            ai_config.save_agent_mode(s, bool(data["agent_mode_enabled"]))
+            done.append("agent_mode_enabled")
+        # 这些键（群聊开关 / 白名单 / 搭话 / 免@会话 / 各类开关）**全都是热读**：
+        # 机器人侧每条消息现读 aichat_manager.json，所以都不需要重启。
+        return {"ok": True, "changed": done, "needs_restart": False,
+                "hot_reload": True,
+                "note": _restart_policy().HOT_LINE}
+
+    # ===== 本机能力清单（与桌面端「插件 → 本机能力（可搜索 · 可开关）」同源）=====
+    # 2026-10-12：老板反馈「插件页面看不见好友申请那个功能」，桌面端因此加了这一节
+    # （plugins_page.py:104-186）。无头端这边**一直没有对应接口**，控制台也就没有这一节
+    # —— 本轮补齐，读写的还是机器人侧 aichat_manager.json 的 disabled_tools
+    # （机器人侧 chat.py 每条消息现读，改完立即生效、不用重启）。
+
+    @app.get("/api/ai/capabilities")
+    def ai_capabilities(authorization: str = Header("", alias="Authorization")):
+        try:
+            return capabilities_list()
+        except HTTPException:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(500, f"本机能力清单读取失败：{exc}") from exc
+
+    @app.put("/api/ai/capabilities")
+    def ai_capabilities_save(body: dict, authorization: str = Header("", alias="Authorization")):
+        """开/关一项能力。只写传进来的 name（未知名字照样先列出来核对，不硬拒）。"""
+        _require_auth(authorization)
+        data = body or {}
+        name = str(data.get("name") or "").strip()
+        if not name or len(name) > 120:
+            raise HTTPException(400, "要给出能力名字（name）")
+        if "enabled" not in data or not isinstance(data["enabled"], bool):
+            raise HTTPException(400, "enabled 要是 true/false")
+        return capabilities_toggle(name, bool(data["enabled"]))
+
+    # ===== 好友申请（2026-10-12 桌面端新增；控制台只读展示）=====
+
+    @app.get("/api/ai/friend-requests")
+    def ai_friend_requests(authorization: str = Header("", alias="Authorization")):
+        """机器人进程记的待处理好友申请（落盘桥，只读；控制台从不让机器人做事）。"""
+        _require_auth(authorization)
+        return friend_requests_state()
+
+    # ===== QQ 官方通道：收消息模式 + 一键体检（桌面端 QQ 页同源）=====
+
+    @app.get("/api/qq/group-state")
+    def qq_group_state(authorization: str = Header("", alias="Authorization")):
+        """机器人到底在收「全量群消息」还是「只收 @」——"群里 @ 它不回"的第一现场证据。"""
+        _require_auth(authorization)
+        ai_config = _ai_config_module()
+        state = ai_config.read_qq_group_state(_settings())
+        return {
+            "mode": str(state.get("mode") or "none"),
+            "text": ai_config.qq_group_state_text(state),
+            "hint": ai_config.qq_group_state_hint(state),
+            "last_ts": float(state.get("last_ts") or 0),
+            "events": state.get("events") or {},
+        }
+
+    @app.get("/api/qq/diagnose")
+    def qq_diagnose(authorization: str = Header("", alias="Authorization")):
+        """官方通道一键体检：凭证、环境、进程、连接、群消息模式、AI 开关逐条给结论。"""
+        _require_auth(authorization)
+        try:
+            from qbotmanager.core import qq_doctor
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(500, f"服务端缺少体检模块（qq_doctor）：{exc}") from exc
+        rows = qq_doctor.run_checks(_settings(), _LinuxRunState())
+        return {
+            "summary": qq_doctor.summary(rows),
+            "rows": [{"name": r.get("name"), "level": r.get("level"),
+                      "text": r.get("text"), "hint": r.get("hint") or ""} for r in rows],
+        }
+
+    # ===== 飞书 / 纸飞机 / QQ 官方凭证 / 日志保留（2026-10-04 控制台接口补齐）=====
+    # 前端按固定字段名调（契约见模块顶部）；密钥一律只回 *_set 布尔，写操作回 needs_restart。
+
+    @app.get("/api/feishu/status")
+    def feishu_status(authorization: str = Header("", alias="Authorization")):
+        # 回的是"填没填"这些布尔量，但整机通道状态不该给未登录的人看（与 /api/wechat/status 一致）
+        _require_auth(authorization)
+        return feishu_state()
+
+    @app.put("/api/feishu/config")
+    def feishu_config_save(body: dict, authorization: str = Header("", alias="Authorization")):
+        _require_auth(authorization)
+        return feishu_save(body or {})
+
+    @app.post("/api/feishu/install-adapter")
+    def feishu_install_adapter(authorization: str = Header("", alias="Authorization")):
+        _require_auth(authorization)
+        return feishu_install_adapter_now()
+
+    @app.get("/api/telegram/status")
+    def telegram_status(authorization: str = Header("", alias="Authorization")):
+        """纸飞机通道如实回"还没做"。
+
+        桌面端的 ui/pages/telegram_page.py 也只有一句占位（EmptyState），
+        所以这里**不假装能配**：控制台照这个开关显示"规划中"就行。
+        """
+        _require_auth(authorization)
+        return {"ok": True, "supported": False, "planned": True,
+                "why": "纸飞机通道还在规划中"}
+
+    @app.get("/api/qq/official")
+    def qq_official_state_route(authorization: str = Header("", alias="Authorization")):
+        # 凭证填没填 + 群名单（openid）都是本机接入信息，要登录
+        _require_auth(authorization)
+        return qq_official()
+
+    @app.put("/api/qq/official")
+    def qq_official_save_route(body: dict, authorization: str = Header("", alias="Authorization")):
+        _require_auth(authorization)
+        return qq_official_save(body or {})
+
+    @app.get("/api/logs/retention")
+    def logs_retention(authorization: str = Header("", alias="Authorization")):
+        _require_auth(authorization)
+        return logs_retention_state()
+
+    @app.put("/api/logs/retention")
+    def logs_retention_save_route(body: dict, authorization: str = Header("", alias="Authorization")):
+        _require_auth(authorization)
+        return logs_retention_save(body or {})
+
+    @app.post("/api/logs/cleanup-now")
+    def logs_cleanup_now_route(authorization: str = Header("", alias="Authorization")):
+        """立刻按保留天数清理旧日志（桌面端服务页「立刻清理旧日志」同款）。"""
+        _require_auth(authorization)
+        return logs_cleanup_now()
+
+    # ===== 星群账号：头像与昵称（与桌面端共用 qbotmanager.core.account）=====
+    # 桌面端早就有（core/account.py：头像落盘 + 昵称 + 老官网个人中心同步），
+    # 无头端一直缺这块（2026-10-01 老板问"头像昵称做好了是吗"时发现）。
+
+    def _account_module():
+        try:
+            from qbotmanager.core import account
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(500, f"服务端缺少账号模块（account）：{exc}") from exc
+        return account
+
+    # 资料同步防抖：上次去官网拉取的时间 / 最小间隔（秒）
+    _PROFILE_SYNC_AT = {"t": 0.0}
+    _PROFILE_SYNC_MIN_INTERVAL = 10.0
+
+    def _profile_payload(account_mod, acc: dict) -> dict:
+        avatar = ""
+        try:
+            path = account_mod.avatar_file()
+            if path.exists():
+                avatar = "data:image/jpeg;base64," + base64.b64encode(path.read_bytes()).decode()
+        except OSError:
+            avatar = ""
+        return {
+            "email": str(acc.get("email") or ""),
+            "nickname": str(acc.get("nickname") or ""),
+            "signature": str(acc.get("signature") or ""),
+            "display_name": account_mod.display_name(acc),
+            "plan": str(acc.get("plan") or ""),
+            "avatar": avatar,
+        }
+
+    @app.get("/api/account/profile")
+    def account_profile(authorization: str = Header("", alias="Authorization")):
+        """当前登录账号的昵称与头像（头像给 data URL，前端直接塞 <img src>）。
+
+        2026-10-06 修（老板反馈"控制台昵称头像没跟官网同步"）：本机这份账号文件里
+        没有昵称/头像时，**顺手去账号服务拉一次**（`/me`），拉不到就照旧返回空的，
+        不报错 —— 这样用户登录后一打开就看到了，不用先点「从官网同步」。
+        """
+        _require_auth(authorization)
+        account_mod = _account_module()
+        acc = account_mod.load_account()
+        if not acc:
+            raise HTTPException(401, "本机还没登录星群账号")
+        # 每次都试着去官网拉一次，但 10 秒内只拉一次 —— 老板在官网换了头像，
+        # 控制台轮询或点「刷新」都能在 10 秒内看到新的。
+        # （2026-10-07 修：以前只在"本机完全没有资料"时才拉，本地存着旧头像就永远不更新，
+        #   老板实测"官网换了头像，控制台一直显示旧的、点刷新也不好使"。）
+        now = time.time()
+        if now - _PROFILE_SYNC_AT["t"] >= _PROFILE_SYNC_MIN_INTERVAL:
+            _PROFILE_SYNC_AT["t"] = now
+            try:
+                refreshed = account_mod.refresh_profile()
+                if refreshed:
+                    acc = refreshed
+            except Exception as exc:  # noqa: BLE001 —— 网络不通不该让账号卡片打不开
+                _log(f"同步官网昵称/头像失败（先用本机那份）：{exc}")
+        return _profile_payload(account_mod, acc)
+
+    @app.post("/api/account/refresh")
+    def account_refresh(authorization: str = Header("", alias="Authorization")):
+        """从账号服务拉一次 /me，把官网个人中心改过的昵称/头像同步回本机。"""
+        _require_auth(authorization)
+        account_mod = _account_module()
+        acc = account_mod.refresh_profile()
+        if not acc:
+            raise HTTPException(400, "同步失败：可能未登录或网络不通")
+        return _profile_payload(account_mod, acc)
+
+    @app.post("/api/account/profile")
+    def account_profile_save(body: dict, authorization: str = Header("", alias="Authorization")):
+        """改昵称 / 换头像（与官网个人中心同一套）。
+
+        2026-10-06 补 avatar 分支：前端按契约发 `{avatar: "data:image/…"}` 时，
+        老实现只读 nickname，会把昵称**清空**还回 200（等于悄悄改坏数据）。
+        现在：带 avatar 就走 upload_avatar；带 nickname 才改昵称；两个都带就都做。
+        """
+        _require_auth(authorization)
+        account_mod = _account_module()
+        acc = account_mod.load_account()
+        if not acc:
+            raise HTTPException(401, "本机还没登录星群账号")
+        payload = body or {}
+        token = str(acc.get("token") or "")
+        did = []
+
+        data_url = str(payload.get("avatar") or "")
+        if data_url:
+            if not data_url.startswith("data:image/"):
+                raise HTTPException(400, "头像格式不对（要 data:image/... 的 data URL）")
+            if len(data_url) > 4 * 1024 * 1024:
+                raise HTTPException(400, "头像太大了，换一张小一点的")
+            res = account_mod.upload_avatar(token, data_url)
+            if not res.get("ok"):
+                raise HTTPException(400, res.get("detail") or "换头像失败")
+            account_mod._apply_profile(res)
+            did.append("avatar")
+
+        if "nickname" in payload:
+            nickname = str(payload.get("nickname") or "")
+            if len(nickname) > 32:
+                raise HTTPException(400, "昵称最多 32 个字")
+            res = account_mod._post("/api/account/profile", {"nickname": nickname}, token=token)
+            if not res.get("ok"):
+                raise HTTPException(400, res.get("detail") or "改昵称失败")
+            account_mod._apply_profile(res)
+            did.append("nickname")
+
+        if not did:
+            raise HTTPException(400, "没说要改什么（nickname 或 avatar 至少给一个）")
+        out = _profile_payload(account_mod, account_mod.load_account() or acc)
+        out["changed"] = did
+        return out
+
+    @app.post("/api/account/avatar")
+    def account_avatar_save(body: dict, authorization: str = Header("", alias="Authorization")):
+        """换头像：前端压成 data URL 传进来，转发给账号服务（它会再裁一次）并落盘。"""
+        _require_auth(authorization)
+        account_mod = _account_module()
+        acc = account_mod.load_account()
+        if not acc:
+            raise HTTPException(401, "本机还没登录星群账号")
+        data_url = str((body or {}).get("avatar") or "")
+        if not data_url.startswith("data:image/"):
+            raise HTTPException(400, "头像格式不对（要 data:image/... 的 data URL）")
+        if len(data_url) > 4 * 1024 * 1024:
+            raise HTTPException(400, "头像太大了，换一张小一点的")
+        res = account_mod.upload_avatar(str(acc.get("token") or ""), data_url)
+        if not res.get("ok"):
+            raise HTTPException(400, res.get("detail") or "换头像失败")
+        account_mod._apply_profile(res)
+        return _profile_payload(account_mod, account_mod.load_account() or acc)
 
 
 # ===== 本地知识库读写（供上面的路由与自检使用）=====
@@ -1458,6 +2056,41 @@ def _ai_config_module():
     return ai_config
 
 
+def _restart_policy():
+    """「这次改动要不要重启」的唯一口径（core.restart_policy）。
+
+    拿不到就用一份最小兜底（不能让接口因为这个辅助模块 500）。
+    """
+    try:
+        from qbotmanager.core import restart_policy
+        return restart_policy
+    except Exception:  # noqa: BLE001
+        class _Fallback:
+            HOT_LINE = "设置改了立即生效；代码改了才需要重启，且点一下就能重启。"
+
+            @staticmethod
+            def summary() -> dict:
+                return {"line": _Fallback.HOT_LINE, "hot_keys": [], "cold_keys": []}
+
+        return _Fallback
+
+
+def _refresh_bot_hot_config() -> None:
+    """把机器人侧的热配置刷一遍（`.env` + 有效开关快照）。
+
+    控制台所有"设置类"改动存完都该调它一次：机器人进程下次读就是新值，
+    **不用重启**。失败只记日志（用户还能点重启兜底），绝不把保存弄失败。
+    """
+    try:
+        s = _settings()
+        from qbotmanager.core import bot as bot_mod
+
+        bot_mod.write_env(s)
+        bot_mod.write_live_gates(s)
+    except Exception as exc:  # noqa: BLE001
+        _log(f"刷新机器人热配置失败（这次改动可能要重启才生效）：{exc}")
+
+
 def _agent_profile_module():
     """延迟导入桌面端智能体档案模块（唤醒词提取用它；它只依赖 core，不带 PySide6）。
 
@@ -1485,6 +2118,176 @@ def _tool_packs_module():
             500, f"服务端缺少能力包模块（qbotmanager.core.tool_packs）：{exc}"
         ) from exc
     return tool_packs
+
+
+# ------------------------------------------------------------ 本机能力清单
+# 对应桌面端 `ui/pages/plugins_page.py::_build_capability_panel`（2026-10-12 新增）
+# 与 `core/ai_config.py::list_capabilities`（同一份实现，**不另写第二套**）。
+
+def _agent_runtime_schemas() -> list:
+    """主程序内置工具清单（拿不到就返回空，不影响界面）。"""
+    try:
+        from qbotmanager.core.agent.runtime import get_runtime
+
+        return list(get_runtime().schemas("") or [])
+    except Exception:  # noqa: BLE001 —— 运行时缺依赖时这一节照旧显示插件那份
+        return []
+
+
+def _plugin_tool_meta() -> tuple:
+    """静态解析 ai 插件里的工具声明 + 权限表（与 ai_config._plugin_actions 同一口径）。
+
+    为什么不直接 import 插件：那个包要 nonebot，控制台进程不该为了"看一眼清单"
+    把机器人依赖拖进来（桌面端也是这么做的，见 ai_config._plugin_actions 的注释）。
+    """
+    base = (Path(__file__).resolve().parent.parent / "qbotmanager" / "assets"
+            / "plugins" / "ai" / "tools_bridge.py")
+    actions = []
+    perms = {}
+    try:
+        text = base.read_text(encoding="utf-8")
+    except OSError:
+        return actions, perms
+    for m in re.finditer(r'_tool\(\s*"([a-z_]+)"\s*,\s*"([^"]{0,200})"', text):
+        actions.append({"name": m.group(1), "desc": m.group(2)})
+    try:
+        perms = dict(re.findall(r'^\s{4}"([a-z_]+)":\s*"([^"]*)",\s*$', text, re.M))
+    except Exception:  # noqa: BLE001
+        perms = {}
+    return actions, perms
+
+
+def capabilities_list() -> dict:
+    """本机能调用的全部能力：名字 / 说明 / 来源 / 需要权限 / 现在开没开。
+
+    与桌面端 `ai_config.list_capabilities` 一一对应（同一份 disabled_tools）。
+    `source` 用中文短标签：主程序 / 内置 ai 插件 / 能力包 / 智能体档案。
+    返回值里额外带 `hot_reload` 与 `note`，前端照它显示"改完立即生效"。
+    """
+    cfg = _ai_config_module()
+    s = _settings()
+    disabled = set(cfg.read_disabled_tools(s))
+    rows = []
+    for tool in _agent_runtime_schemas():
+        name = str(((tool or {}).get("function") or {}).get("name") or "")
+        if not name:
+            continue
+        rows.append({
+            "name": name,
+            "desc": str(((tool or {}).get("function") or {}).get("description") or "")[:160],
+            "source": "主程序",
+            "permission": "",
+            "enabled": name not in disabled,
+        })
+    actions, perms = _plugin_tool_meta()
+    for item in actions:
+        rows.append({
+            "name": item["name"],
+            "desc": item["desc"][:160],
+            "source": "内置 ai 插件",
+            "permission": perms.get(item["name"], ""),
+            "enabled": item["name"] not in disabled,
+        })
+    # 已装能力包（装上即用，没有单独开关；列出来是为了让"本机能调什么"完整）
+    try:
+        packs = _tool_packs_module().list_packs(s) or []
+    except Exception:  # noqa: BLE001 —— 能力包读不到不影响插件那份清单
+        packs = []
+    for pack in packs:
+        pid = str(pack.get("id") or pack.get("name") or "")
+        if not pid:
+            continue
+        rows.append({
+            "name": "包:" + pid,
+            "desc": str(pack.get("desc") or pack.get("title") or "")[:160],
+            "source": "能力包",
+            "permission": "",
+            "enabled": True,
+        })
+    # 名字去重（同名只留第一条：主程序优先）
+    seen = set()
+    uniq = []
+    for row in rows:
+        if row["name"] in seen:
+            continue
+        seen.add(row["name"])
+        uniq.append(row)
+    return {
+        "ok": True,
+        "items": uniq,
+        "total": len(uniq),
+        "enabled": sum(1 for r in uniq if r["enabled"]),
+        "disabled_tools": sorted(disabled),
+        "has_approve_friend": any(r["name"] == "approve_friend" for r in uniq),
+        "has_agent_tools": any(r["name"] == "send_to" for r in uniq),
+        "hot_reload": True,
+        "note": "关掉某个开关，机器人就不再用它 —— 模型那边直接看不见。改完立即生效，不用重启机器人。",
+    }
+
+
+def capabilities_toggle(name: str, enabled: bool) -> dict:
+    """开/关一项能力（写机器人侧同一份 disabled_tools；机器人每条消息现读）。"""
+    cfg = _ai_config_module()
+    s = _settings()
+    before = set(cfg.read_disabled_tools(s))
+    cfg.set_tool_enabled(s, name, bool(enabled))
+    after = set(cfg.read_disabled_tools(s))
+    return {
+        "ok": True,
+        "name": name,
+        "enabled": bool(enabled),
+        "changed": sorted(before ^ after),
+        "needs_restart": False,
+        "hot_reload": True,
+        "note": _restart_policy().HOT_LINE,
+    }
+
+
+# ------------------------------------------------------------ 好友申请（只读桥）
+# 机器人进程把待处理申请写一份 JSON（assets/plugins/ai/friend_requests.py），
+# 控制台进程只读它 —— 两个进程不共享内存，控制台**绝不**替机器人做动作。
+# 落盘路径由 deploy.build_settings().bot_dir 决定，两边用同一个环境变量对齐：
+#   ASTROSWARM_BOT_DIR（deploy.build_bot_env 注入；老的没注入时回退 bot/ 相对路径）。
+
+def friend_requests_path() -> Path:
+    try:
+        bot_dir = Path(str(_settings().bot_dir))
+    except Exception:  # noqa: BLE001
+        bot_dir = Path.cwd() / "bot"
+    return bot_dir / "data" / "friend_requests.json"
+
+
+def friend_requests_state() -> dict:
+    """待处理好友申请（只读）。文件不在 = 机器人还没收到过申请，不是错误。"""
+    path = friend_requests_path()
+    rows = []
+    updated = 0.0
+    try:
+        data = json.loads(path.read_text(encoding="utf-8") or "{}")
+        if isinstance(data, dict):
+            rows = [r for r in (data.get("pending") or []) if isinstance(r, dict)]
+            updated = float(data.get("updated_at") or 0)
+    except FileNotFoundError:
+        rows = []
+    except Exception as exc:  # noqa: BLE001 —— 坏文件不该让整页 500
+        raise HTTPException(500, f"好友申请文件读不出来：{exc}") from exc
+    cfg = _ai_config_module()
+    s = _settings()
+    try:
+        auto = cfg.read_auto_approve_friend(s)
+    except Exception:  # noqa: BLE001
+        auto = False
+    return {
+        "ok": True,
+        "pending": rows,
+        "total": len(rows),
+        "auto_approve_friend": auto,
+        "updated_at": updated,
+        "path": str(path),
+        "read_only": True,
+        "note": ("控制台只读这份清单：机器人进程才是处理好友申请的那一方。"
+                 "要自动通过就打开「自动通过好友申请」开关。"),
+    }
 
 
 def mcp_config() -> dict:
@@ -1700,6 +2503,33 @@ def install_tool_pack_zip(filename: str, content_b64: str, confirm: bool) -> dic
 
 
 # ===== 消息与统计（消息中心 / 首页真实统计）=====
+
+class _LinuxRunState:
+    """把 Linux 的运行状态包成桌面端 qq_doctor 期望的那两个方法。
+
+    桌面端那边传的是 core/manager.py；无头端没有这个类，运行状态在 deploy.status()
+    里（state: running/installed/not_installed + qq: connected/stopped/unknown）。
+    接口对不上就会误报"机器人没在跑"，所以这里显式转一层。
+    """
+
+    def bot_running(self) -> bool:
+        try:
+            return str(deploy.status().get("state") or "") == "running"
+        except Exception:  # noqa: BLE001
+            return False
+
+    def qq_login_state(self) -> dict:
+        try:
+            state = str(deploy.status().get("qq") or "")
+        except Exception:  # noqa: BLE001
+            state = ""
+        label = {
+            "connected": "已连接（协议端在线）",
+            "stopped": "没连上（协议端不在线）",
+            "unknown": "读不到连接状态",
+        }.get(state, "")
+        return {"connected": state == "connected", "reason": label}
+
 
 def _message_store():
     """延迟导入桌面端消息模块（只依赖 core）。"""
@@ -1977,6 +2807,587 @@ def memory_clear(confirm: bool) -> dict:
     return {"ok": True, "cleared": total, "backup": backup, "needs_restart": True}
 
 
+# ---- 内置记忆（程序侧三档那套）：与桌面端「AI 大脑 → 现在记住了什么」同一份数据 ----
+
+def _builtin_memory_module():
+    """延迟导入内置记忆模块。老装机环境没有它 → 503 并说清原因，而不是 500。"""
+    try:
+        from qbotmanager.core import memory as memory_mod
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(503, f"服务端缺少内置记忆模块（qbotmanager.core.memory）：{exc}") from exc
+    return memory_mod
+
+
+def builtin_memory_overview(qq: str = "") -> dict:
+    """「现在记住了什么」：档位 + 条数 + 条目明细。
+
+    **只读**，而且走的是内置模块自己的 list_memories——它会把 off 档处理成空，
+    与机器人侧看到的一致（控制台不会显示机器人其实看不见的东西）。
+    """
+    mod = _builtin_memory_module()
+    cfg = _ai_config_module()          # 档位说明的文案与桌面端共用同一份，别各写各的
+    level = mod.level()
+    info = dict(mod.stats() or {})
+    rows: list = []
+    if level != "off":
+        try:
+            conn = mod.store().connect()
+            if qq:
+                people = [str(qq)]
+            else:
+                # 按「最近写过记忆的人」排前面。必须 GROUP BY：SELECT DISTINCT 配
+                # ORDER BY MAX(id) 在 SQLite 里是 misuse of aggregate（线上真踩过）。
+                people = [str(r["qq"]) for r in conn.execute(
+                    "SELECT qq, MAX(id) AS last_id FROM memories WHERE expired=0 "
+                    "GROUP BY qq ORDER BY last_id DESC LIMIT 50")]
+            for person in people:
+                for r in conn.execute(
+                        "SELECT id, qq, fact, kind, weight, ts, expired FROM memories "
+                        "WHERE qq=? AND expired=0 ORDER BY id DESC LIMIT 50", (person,)):
+                    rows.append({"id": int(r["id"]), "qq": str(r["qq"]),
+                                 "fact": str(r["fact"]), "kind": str(r["kind"] or "event"),
+                                 "weight": int(r["weight"] or 3),
+                                 "ts": int(r["ts"] or 0)})
+        except Exception as exc:  # noqa: BLE001 —— 读库失败要说出来，不能显示成「没有记忆」
+            raise HTTPException(500, f"读内置记忆库失败：{exc}") from exc
+    return {
+        "ok": True,
+        "level": level,
+        "level_label": cfg.MEMORY_LEVEL_LABELS.get(level, level),
+        "level_note": cfg.MEMORY_LEVEL_NOTE,
+        "options": cfg.memory_level_info()["options"],
+        "total": int(info.get("total") or 0),
+        "promises": int(info.get("promises") or 0),
+        "impressions": int(info.get("impressions") or 0),
+        "expired": int(info.get("expired") or 0),
+        "db": str(info.get("db") or ""),
+        "rows": rows,
+        "truncated": len(rows) >= 50 * 50,
+    }
+
+
+def builtin_memory_forget(qq: str, fact: str = "") -> dict:
+    """「忘掉这件事」：真删（不是标记）。fact 留空 = 清掉这个人的全部记忆。"""
+    mod = _builtin_memory_module()
+    if mod.level() == "off":
+        raise HTTPException(400, "当前档位是「无」，本来就没有在记")
+    removed = list(mod.forget(str(qq), str(fact or "")) or [])
+    return {"ok": True, "removed": removed, "count": len(removed),
+            "scope": "all" if not str(fact or "").strip() else "one",
+            "needs_restart": False}
+
+
+# ===== 通道配置（飞书 / QQ 官方）与日志保留 =====
+# 存哪：
+#   飞书凭证、日志保留天数 → 无头配置 config_home/config.json，键名与桌面端 Settings 的
+#   同名字段一模一样（feishu_enabled / feishu_app_id / ... / logs_keep_days）；
+#   QQ 官方凭证 → 已有的 qq_app_id / qq_app_secret / qq_app_token / qq_channel
+#   （deploy.build_settings() 本来就把它们映射进 Settings，机器人的 write_env 也读它）。
+# 为什么不像桌面端那样写 <root>/settings.json：无头端的机器人启动读的是 config.json
+#   （deploy.build_settings），写 settings.json 没人读 —— 控制台存了等于没存。
+
+_CLEAR_VALUE = "__clear__"        # 前端用它表示"把这个字段清空"
+_SECRET_MAX_LEN = 512             # 凭证字段长度上限（挡手滑粘进来一整页东西）
+_LOGS_KEEP_DEFAULT = 10           # 老板定的默认：日志留最近 10 天
+_LOGS_KEEP_MIN, _LOGS_KEEP_MAX = 1, 365
+_ADAPTER_WAIT_SECONDS = 25        # 装适配器最多让请求等这么久（再长就会被 nginx 掐掉）
+_ADAPTER_LOG_LINES = 120          # 安装日志最多留多少行（给前端展示）
+
+# deploy.build_settings() 没映射、但机器人侧要用到的字段（键名与桌面端 Settings 字段一致）
+# 少了这一步，控制台把飞书凭证存进 config.json 后机器人读不到：write_env() 拼不出
+# FEISHU_BOTS、适配器也不会注册 —— 界面显示"就绪"而机器人根本不连，正是桌面端飞书页
+# 明确拒绝的"假装已接入"。deploy.py 不在本次改动范围内，所以在下面包一层补上。
+_CONSOLE_SETTINGS_FIELDS = (
+    ("feishu_enabled", "bool"),
+    ("feishu_app_id", "str"),
+    ("feishu_app_secret", "str"),
+    ("feishu_encrypt_key", "str"),
+    ("feishu_verification_token", "str"),
+)
+
+_bridge_lock = threading.Lock()
+_bridge_installed = False
+
+# 装适配器是后台线程 + 轮询等待：pip 要联网，几十秒起步，同步等必被 nginx 掐
+_adapter_lock = threading.Lock()
+_adapter_state = {"running": False, "log": [], "ok": None, "error": "", "started_at": 0.0}
+
+# 适配器装没装的缓存：bot.feishu_adapter_installed() 每次都要起一个 `pip show` 子进程
+# （实测 0.5~1.5 秒），状态卡被控制台轮询会把 CPU 白烧掉。
+_adapter_cache = {"key": "", "at": 0.0, "ok": False}
+_ADAPTER_CACHE_TTL = 15.0
+
+
+def _as_bool(value) -> bool:
+    """配置里的布尔（手改过的 config.json 可能是 "true"/"1" 这类字符串）。"""
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "yes", "on", "是", "开")
+    return bool(value)
+
+
+def _clamp_keep_days(value) -> int:
+    """日志保留天数收敛到 1~365，脏值回默认 10（与桌面端 QSpinBox 的范围一致）。"""
+    try:
+        days = int(value)
+    except (TypeError, ValueError):
+        return _LOGS_KEEP_DEFAULT
+    return max(_LOGS_KEEP_MIN, min(days, _LOGS_KEEP_MAX))
+
+
+def _overlay_console_fields(settings, cfg: dict):
+    """把无头配置里那几个 deploy.build_settings() 不认识的字段补到 Settings 上。"""
+    for key, kind in _CONSOLE_SETTINGS_FIELDS:
+        if key not in cfg or cfg.get(key) is None:
+            continue
+        try:
+            setattr(settings, key, _as_bool(cfg[key]) if kind == "bool" else str(cfg[key]))
+        except (TypeError, ValueError):   # noqa: PERF203 —— 单字段脏了不该拖垮整份配置
+            continue
+    if "logs_keep_days" in cfg:
+        settings.logs_keep_days = _clamp_keep_days(cfg.get("logs_keep_days"))
+    return settings
+
+
+def install_settings_bridge() -> bool:
+    """给 deploy.build_settings() 包一层，让机器人的启动路径也拿到飞书凭证 / 日志保留天数。
+
+    幂等：重复调用（register 被调多次、selftest 又建一个 app）只包一次。
+    将来 deploy.build_settings() 自己映射了这几个键，这个包装可以整段删掉 ——
+    它叠加的就是同一份 config.json，不会重复也不会打架。
+    """
+    global _bridge_installed
+    with _bridge_lock:
+        current = deploy.build_settings
+        if _bridge_installed or getattr(current, "_console_bridge", False):
+            return False
+        original = current
+
+        @functools.wraps(original)
+        def build_settings():
+            return _overlay_console_fields(original(), headless_config.load())
+
+        build_settings._console_bridge = True
+        deploy.build_settings = build_settings
+        _bridge_installed = True
+    return True
+
+
+def _channel_settings():
+    """_settings() 再补上控制台写在无头配置里的通道字段（飞书凭证 / 日志保留天数）。
+
+    为什么不直接用 _settings()：deploy.build_settings() 建的是全新 Settings，
+    飞书那 5 个键不在它的映射表里；不补的话控制台自己都读不回来 ——
+    状态卡会永远显示"没填"。这里和 install_settings_bridge() 是同一份口径。
+    """
+    s = _overlay_console_fields(_settings(), headless_config.load())
+    py = _bot_python(s)
+    if py is not None:
+        # build_settings() 给的 python_exe 是 python_dir/"python.exe"（Windows 名），
+        # Linux 上不存在 —— 不换成机器人 venv 的那个，adapter_installed 永远是 False。
+        s.python_exe = py
+    return s
+
+
+def _save_headless(cfg: dict) -> dict:
+    """把整份无头配置写回去（headless_config.save 会自己合并默认值、原子落盘）。"""
+    try:
+        return headless_config.save(cfg)
+    except Exception as exc:  # noqa: BLE001 —— 给人话，不让 OSError 裸奔成 500 堆栈
+        raise HTTPException(
+            500, f"保存配置失败（{headless_config.config_path()}）：{exc}") from exc
+
+
+def _bot_module():
+    """延迟导入机器人模块（装适配器 / 判适配器装没装都用它）。"""
+    try:
+        from qbotmanager.core import bot as bot_mod
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(500, f"服务端缺少机器人模块（qbotmanager.core.bot）：{exc}") from exc
+    return bot_mod
+
+
+def _apply_secret(data: dict, key: str, current: str):
+    """算一个凭证字段的新值，返回 (新值, 是否变了)。
+
+    写规则（前后端约定）：字段没传 / 传 null / 传空串 = **不改**（前端回填不了密钥，
+    空串只表示"这栏没动过"）；传 `__clear__` = 清空；其它 = 覆盖。
+    这样前端可以整表提交而不必先把密钥读出来（后端也永远不回显它）。
+    """
+    if key not in data or data.get(key) is None:
+        return current, False
+    value = str(data.get(key)).strip()
+    if not value:
+        return current, False
+    if value == _CLEAR_VALUE:
+        value = ""
+    elif len(value) > _SECRET_MAX_LEN or "\n" in value or "\r" in value:
+        raise HTTPException(
+            400, f"{key} 不合法：最多 {_SECRET_MAX_LEN} 个字符，也不能带换行")
+    return value, value != current
+
+
+def _log_adapter(line) -> None:
+    text = str(line or "").strip()
+    if not text:
+        return
+    with _adapter_lock:
+        _adapter_state["log"] = (_adapter_state["log"] + [text])[-_ADAPTER_LOG_LINES:]
+
+
+def _feishu_adapter_installed(settings, refresh: bool = False) -> bool:
+    """飞书适配器装没装（带 15 秒缓存，见 _adapter_cache 的说明）。"""
+    key = str(getattr(settings, "python_exe", "") or "")
+    now = _now()
+    with _adapter_lock:
+        if (not refresh and _adapter_cache["key"] == key
+                and now - _adapter_cache["at"] < _ADAPTER_CACHE_TTL):
+            return bool(_adapter_cache["ok"])
+    try:
+        ok = bool(_bot_module().feishu_adapter_installed(settings))
+    except Exception as exc:  # noqa: BLE001 —— 查不出来按"没装"处理，别让状态接口 500
+        _log(f"检查飞书适配器失败：{exc}")
+        ok = False
+    with _adapter_lock:
+        _adapter_cache.update(key=key, at=now, ok=ok)
+    return ok
+
+
+def feishu_state(settings=None) -> dict:
+    """飞书通道状态。**只回 *_set 布尔**，App Secret / Token 一律不回显。"""
+    s = settings if settings is not None else _channel_settings()
+    app_id = str(getattr(s, "feishu_app_id", "") or "").strip()
+    secret = str(getattr(s, "feishu_app_secret", "") or "").strip()
+    token = str(getattr(s, "feishu_verification_token", "") or "").strip()
+    encrypt = str(getattr(s, "feishu_encrypt_key", "") or "").strip()
+    enabled = bool(getattr(s, "feishu_enabled", False))
+    installed = _feishu_adapter_installed(s)
+    # 判据与机器人侧 bot._feishu_ready() 对齐（它还要求 verification_token），
+    # 否则这里显示"就绪"、机器人却不会注册飞书适配器。
+    if not enabled:
+        why = "飞书通道没开：勾上「启用飞书通道」再保存"
+    elif not app_id or not secret:
+        why = "还没填 App ID / App Secret（飞书开放平台 → 开发者后台 → 凭证与基础信息）"
+    elif not token:
+        why = "还差 Verification Token（事件订阅页给的）：缺它机器人不会注册飞书适配器"
+    elif not installed:
+        why = "适配器（nonebot-adapter-feishu）还没装：点「装适配器」（要联网）"
+    else:
+        why = ""
+    return {
+        "ok": True,
+        "enabled": enabled,
+        "app_id_set": bool(app_id),
+        "app_secret_set": bool(secret),
+        "encrypt_key_set": bool(encrypt),
+        "verification_token_set": bool(token),
+        "adapter_installed": installed,
+        "ready": not why,
+        "why": why,
+    }
+
+
+def feishu_save(data: dict) -> dict:
+    """写飞书配置：只有真的变了才落盘（免得每次保存都翻一次配置备份）。"""
+    data = data or {}
+    cfg = headless_config.load()
+    changed = []
+    if "enabled" in data and data.get("enabled") is not None:
+        want = _as_bool(data.get("enabled"))
+        if want != _as_bool(cfg.get("feishu_enabled", False)):
+            cfg["feishu_enabled"] = want
+            changed.append("enabled")
+    for key, cfg_key in (("app_id", "feishu_app_id"),
+                         ("app_secret", "feishu_app_secret"),
+                         ("encrypt_key", "feishu_encrypt_key"),
+                         ("verification_token", "feishu_verification_token")):
+        value, differs = _apply_secret(data, key, str(cfg.get(cfg_key) or ""))
+        if differs:
+            cfg[cfg_key] = value
+            changed.append(key)
+    if changed:
+        _save_headless(cfg)
+    _log("飞书配置已保存：" + ("、".join(changed) if changed else "没有变化"))
+    return {"ok": True, "changed": changed, "needs_restart": True}
+
+
+def feishu_install_adapter_now() -> dict:
+    """装飞书适配器（nonebot-adapter-feishu），最多等 _ADAPTER_WAIT_SECONDS 秒。
+
+    bot.ensure_feishu_deps() 内部是 pip（几十秒起步），同步等会被 nginx 掐成 504，
+    所以放后台线程：装完就回 ok:true；还没装完如实回 ok:false + running:true，
+    安装继续跑（再点一次会接着看进度，不会又起一个 pip）。
+    """
+    s = _channel_settings()
+    if _bot_python(s) is None:
+        return {"ok": False, "adapter_installed": False, "running": False,
+                "log": ["机器人运行时还没部署（缺 .venv）：先启动一次机器人再装适配器"],
+                "error": "机器人运行时还没部署（缺 .venv），先启动一次机器人"}
+    if _feishu_adapter_installed(s, refresh=True):
+        return {"ok": True, "adapter_installed": True, "running": False,
+                "log": ["飞书适配器已经装好了（重启机器人后生效）"],
+                "needs_restart": True, "error": ""}
+
+    with _adapter_lock:
+        running = bool(_adapter_state["running"])
+        if not running:
+            _adapter_state.update(running=True, log=[], ok=None, error="", started_at=_now())
+    if not running:
+        threading.Thread(target=_feishu_install_worker, args=(s,), daemon=True,
+                         name="feishu-adapter-install").start()
+
+    deadline = _now() + _ADAPTER_WAIT_SECONDS
+    while _now() < deadline:
+        with _adapter_lock:
+            if not _adapter_state["running"]:
+                break
+        time.sleep(0.4)
+
+    with _adapter_lock:
+        running = bool(_adapter_state["running"])
+        lines = list(_adapter_state["log"])
+        ok = _adapter_state["ok"]
+        error = str(_adapter_state["error"] or "")
+    if running:
+        _log_adapter(f"还在装（已经等了 {_ADAPTER_WAIT_SECONDS} 秒），后台继续")
+        with _adapter_lock:
+            lines = list(_adapter_state["log"])
+        return {"ok": False, "adapter_installed": False, "running": True, "log": lines,
+                "error": "适配器还在装（pip 要联网，慢的时候一两分钟）：稍后再刷新状态看结果"}
+    installed = _feishu_adapter_installed(s, refresh=True)
+    if not ok and not error:
+        error = "适配器没装上：多半是这台机器连不上 PyPI，或机器人 venv 里没有 pip"
+    if not installed and ok:
+        error = "pip 说装完了但校验没通过：看上面的日志，或在服务器上手跑一次 pip install nonebot-adapter-feishu"
+    return {"ok": bool(ok and installed), "adapter_installed": installed, "running": False,
+            "log": lines, "error": error, "needs_restart": True}
+
+
+def _feishu_install_worker(settings) -> None:
+    """后台装适配器：日志进 _adapter_state，结束写 ok/error（异常也不能把线程带崩）。"""
+    ok, error = False, ""
+    try:
+        ok = bool(_bot_module().ensure_feishu_deps(settings, log=_log_adapter))
+    except Exception as exc:  # noqa: BLE001
+        error = f"装适配器失败：{exc}"
+        _log_adapter(error)
+    with _adapter_lock:
+        _adapter_state.update(running=False, ok=bool(ok), error=error)
+    try:
+        _feishu_adapter_installed(settings, refresh=True)
+    except Exception:  # noqa: BLE001 —— 只是刷缓存，失败无所谓
+        pass
+
+
+def qq_official() -> dict:
+    """QQ 官方通道：凭证是否已填 + 收消息模式 + 见过的群 + 回话白名单。
+
+    凭证读的是无头配置（控制台自己写的那份，deploy.build_settings 也读它）；
+    模式/群名单是机器人侧插件写的状态与 AI 配置（ai_config），所以这里要 _settings()。
+    """
+    cfg = headless_config.load()
+    ai_config = _ai_config_module()
+    s = _channel_settings()
+    try:
+        state = ai_config.read_qq_group_state(s)
+    except Exception as exc:  # noqa: BLE001 —— 读不到状态不该让凭证面板整个打不开
+        _log(f"读取 QQ 群消息模式失败：{exc}")
+        state = {}
+    try:
+        groups = list(ai_config.known_groups(s) or [])
+    except Exception:  # noqa: BLE001
+        groups = []
+    try:
+        allowed = list(ai_config.allowed_groups(s) or [])
+    except Exception:  # noqa: BLE001
+        allowed = []
+    channel = str(cfg.get("qq_channel") or "onebot").strip() or "onebot"
+    return {
+        "ok": True,
+        "enabled": channel != "onebot",      # 与 bot.build_env_text 的判据一致：不是 onebot 就走官方
+        "channel": channel,
+        "appid_set": bool(str(cfg.get("qq_app_id") or "").strip()),
+        "secret_set": bool(str(cfg.get("qq_app_secret") or "").strip()),
+        "token_set": bool(str(cfg.get("qq_app_token") or "").strip()),
+        "mode": str(state.get("mode") or "none"),
+        "mode_text": ai_config.qq_group_state_text(state),
+        "mode_hint": ai_config.qq_group_state_hint(state),
+        "last_ts": float(state.get("last_ts") or 0),
+        "groups": groups,
+        "allowed_groups": allowed,
+    }
+
+
+def qq_official_save(data: dict) -> dict:
+    """写 QQ 官方凭证 / 通道 / 群白名单。
+
+    - enabled：开关官方通道（false 就切回第三方 onebot，与桌面端通道下拉一个语义）；
+    - mode：只接受 official / onebot（等价于 enabled）；收消息模式（全量 / 仅 @）是
+      q.qq.com 那边的设置，控制台改不了 —— 传这种值直接给人话，不装成成功。
+    - appid / secret / token：__clear__ 清空、空串不改（同飞书）。
+    - allowed_groups：可选的群白名单（空数组 = 不限群），走 ai_config 那份机器人侧配置。
+    """
+    data = data or {}
+    cfg = headless_config.load()
+    changed = []
+    # 收消息模式（全量 / 仅 @）改不动：它由 q.qq.com 的「接收所有消息」决定，是**只读状态**。
+    # 传这种值不报错（前端整表提交时不会因此保存失败），但要如实回 mode_ignored + 怎么办。
+    mode_ignored = False
+    note = ""
+
+    def set_channel(value: str, field: str) -> None:
+        if str(cfg.get("qq_channel") or "") != value:
+            cfg["qq_channel"] = value
+            changed.append(field)
+
+    if "enabled" in data and data.get("enabled") is not None:
+        set_channel("official" if _as_bool(data.get("enabled")) else "onebot", "enabled")
+    if "mode" in data and data.get("mode") is not None:
+        mode = str(data.get("mode") or "").strip().lower()
+        if mode in ("official", "onebot"):
+            set_channel(mode, "mode")
+        elif mode in ("full", "at_only", "none", "all", "at"):
+            mode_ignored = True
+            note = ("收消息模式（全量 / 仅 @）由 QQ 开放平台的「接收所有消息」决定，"
+                    "控制台改不了：去 q.qq.com 打开它，再重启机器人。")
+            _log("QQ 官方：有人在改收消息模式，已拒绝（要在 q.qq.com 改）")
+        else:
+            raise HTTPException(400, "mode 只能是 official（官方机器人）或 onebot（第三方协议端）")
+    for key, cfg_key in (("appid", "qq_app_id"),
+                         ("secret", "qq_app_secret"),
+                         ("token", "qq_app_token")):
+        value, differs = _apply_secret(data, key, str(cfg.get(cfg_key) or ""))
+        if differs:
+            cfg[cfg_key] = value
+            changed.append(key)
+
+    # 白名单先校验类型再落盘：不然后面 400 了，前面几个字段却已经写进去了（半套生效）
+    groups = data.get("allowed_groups")
+    if "allowed_groups" in data and groups is not None and not isinstance(groups, list):
+        raise HTTPException(400, "allowed_groups 要是数组（空数组 = 不限群）")
+
+    if changed:
+        _save_headless(cfg)
+
+    if isinstance(groups, list):
+        try:
+            _ai_config_module().save_allowed_groups(_channel_settings(), groups)
+        except HTTPException:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(500, f"保存群白名单失败：{exc}") from exc
+        changed.append("allowed_groups")
+
+    _log("QQ 官方配置已保存：" + ("、".join(changed) if changed else "没有变化"))
+    return {"ok": True, "changed": changed, "needs_restart": True,
+            "mode_ignored": mode_ignored, "note": note}
+
+
+def _logs_keep_days() -> int:
+    return _clamp_keep_days(headless_config.load().get("logs_keep_days"))
+
+
+def _logs_usage(home: Path) -> dict:
+    """日志目录占用（桌面端服务页显示的"现在占多少 MB / 几个文件"）。"""
+    try:
+        from qbotmanager.core import cleanup as cleanup_mod
+
+        info = cleanup_mod.logs_usage(home) or {}
+    except Exception as exc:  # noqa: BLE001 —— 统计不出来也不能让接口挂掉
+        _log(f"统计日志占用失败：{exc}")
+        info = {}
+    return {"bytes": int(info.get("bytes") or 0),
+            "files": int(info.get("files") or 0),
+            "mb": float(info.get("mb") or 0.0)}
+
+
+def _archived_logs(home: Path) -> list:
+    """已归档的旧日志文件名（正在写的那两份不在里面；按名字排序方便前端直接列）。"""
+    live = set(logs.LOG_FILES.values())
+    try:
+        from qbotmanager.core import cleanup as cleanup_mod
+
+        is_archived = cleanup_mod._is_archived_log      # noqa: SLF001 —— 与桌面端同一套判据
+    except Exception:  # noqa: BLE001
+        is_archived = None
+    names = []
+    try:
+        entries = sorted(Path(home).iterdir())
+    except OSError:
+        return []
+    for path in entries:
+        try:
+            if not path.is_file() or path.name in live:
+                continue
+        except OSError:
+            continue
+        if is_archived is not None:
+            try:
+                if not is_archived(path.name):
+                    continue
+            except Exception:  # noqa: BLE001
+                pass
+        elif ".log" not in path.name.lower():
+            continue
+        names.append(path.name)
+    return names
+
+
+def logs_retention_state() -> dict:
+    home = platform_info.log_home()
+    return {"ok": True, "keep_days": _logs_keep_days(),
+            "usage": _logs_usage(home), "archives": _archived_logs(home),
+            "dir": str(home)}
+
+
+def logs_retention_save(data: dict) -> dict:
+    """改日志保留天数（1~365）。越界 / 非整数一律 400 说清楚，不静默改成别的值。"""
+    data = data or {}
+    if "keep_days" not in data or data.get("keep_days") is None:
+        raise HTTPException(400, "必须提供 keep_days（1~365 的整数）")
+    raw = data["keep_days"]
+    if isinstance(raw, bool) or (isinstance(raw, float) and not float(raw).is_integer()):
+        raise HTTPException(400, "keep_days 必须是 1~365 的整数")
+    try:
+        days = int(str(raw).strip())
+    except (TypeError, ValueError):
+        raise HTTPException(400, "keep_days 必须是 1~365 的整数") from None
+    if not _LOGS_KEEP_MIN <= days <= _LOGS_KEEP_MAX:
+        raise HTTPException(
+            400, f"keep_days 只能是 {_LOGS_KEEP_MIN}~{_LOGS_KEEP_MAX} 天（收到 {days}）")
+    cfg = headless_config.load()
+    cfg["logs_keep_days"] = days
+    _save_headless(cfg)
+    _log(f"日志保留天数已改为 {days} 天")
+    # 机器人的清理线程读 settings.logs_keep_days，所以下次启动才用上新值（见 install_settings_bridge）
+    return {"ok": True, "keep_days": days, "needs_restart": True}
+
+
+def logs_cleanup_now() -> dict:
+    """立刻归档跨天的日志 + 删掉超过保留天数的归档。
+
+    与桌面端服务页的「立刻清理旧日志」同一个函数（cleanup.rotate_and_prune_logs）：
+    正在写的那份永不删，被占用的（Windows 常见）进 skipped，下次再来。
+    """
+    home = platform_info.log_home()
+    keep = _logs_keep_days()
+    try:
+        from qbotmanager.core import cleanup as cleanup_mod
+
+        stats = cleanup_mod.rotate_and_prune_logs(home, keep) or {}
+    except Exception as exc:  # noqa: BLE001 —— 回 ok:false + 原因，别 500
+        _log(f"清理日志失败：{exc}")
+        return {"ok": False, "error": f"清理日志失败：{exc}", "rotated": [], "deleted": [],
+                "skipped": [], "bytes_freed": 0, "keep_days": keep, "needs_restart": False}
+    rotated = [str(x) for x in (stats.get("rotated") or [])]
+    deleted = [str(x) for x in (stats.get("deleted") or [])]
+    freed = int(stats.get("bytes_freed") or 0)
+    _log(f"日志清理：归档 {len(rotated)} 个、删除 {len(deleted)} 个，回收 {round(freed / 1048576, 2)} MB")
+    # 这是立刻生效的动作、没改任何配置：不需要重启（桌面端同样不提示重启）
+    return {"ok": True, "rotated": rotated, "deleted": deleted,
+            "skipped": [str(x) for x in (stats.get("skipped") or [])],
+            "bytes_freed": freed, "keep_days": keep, "needs_restart": False}
+
+
 def selftest() -> dict:
     """不依赖 HTTP 的自检：路由能注册、依赖名提取、包名校验、开关读写都能跑。"""
     app = FastAPI()
@@ -1999,4 +3410,12 @@ def selftest() -> dict:
         "persona_ok_ids": [p for p in ("com.demo.rose", "rose-1.0", "A_b.c") if valid_persona_id(p)],
         "personas_dir": str(_personas_root()),
         "json_dump_ok": bool(json.dumps(dict(_state), ensure_ascii=False)),
+        # 凭证写规则：空串不改、__clear__ 清空（前端整表提交时靠它，谁也不回显密钥）
+        "secret_rule": {
+            "empty_keeps": _apply_secret({"k": ""}, "k", "old")[0],
+            "missing_keeps": _apply_secret({}, "k", "old")[0],
+            "clear_clears": _apply_secret({"k": _CLEAR_VALUE}, "k", "old")[0],
+            "value_overwrites": _apply_secret({"k": " new "}, "k", "old")[0],
+        },
+        "settings_bridge": bool(getattr(deploy.build_settings, "_console_bridge", False)),
     }

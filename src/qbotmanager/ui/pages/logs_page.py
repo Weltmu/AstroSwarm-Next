@@ -10,6 +10,7 @@ import threading
 import time
 
 from PySide6.QtCore import QTimer
+from PySide6.QtGui import QColor, QTextCharFormat, QTextCursor
 from PySide6.QtWidgets import (
     QComboBox, QFileDialog, QHBoxLayout, QLabel, QPlainTextEdit, QPushButton,
     QVBoxLayout, QWidget,
@@ -17,10 +18,34 @@ from PySide6.QtWidgets import (
 
 from ...core import log_export
 from ..theme import MONO_FAMILY, TEXT_3
+from ...core import qq_events
 from ..widgets import GlassPanel
 from .common import Worker
 
 LEVELS = ("全部", "INFO", "OK", "WARN", "ERROR")
+# 级别 → 文字颜色（2026-10-06 用户要求：成功要绿、出错要红，别一片灰）。
+# 用 [OK] / [SUCCESS] / [ERROR] 这种级别前缀判断，不看正文里随便出现的 ok 二字。
+_LEVEL_COLORS = {
+    "OK": "#3DDC97",
+    "SUCCESS": "#3DDC97",
+    "ERROR": "#FF6B6B",
+    "FATAL": "#FF6B6B",
+    "CRITICAL": "#FF6B6B",
+    "WARN": "#FFC65C",
+    "WARNING": "#FFC65C",
+}
+
+
+def _line_color(level: str, text: str) -> str:
+    """按级别给整行上色；不确定的级别回落到中性色。"""
+    key = str(level or "").strip().upper()
+    if key in _LEVEL_COLORS:
+        return _LEVEL_COLORS[key]
+    if key in ("INFO", "DEBUG", ""):
+        m = re.search(r"\[(SUCCESS|ERROR|FATAL|CRITICAL|WARN|WARNING)\]", str(text or ""), re.I)
+        if m:
+            return _LEVEL_COLORS.get(m.group(1).upper(), "#C6D0E0")
+    return "#C6D0E0"
 # 文件来源：磁盘上实际一直在写的 5 份日志（与 core/cleanup._LOG_FILES 对齐）。
 # 以前页面只跟随 nonebot.log，manager / deploy / dsh / liqinghan 四份日志在界面上完全看不到。
 FILE_SOURCES = (
@@ -30,10 +55,28 @@ FILE_SOURCES = (
     ("星群助手", "dsh.log"),
     ("李清菡", "liqinghan.log"),
 )
-SOURCES = ("全部", "任务") + tuple(label for label, _ in FILE_SOURCES)
+SOURCES = ("全部", "官方通道", "任务") + tuple(label for label, _ in FILE_SOURCES)
+# 「官方通道」不是一份文件，而是一个跨文件的筛选项：凡带 EventType. / qq_official 等
+# 字样的行都算（用户排查"群里 @ 它不回"时要能一眼筛出来）。
+OFFICIAL_FILTER = "官方通道"
 MAX_MASTER = 12000
 TAIL_MAX_BYTES = 256 * 1024  # 首次跟随最多读日志尾部 256KB，防止大文件一次性拖死 UI
 RENDER_BATCH = 300           # 渲染时分批 append，避免一次几万行阻塞界面
+
+# 终端颜色码有两种落盘形式，都要剥掉（2026-10-06 实测日志里出现的是第二种）：
+#   ① 真 ESC 字节（在终端里染色用）：0x1b [36m
+#   ② 字面文本（Python 里写法被当字符串存进日志）：\x1b[36m / \u001b[36m
+# 不剥的话用户会看到 "[外观][\u001b[36m动态背景[\u001b[0m: ..." 这种残渣。
+_ANSI_RE = re.compile(
+    r"\x1b\[[0-9;]*m"
+    r"|\\x1b\[[0-9;]*m"
+    r"|\\u001b\[[0-9;]*m",
+    re.I,
+)
+
+
+def strip_ansi(text: str) -> str:
+    return _ANSI_RE.sub("", str(text or ""))
 
 
 def _infer_level(line: str) -> str:
@@ -71,7 +114,7 @@ class LogsPage(QWidget):
 
         title = QLabel("日志")
         title.setObjectName("pageTitle")
-        sub = QLabel("任务与管理器日志实时推送；机器人、部署、星群助手、李清菡四类日志跟随文件尾部")
+        sub = QLabel("日志实时刷新，可切换来源。")
         sub.setObjectName("pageSub")
         outer.addWidget(title)
         outer.addWidget(sub)
@@ -94,9 +137,7 @@ class LogsPage(QWidget):
         bar.addWidget(self.lv_combo)
         bar.addStretch(1)
         self.btn_export = QPushButton("导出日志")
-        self.btn_export.setToolTip(
-            "按上面的「来源」导出：选具体日志就导出那一份；选「全部」把五份日志尾部拼成一份；"
-            "选「任务」导出当前界面里看到的这份流水")
+        self.btn_export.setToolTip("导出当前选中的日志。")
         self.btn_export.clicked.connect(self._export_logs)
         btn_open = QPushButton("打开日志目录")
         btn_open.clicked.connect(self._open_logs_dir)
@@ -202,19 +243,35 @@ class LogsPage(QWidget):
             del self._entries[:2000]
             # 不在这里全量重建：视图由 QPlainTextEdit 的 maxBlockCount 自动截断，
             # 过滤条件变化时再重建。避免大日志下 O(n^2) 反复清空重刷导致 UI 卡死。
-        if self._matches(source, level):
+        if self._matches(source, level, msg):
             self._append_line(source, level, msg)
 
-    def _matches(self, source, level):
-        if self._src_filter != "全部" and source != self._src_filter:
+    def _matches(self, source, level, msg=""):
+        if self._src_filter == OFFICIAL_FILTER:
+            if not qq_events.is_official_line(msg):
+                return False
+        elif self._src_filter != "全部" and source != self._src_filter:
             return False
         if self._lv_filter != "全部" and level != self._lv_filter:
             return False
         return True
 
+    def _append_colored(self, lines, level=""):
+        """把整行按级别上色写进视图（保留等宽字体与自动滚到底）。"""
+        if not lines:
+            return
+        cur = self.log_view.textCursor()
+        fmt = QTextCharFormat()
+        fmt.setForeground(QColor(_line_color(level, lines[0])))
+        cur.movePosition(QTextCursor.End)
+        cur.insertText("\n".join(lines) + "\n", fmt)
+        self.log_view.setTextCursor(cur)
+        self.log_view.ensureCursorVisible()
+
     def _append_line(self, source, level, msg):
         ts = time.strftime("%H:%M:%S", time.localtime())
-        self.log_view.appendPlainText(f"[{ts}] [{source}][{level}] {msg}")
+        self._append_colored(
+            [f"[{ts}] [{source}][{level}] {qq_events.humanize_line(msg)}"], level)
 
     def _on_filter_changed(self, _text):
         self._src_filter = self.src_combo.currentText()
@@ -223,16 +280,25 @@ class LogsPage(QWidget):
 
     def _rebuild(self):
         self.log_view.clear()
-        lines = []
+        lines, level_of = [], ""
+
+        def flush():
+            nonlocal lines, level_of
+            if lines:
+                self._append_colored(lines, level_of)
+                lines, level_of = [], ""
+
         for ts, source, level, msg in self._entries:
-            if self._matches(source, level):
-                stamp = time.strftime("%H:%M:%S", time.localtime(ts))
-                lines.append(f"[{stamp}] [{source}][{level}] {msg}")
-                if len(lines) >= RENDER_BATCH:
-                    self.log_view.appendPlainText("\n".join(lines))
-                    lines = []
-        if lines:
-            self.log_view.appendPlainText("\n".join(lines))
+            if not self._matches(source, level, msg):
+                continue
+            stamp = time.strftime("%H:%M:%S", time.localtime(ts))
+            if level != level_of:      # 级别变了就换一段，颜色不一样
+                flush()
+                level_of = level
+            lines.append(f"[{stamp}] [{source}][{level}] {qq_events.humanize_line(msg)}")
+            if len(lines) >= RENDER_BATCH:
+                flush()
+        flush()
         sb = self.log_view.verticalScrollBar()
         sb.setValue(sb.maximum())
 
@@ -263,7 +329,7 @@ class LogsPage(QWidget):
                 self._file_offsets[key] = size
             except OSError:
                 continue
-            text = re.sub(r"\x1b\[[0-9;]*m", "", raw.decode("utf-8", errors="replace"))
+            text = strip_ansi(raw.decode("utf-8", errors="replace"))
             lines = [line.rstrip() for line in text.splitlines() if line.strip()]
             if not lines:
                 continue
@@ -275,12 +341,18 @@ class LogsPage(QWidget):
             # 分批渲染符合当前过滤条件的行
             matched = []
             stamp = time.strftime("%H:%M:%S", time.localtime(now))
+            keep_level = ""
             for line in lines:
                 level = _infer_level(line)
-                if self._matches(source, level):
-                    matched.append(f"[{stamp}] [{source}][{level}] {line}")
+                if self._matches(source, level, line):
+                    if level != keep_level and matched:
+                        self._append_colored(matched, keep_level)
+                        matched = []
+                    keep_level = level
+                    matched.append(
+                        f"[{stamp}] [{source}][{level}] {qq_events.humanize_line(line)}")
                     if len(matched) >= RENDER_BATCH:
-                        self.log_view.appendPlainText("\n".join(matched))
+                        self._append_colored(matched, level)
                         matched = []
             if matched:
-                self.log_view.appendPlainText("\n".join(matched))
+                self._append_colored(matched, keep_level)

@@ -8,16 +8,25 @@ $zips = @(
     (Join-Path $desktop 'AstroSwarm_客户版_nooffline.zip')
 )
 
-# 1) 同步 exe 到分发目录
+# 1) 同步客户端到分发目录（v1.2.16 起是 onedir：AstroSwarm.exe + _internal\ 整个目录）
 New-Item -ItemType Directory -Path $pkg -Force | Out-Null
-Copy-Item -LiteralPath (Join-Path $root 'dist\AstroSwarm.exe') -Destination $pkg -Force
+$appDir = Join-Path $root 'dist\AstroSwarm'
+if (Test-Path -LiteralPath (Join-Path $appDir 'AstroSwarm.exe')) {
+    $staleInternal = Join-Path $pkg '_internal'
+    if ((Test-Path -LiteralPath $staleInternal) -and $staleInternal.StartsWith($pkg, 'OrdinalIgnoreCase')) {
+        Remove-Item -LiteralPath $staleInternal -Recurse -Force
+    }
+    Copy-Item -LiteralPath (Join-Path $appDir '*') -Destination $pkg -Recurse -Force
+} else {
+    Copy-Item -LiteralPath (Join-Path $root 'dist\AstroSwarm.exe') -Destination $pkg -Force
+}
 Copy-Item -LiteralPath (Join-Path $root 'dist\uninstall.exe') -Destination $pkg -Force
 $docOld = Join-Path $root 'dist_package\QBotManager_客户版\使用说明.docx'
 $docNew = Join-Path $pkg '使用说明.docx'
 if (-not (Test-Path -LiteralPath $docNew) -and (Test-Path -LiteralPath $docOld)) {
     Copy-Item -LiteralPath $docOld -Destination $docNew -Force
 }
-Write-Output 'COPIED exe -> dist_package\AstroSwarm_客户版'
+Write-Output 'COPIED client -> dist_package\AstroSwarm_客户版'
 
 # 2) 在临时目录摆出与 zip 一致的顶层目录，再打包
 $stage = Join-Path $env:TEMP ('qbm_zip_' + [guid]::NewGuid().ToString('N'))
@@ -35,11 +44,11 @@ foreach ($z in $zips) {
 
 # 3) 校验：dist exe 哈希 + zip 内 exe 哈希
 $sha = [System.Security.Cryptography.SHA256]::Create()
-foreach ($name in @('AstroSwarm.exe', 'uninstall.exe')) {
-    $fs = [IO.File]::OpenRead((Join-Path $root ("dist\$name")))
+foreach ($rel in @('AstroSwarm\AstroSwarm.exe', 'uninstall.exe')) {
+    $fs = [IO.File]::OpenRead((Join-Path $root ("dist\$rel")))
     $h = [BitConverter]::ToString($sha.ComputeHash($fs)) -replace '-', ''
     $fs.Dispose()
-    Write-Output "DIST $name $h"
+    Write-Output "DIST $rel $h"
 }
 foreach ($z in $zips) {
     $a = [System.IO.Compression.ZipFile]::OpenRead($z)

@@ -1,12 +1,14 @@
 # -*- coding: utf-8 -*-
 """AI 大脑页：接口配置 + 平台开关 + 模型/MCP/记忆/身份绑定摘要。"""
 import json
+import logging
 import os
 import threading
 import time
 from pathlib import Path
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Property, QEasingCurve, QPropertyAnimation, QRect, Qt, Signal
+from PySide6.QtGui import QColor, QPainter, QPainterPath
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDialog, QFileDialog, QFrame, QGridLayout,
     QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMessageBox,
@@ -14,10 +16,15 @@ from PySide6.QtWidgets import (
 )
 
 from ...core import agent_profile, ai_config
+from ...core import bot
 from ...core import message_store
 from ..theme import TEXT_3
 from ..widgets import EmptyState, FoldSection, GlassPanel
 from .common import ModelFetchController, PageContext, Worker, make_row
+from ..widgets_switch import CollapseGroup, iOSSwitchRow, upgrade_checkboxes
+from ..segmented import SegmentedPill
+
+logger = logging.getLogger("qbotmanager")
 
 
 def _split_csv(text: str) -> list:
@@ -48,9 +55,37 @@ def _agent_cfg_snapshot(s):
     }
 
 
+# 真正"必须重启一次"的两个键（2026-10-15）：档案开关 / 档案 id 决定的是
+# **机器人进程启动时要不要加载李清菡插件**（插件在 import 期判定 _ENABLED）。
+# 热配置刷了也不管用，两个方向都会坏：
+#   · 打开档案：程序侧把 QQ/微信交给档案（live gates），AI 插件按条热读立刻停，
+#     可档案插件在启动时已经判定"没启用"、压根没注册 → **谁都不回话**；
+#   · 关掉档案：AI 插件热恢复处理 QQ/微信，李清菡的 handler 还在 → **同一条消息双回复**。
+_PROFILE_RESTART_KEYS = ("agent_profile_enabled", "agent_profile_id")
+
+
+def _profile_restart_required(before, after) -> bool:
+    """档案开关/id 变了就必须重启一次机器人（见上面说明）。"""
+    return any(before.get(k) != after.get(k) for k in _PROFILE_RESTART_KEYS)
+
+
 def _agent_restart_required(before, after) -> bool:
     """档案/模型相关配置变化时需要重启机器人才会真正载入。"""
     return any(before.get(k) != after.get(k) for k in _AGENT_RESTART_KEYS)
+
+
+class PersonaSegment(SegmentedPill):
+    """人设来源胶囊（预设 / 自定义）——通用控件 SegmentedPill 的预设版本。
+
+    2026-10-11：实现搬到 `qbotmanager/ui/segmented.py`（QQ 通道切换要复用同一套外观），
+    这里只保留老板要的那套文案与提示，原调用点（`PersonaSegment()` / `.changed` /
+    `.set_current()`）完全不变。
+    """
+
+    def __init__(self, labels=("预设", "自定义"), parent=None):
+        super().__init__(("preset", "custom"), labels, parent,
+                         accessible_name="人设来源切换",
+                         tooltip="预设 = 下载好的智能体档案；自定义 = 自己写或导入的人设。两段互斥。")
 
 
 class BrainPage(QWidget):
@@ -67,9 +102,50 @@ class BrainPage(QWidget):
         self._loaded_agent_cfg = {}
         self._ai_configured = False
         self._beginner = False
+        self._syncing_mode = False        # 文档/控件回填期间别再触发切换副作用
         self._build_ui()
+        self._upgrade_toggles()
         self.load_config()
         self.refresh_status()
+
+    def _upgrade_toggles(self):
+        """把页面上的复选框升级成 iOS 式开关行（2026-10-11 老板要求）。
+
+        只升级"独占一行"的：横排多个复选框（如 QQ/微信/飞书/纸飞机）保持原样，
+        避免一排四个整行开关。危险开关（主动搭话）带二次确认。
+        """
+        try:
+            n = upgrade_checkboxes(self)
+            # 主动搭话那个单独包一层，带上二次确认
+            # 主动搭话要带二次确认：**不能重复包裹**（包两次会在卡片左上角留残影），
+            # 先找已经包好的那一行补提示；确实没包过时再按索引插进去。
+            chk = getattr(self, "chk_interject", None)
+            if chk is not None:
+                row = None
+                for r in self.findChildren(iOSSwitchRow):
+                    if getattr(r, "chk", None) is chk:
+                        row = r
+                        break
+                if row is not None:
+                    row._danger = getattr(self, "_interject_danger", "")
+                    row.setToolTip(row._danger)
+                    self._switch_interject = row
+                else:
+                    lay = chk.parentWidget().layout() if chk.parentWidget() else None
+                    idx = lay.indexOf(chk) if lay is not None else -1
+                    if idx >= 0:
+                        row = iOSSwitchRow(chk, parent=chk.parentWidget(),
+                                           danger_confirm=getattr(self, "_interject_danger", ""))
+                        lay.removeWidget(chk)
+                        lay.insertWidget(idx, row)
+                        self._switch_interject = row
+                        n += 1
+            self._switch_count = n
+        except Exception as e:  # noqa: BLE001 —— 开关升级失败不能挡住页面
+            try:
+                self.ctx.show_toast("开关样式升级失败：" + str(e))
+            except Exception:  # noqa: BLE001
+                pass
 
     def _build_ui(self):
         self.scroll = QScrollArea(self)
@@ -84,8 +160,7 @@ class BrainPage(QWidget):
 
         title = QLabel("AI 大脑")
         title.setObjectName("pageTitle")
-        sub = QLabel("内置 AI 大脑：QQ / 微信 / 飞书 / 纸飞机共享模型、记忆与工具；"
-                     "接口配置与平台开关在本页完成")
+        sub = QLabel("QQ / 微信 / 飞书 / 纸飞机共用一个 AI 大脑。")
         sub.setObjectName("pageSub")
         outer.addWidget(title)
         outer.addWidget(sub)
@@ -98,9 +173,8 @@ class BrainPage(QWidget):
         cfg_lbl = QLabel("接口配置")
         cfg_lbl.setObjectName("sectionTitle")
         cv.addWidget(cfg_lbl)
-        cfg_tip = QLabel("选择服务商自动填接口地址；填好 API 密钥后会自动去服务商拉取"
-                         "你账号里真实可用的模型列表（也可点「获取模型」手动刷新）。"
-                         "平台开关决定 AI 在哪些平台生效，保存后重启机器人生效。")
+        cfg_tip = QLabel("选服务商自动填地址；填好密钥点「获取模型」刷新。")
+        cfg_tip.setToolTip("模型 / 密钥 / 地址改完立即生效，不用重启机器人。")
         cfg_tip.setWordWrap(True)
         cfg_tip.setStyleSheet(f"color: {TEXT_3}; font-size: 12px;")
         cv.addWidget(cfg_tip)
@@ -113,7 +187,7 @@ class BrainPage(QWidget):
         self.chk_feishu = QCheckBox("飞书")
         self.chk_telegram = QCheckBox("纸飞机")
         for chk in (self.chk_qq, self.chk_wechat, self.chk_feishu, self.chk_telegram):
-            chk.setToolTip("关闭后 AI 大脑不再处理该平台的消息，但平台通道本身仍正常运行")
+            chk.setToolTip("关掉后 AI 大脑不再处理该平台的消息。")
         platform_row.addWidget(platform_lbl)
         platform_row.addSpacing(6)
         platform_row.addWidget(self.chk_qq)
@@ -129,9 +203,7 @@ class BrainPage(QWidget):
         self.ai_provider_combo = QComboBox()
         for p in ai_config.AI_PROVIDERS:
             self.ai_provider_combo.addItem(p["name"], p["key"])
-        self.ai_provider_combo.setToolTip(
-            "DeepSeek / 通义 / 智谱 / Kimi / OpenAI 等大厂接口自动填地址与默认模型，"
-            "也可选「自定义接口」手动填写")
+        self.ai_provider_combo.setToolTip("选大厂服务商自动填地址与模型，也可自定义。")
         provider_row.addWidget(provider_lbl)
         provider_row.addWidget(self.ai_provider_combo, 1)
         cv.addLayout(provider_row)
@@ -159,7 +231,7 @@ class BrainPage(QWidget):
         model_row.addWidget(self.ai_model_edit, 1)
         self.btn_fetch_models = QPushButton("获取模型")
         self.btn_fetch_models.setObjectName("ghost")
-        self.btn_fetch_models.setToolTip("按你填的接口地址与 API 密钥拉取该服务商的模型列表")
+        self.btn_fetch_models.setToolTip("拉取该服务商可用的模型列表")
         model_row.addWidget(self.btn_fetch_models)
         cv.addLayout(model_row)
         self.ai_model_tip = QLabel("")
@@ -194,10 +266,21 @@ class BrainPage(QWidget):
 
         save_row = QHBoxLayout()
         self.btn_save = QPushButton("保存并测试")
-        self.btn_save.setToolTip("保存后自动拉一次服务商模型列表 —— 拉得到就说明密钥和地址能用")
+        self.btn_save.setToolTip(
+            "保存（模型/密钥/开关/人设改完立即生效，不用重启机器人）；"
+            "能拉到模型说明配置可用")
         self.btn_save.setObjectName("primary")
         self.btn_save.clicked.connect(self._save_config)
         save_row.addWidget(self.btn_save)
+        # 「需要重启」的改动（插件代码 / 换通道 / 能力包 / MCP）都点这个按钮。
+        # 口径一句话：设置改了立即生效；代码改了才需要重启，且点一下就能重启。
+        self.btn_restart_bot = QPushButton("重启机器人")
+        self.btn_restart_bot.setObjectName("ghost")
+        self.btn_restart_bot.setToolTip(
+            "装/卸插件、换 QQ 通道、MCP 服务器这类改动要重启一次才生效。\n"
+            "只重启机器人进程（不碰 NapCat / QQ），大约 10 秒内离线，之后自动重连。")
+        self.btn_restart_bot.clicked.connect(self._restart_bot)
+        save_row.addWidget(self.btn_restart_bot)
         save_row.addStretch(1)
         cv.addLayout(save_row)
         outer.addWidget(config_panel)
@@ -210,35 +293,89 @@ class BrainPage(QWidget):
         n_title = QLabel("先填 AI 配置")
         n_title.setObjectName("sectionTitle")
         nv.addWidget(n_title)
-        n_body = QLabel(
-            "在上面「接口配置」里选服务商、填 API 密钥，点「保存 AI 配置」。"
-            "保存成功后，人格设定、主动聊天、记忆、智能体档案这些才会出现。"
-            "密钥只存在你自己电脑上的机器人目录里，不会上传。")
+        n_body = QLabel("先选服务商、填密钥并保存，下面的设置才会出现。")
+        n_body.setToolTip("密钥只存在你本机，不会上传。")
         n_body.setWordWrap(True)
         n_body.setStyleSheet(f"color: {TEXT_3}; font-size: 12px;")
         nv.addWidget(n_body)
         outer.addWidget(self.notice_panel)
 
-        # ---- 智能体档案（李清菡等可选预设） ----
-        agent_panel = GlassPanel(strong=True)
-        self._agent_panel = agent_panel
-        av = QVBoxLayout(agent_panel)
-        av.setContentsMargins(18, 14, 18, 16)
+        # ---- 人设（一张卡）：预设档案 / 自定义人设 + 谁在生效 + 主动聊天 -------------
+        # 2026-10-07 老板：以前这里是三张卡（智能体档案 / 人设工坊（本地）/ 人设与主动聊天），
+        # 功能重合、设置框离得远，一眼看不出「谁在生效」。现在并成一张，顶部一个胶囊
+        # 分段控件切「预设 / 自定义」，下面固定放主动聊天那几项（跟人设来源无关）。
+        persona_panel = GlassPanel(strong=True)
+        self._persona_panel = persona_panel
+        pv = QVBoxLayout(persona_panel)
+        pv.setContentsMargins(18, 14, 18, 16)
+        pv.setSpacing(10)
+        p_lbl = QLabel("人设与主动聊天")
+        p_lbl.setObjectName("sectionTitle")
+        pv.addWidget(p_lbl)
+        p_tip = QLabel(
+            "先选人设从哪来：用下载好的档案（预设），还是自己写 / 导入一份（自定义）；"
+            "人设改完立即生效。")
+        p_tip.setWordWrap(True)
+        p_tip.setStyleSheet(f"color: {TEXT_3}; font-size: 12px;")
+        pv.addWidget(p_tip)
+
+        seg_row = QHBoxLayout()
+        self.persona_seg = PersonaSegment()
+        self.persona_seg.changed.connect(self._on_persona_seg)
+        seg_row.addWidget(self.persona_seg)
+        seg_row.addStretch(1)
+        pv.addLayout(seg_row)
+
+        # 谁在生效：两种形态都显示（本地人设《…》/ 预设档案 …/ 手写人设）
+        self.persona_mode_lbl = QLabel("当前生效：手写人设")
+        self.persona_mode_lbl.setWordWrap(True)
+        self.persona_mode_lbl.setToolTip("这里说的是机器人现在真正照谁的性格说话。")
+        pv.addWidget(self.persona_mode_lbl)
+        # 切换时改了什么的实话（不静默改状态）
+        self.persona_switch_hint = QLabel("")
+        self.persona_switch_hint.setWordWrap(True)
+        self.persona_switch_hint.setStyleSheet(f"color: {TEXT_3}; font-size: 12px;")
+        pv.addWidget(self.persona_switch_hint)
+
+        # 唤醒词（群聊"被叫到称呼就回应"的触发词）：2026-10-12 老板报「找不到了」——
+        # v1.2.15 把它收进「预设」面板，切到「自定义」整块隐藏。它跟人设来源是两件事，
+        # 挪到胶囊下面常显；配一行小字说清它作用在「预设」档案上。
+        wake_note = QLabel("群里有人喊这些称呼，不用 @ 也会回应；填完保存立即生效，留空 = 只认 @ 和引用。")
+        wake_note.setWordWrap(True)
+        wake_note.setStyleSheet(f"color: {TEXT_3}; font-size: 12px;")
+        pv.addWidget(wake_note)
+        wake_row = QHBoxLayout()
+        wake_lbl = QLabel("唤醒词")
+        wake_lbl.setStyleSheet(f"color: {TEXT_3}; font-size: 12px;")
+        self.agent_wake_edit = QLineEdit()
+        self.agent_wake_edit.setPlaceholderText("逗号分隔，如：可奈,奈姐；留空 = 群里只靠 @ / 引用触发")
+        self.agent_wake_edit.textEdited.connect(self._on_wake_edited)
+        wake_row.addWidget(wake_lbl)
+        wake_row.addWidget(self.agent_wake_edit, 1)
+        self.btn_wake_generate = QPushButton("按人格生成")
+        self.btn_wake_generate.setObjectName("ghost")
+        self.btn_wake_generate.setToolTip("按人格文本生成唤醒词；没配模型时按名字提取。")
+        self.btn_wake_generate.clicked.connect(self._start_wake_generation)
+        wake_row.addWidget(self.btn_wake_generate)
+        pv.addLayout(wake_row)
+        self.chk_wake_auto = QCheckBox("人格变化时自动重生成唤醒词")
+        self.chk_wake_auto.setToolTip("手动改过唤醒词后，这里会自动关闭。")
+        pv.addWidget(self.chk_wake_auto)
+
+        # 预设态：档案开关 + 档案选择 + 会话标识 / 视觉模型（唤醒词挪到上面常显，其余是原「智能体档案」卡的内容）
+        self._agent_panel = QWidget()
+        av = QVBoxLayout(self._agent_panel)
+        av.setContentsMargins(0, 0, 0, 0)
         av.setSpacing(10)
-        a_lbl = QLabel("智能体档案")
-        a_lbl.setObjectName("sectionTitle")
-        av.addWidget(a_lbl)
-        a_tip = QLabel("可选李清菡等智能体预设：人格仍跟随上方人格设定，功能层按档案启用；"
-                       "唤醒词用于群聊无 @ 唤醒，私聊无需唤醒词；"
-                       "QQ 群不 @ 也回复需要群主开启「获取群内全部消息」后才会推送。"
-                       "保存后重启机器人生效。")
+        a_tip = QLabel("挑个档案打开开关，就有群管、表情、游戏等功能。")
+        a_tip.setToolTip("唤醒词用于群聊，不用 @ 也能叫醒；私聊直接说。")
         a_tip.setWordWrap(True)
         a_tip.setStyleSheet(f"color: {TEXT_3}; font-size: 12px;")
         av.addWidget(a_tip)
 
-        self.chk_agent_profile = QCheckBox("启用智能体档案（默认关闭）")
-        self.chk_agent_profile.setToolTip(
-            "开启后机器人按所选档案的功能层运行（李清菡：群管/语音/图片/游戏/记忆等）")
+        self.chk_agent_profile = QCheckBox("启用档案")
+        self.chk_agent_profile.setToolTip("开启后按档案启用群管、语音、图片、游戏。")
+        self.chk_agent_profile.toggled.connect(self._on_agent_profile_toggled)
         av.addWidget(self.chk_agent_profile)
 
         profile_row = QHBoxLayout()
@@ -247,37 +384,25 @@ class BrainPage(QWidget):
         self.agent_profile_combo = QComboBox()
         for prof in agent_profile.list_profiles():
             self.agent_profile_combo.addItem(prof["name"], prof["id"])
-        self.agent_profile_combo.setToolTip("星群助手 = 默认行为；李清菡 = 完整功能层预设")
+        self.agent_profile_combo.setToolTip("星群助手 = 默认；李清菡 = 完整功能。")
         profile_row.addWidget(profile_lbl)
         profile_row.addWidget(self.agent_profile_combo, 1)
         av.addLayout(profile_row)
 
-        wake_row = QHBoxLayout()
-        wake_lbl = QLabel("唤醒词")
-        wake_lbl.setStyleSheet(f"color: {TEXT_3}; font-size: 12px;")
-        self.agent_wake_edit = QLineEdit()
-        self.agent_wake_edit.setPlaceholderText(
-            "逗号分隔，如：李清菡,学姐,菡姐,菡菡（留空 = 档案默认）")
-        self.agent_wake_edit.textEdited.connect(self._on_wake_edited)
-        wake_row.addWidget(wake_lbl)
-        wake_row.addWidget(self.agent_wake_edit, 1)
-        self.btn_wake_generate = QPushButton("按人格生成")
-        self.btn_wake_generate.setObjectName("ghost")
-        self.btn_wake_generate.setToolTip(
-            "用上方语言模型按人格文本生成唤醒词；未配置模型时自动按名字句式提取")
-        self.btn_wake_generate.clicked.connect(self._start_wake_generation)
-        wake_row.addWidget(self.btn_wake_generate)
-        av.addLayout(wake_row)
-
-        self.chk_wake_auto = QCheckBox("人格变化时自动重新生成唤醒词（手动修改唤醒词后自动取消）")
-        av.addWidget(self.chk_wake_auto)
+        # 一个档案都没有时不摆空白：给一句实话
+        self.agent_profile_empty = QLabel("还没有下载档案，去「插件工坊」看看")
+        self.agent_profile_empty.setWordWrap(True)
+        self.agent_profile_empty.setStyleSheet(f"color: {TEXT_3}; font-size: 12px;")
+        self.agent_profile_empty.setVisible(self.agent_profile_combo.count() == 0)
+        av.addWidget(self.agent_profile_empty)
 
         owner_row = QHBoxLayout()
-        owner_lbl = QLabel("你同学 openid")
+        # 「你同学」是李清菡人设里对老板的称呼，不能当界面文案（老板看到一脸问号）
+        owner_lbl = QLabel("你的会话标识")
         owner_lbl.setStyleSheet(f"color: {TEXT_3}; font-size: 12px;")
         self.agent_owner_edit = QLineEdit()
-        self.agent_owner_edit.setPlaceholderText(
-            "你的官方 openid（先用你的账号与机器人对话，从消息中心会话标识复制；留空 = 群管专属命令降级）")
+        self.agent_owner_edit.setPlaceholderText("从「消息中心」复制你的会话标识贴这里")
+        self.agent_owner_edit.setToolTip("留空则群里谁都能用禁言等群管命令。")
         owner_row.addWidget(owner_lbl)
         owner_row.addWidget(self.agent_owner_edit, 1)
         av.addLayout(owner_row)
@@ -286,7 +411,7 @@ class BrainPage(QWidget):
         vision_tip.setStyleSheet(f"color: {TEXT_3}; font-size: 12px;")
         av.addWidget(vision_tip)
         v_url_row = QHBoxLayout()
-        v_url_lbl = QLabel("视觉接口地址")
+        v_url_lbl = QLabel("视觉服务地址")
         v_url_lbl.setStyleSheet(f"color: {TEXT_3}; font-size: 12px;")
         self.vision_url_edit = QLineEdit()
         self.vision_url_edit.setPlaceholderText("https://api.siliconflow.cn/v1")
@@ -302,7 +427,7 @@ class BrainPage(QWidget):
         v_model_row.addWidget(self.vision_model_edit, 1)
         av.addLayout(v_model_row)
         v_key_row = QHBoxLayout()
-        v_key_lbl = QLabel("视觉 API 密钥")
+        v_key_lbl = QLabel("视觉密钥")
         v_key_lbl.setStyleSheet(f"color: {TEXT_3}; font-size: 12px;")
         self.vision_key_edit = QLineEdit()
         self.vision_key_edit.setEchoMode(QLineEdit.Password)
@@ -310,21 +435,16 @@ class BrainPage(QWidget):
         v_key_row.addWidget(v_key_lbl)
         v_key_row.addWidget(self.vision_key_edit, 1)
         av.addLayout(v_key_row)
-        outer.addWidget(agent_panel)
+        # 预设态容器收尾：这一整块就是「预设」那一段显示的内容
+        pv.addWidget(self._agent_panel)
 
-        # ---- 人设工坊（本地）：用户自制人格卡 + 工具 ----
-        workshop_panel = GlassPanel(strong=True)
-        self._workshop_panel = workshop_panel
-        wv = QVBoxLayout(workshop_panel)
-        wv.setContentsMargins(18, 14, 18, 16)
+        # ---- 自定义态：本地人设包（原来「人设工坊（本地）」卡里的全部内容） ----
+        self._workshop_panel = QWidget()
+        wv = QVBoxLayout(self._workshop_panel)
+        wv.setContentsMargins(0, 0, 0, 0)
         wv.setSpacing(10)
-        w_lbl = QLabel("人设工坊（本地）")
-        w_lbl.setObjectName("sectionTitle")
-        wv.addWidget(w_lbl)
-        w_tip = QLabel(
-            "上传自己的「人格卡 + 工具」人设包（和内置李清菡 / EVA 同一种模式）："
-            "先下载模板填写，再导入 JSON 或 zip；启用后写入人格并加载自带工具，"
-            "保存重启机器人生效。启用本地人设会自动关闭上方智能体档案，避免双人格。")
+        w_tip = QLabel("导入人设包：先下载模板填写，再导入文件。")
+        w_tip.setToolTip("启用后会关闭预设档案，避免双人格。")
         w_tip.setWordWrap(True)
         w_tip.setStyleSheet(f"color: {TEXT_3}; font-size: 12px;")
         wv.addWidget(w_tip)
@@ -374,37 +494,108 @@ class BrainPage(QWidget):
         ws_act.addWidget(self.btn_persona_uninstall)
         ws_act.addStretch(1)
         wv.addLayout(ws_act)
-        outer.addWidget(workshop_panel)
-
-        # ---- 人设与主动聊天（程序内设置，不再走聊天指令） ----
-        persona_panel = GlassPanel(strong=True)
-        self._persona_panel = persona_panel
-        pv = QVBoxLayout(persona_panel)
-        pv.setContentsMargins(18, 14, 18, 16)
-        pv.setSpacing(10)
-        p_lbl = QLabel("人设与主动聊天")
-        p_lbl.setObjectName("sectionTitle")
-        pv.addWidget(p_lbl)
-        p_tip = QLabel("原 ac 指令已移除，改在这里配置；保存后重启机器人生效。")
-        p_tip.setWordWrap(True)
-        p_tip.setStyleSheet(f"color: {TEXT_3}; font-size: 12px;")
-        pv.addWidget(p_tip)
-
-        # 人格设定按你的决定挪进「设置 → 高级 → 人格设定」：只留一句指路，
-        # 避免两处都能改、互相覆盖（这里是只读的执行侧）。
-        persona_hint = QLabel("人格设定已挪到「设置 → 高级 → 人格设定」；改完保存，重启机器人生效。")
+        # 人格设定：老板要求两端一模一样（控制台那张卡里就有这个框），所以这里也放一个
+        # 可编辑的多行框 +「保存人设」。写的是**同一个字段、同一个函数**
+        # （ai_config.save_personality → 机器人侧 aichat_manager.json 的 personality），
+        # 不另造一份存储；「设置 → 高级 → 人格设定」那块保留，两边改的是同一份。
+        persona_row = QHBoxLayout()
+        persona_lbl = QLabel("人格设定")
+        persona_lbl.setStyleSheet(f"color: {TEXT_3}; font-size: 12px;")
+        persona_lbl.setAlignment(Qt.AlignTop)
+        self.personality_edit = QPlainTextEdit()
+        self.personality_edit.setPlaceholderText("例如：回答简洁直接，不废话…")
+        self.personality_edit.setToolTip(
+            "这里写什么，机器人就按什么演；留空 = 内置默认。和「设置 → 高级 → 人格设定」是同一份。")
+        self.personality_edit.setFixedHeight(96)
+        persona_row.addWidget(persona_lbl)
+        persona_row.addWidget(self.personality_edit, 1)
+        wv.addLayout(persona_row)
+        persona_btns = QHBoxLayout()
+        persona_btns.setSpacing(6)
+        self.btn_persona_save = QPushButton("保存人设")
+        self.btn_persona_save.setObjectName("primary")
+        self.btn_persona_save.setMinimumHeight(30)
+        self.btn_persona_save.setToolTip("只保存这一项人格设定，不动接口配置")
+        self.btn_persona_save.clicked.connect(self._save_persona_text)
+        persona_btns.addWidget(self.btn_persona_save)
+        persona_hint = QLabel("也可以去「设置 → 高级 → 人格设定」改，两边是同一份。")
         persona_hint.setWordWrap(True)
         persona_hint.setStyleSheet(f"color: {TEXT_3}; font-size: 12px;")
-        pv.addWidget(persona_hint)
+        persona_btns.addWidget(persona_hint, 1)
+        wv.addLayout(persona_btns)
+        self.persona_save_hint = QLabel("")
+        self.persona_save_hint.setWordWrap(True)
+        self.persona_save_hint.setStyleSheet(f"color: {TEXT_3}; font-size: 12px;")
+        wv.addWidget(self.persona_save_hint)
+        # 自定义态容器收尾：这一整块就是「自定义」那一段显示的内容
+        pv.addWidget(self._workshop_panel)
 
-        self.chk_proactive = QCheckBox("启用主动聊天（机器人会不定时主动找用户聊天）")
+        # ---- 主动聊天（跟人设从哪来无关，两种形态都显示） ----
+        pro_lbl = QLabel("主动聊天（跟上面选哪种人设无关）")
+        pro_lbl.setWordWrap(True)
+        pro_lbl.setStyleSheet(f"color: {TEXT_3}; font-size: 12px;")
+        pv.addWidget(pro_lbl)
+
+        self.chk_proactive = QCheckBox("启用主动聊天")
+        self.chk_proactive.setToolTip("机器人会不定时找人聊天；发不出去会跳过。")
         pv.addWidget(self.chk_proactive)
+        proactive_tip = QLabel(
+            "平台限制：QQ 有额度；微信要 30 分钟内说过话。")
+        proactive_tip.setWordWrap(True)
+        proactive_tip.setStyleSheet(f"color: {TEXT_3}; font-size: 12px;")
+        pv.addWidget(proactive_tip)
+
+        # 群聊回话总开关：默认开（群里被 @ 就回）。以前群白名单默认为空 =
+        # 一个群都不回，用户装完在群里怎么 @ 都没反应，界面也没入口 —— 这里补上。
+        self.chk_group_chat = QCheckBox("允许在群里回话")
+        self.chk_group_chat.setToolTip("关掉后不在任何群里说话；打开则所有群都回。")
+        pv.addWidget(self.chk_group_chat)
+
+        # 识图开关（2026-10-03 加）：以前这个开关只有插件配置里有，界面上根本没有，
+        # 大部分人（包括老板）一直是关的 —— 表现就是"发表情包/照片它说看不到"。
+        self.chk_vision = QCheckBox("能看图片和表情包")
+        self.chk_vision.setToolTip("用 AI 大脑当前的模型识图；模型不支持图片时无效。")
+        pv.addWidget(self.chk_vision)
+
+        # 群里发引用/聊天记录/图片时，把这些内容也喂给 AI（不然它只看得到一句纯文本）
+        self.chk_rich_parse = QCheckBox("引用、记录、链接也一起给它看")
+        self.chk_rich_parse.setToolTip("关掉只剩纯文本，引用和卡片里的内容都会丢。")
+        pv.addWidget(self.chk_rich_parse)
+
+        # 聊天里自学（2026-10-04）：不会的事，AI 自己写个插件装上
+        self.chk_self_forge = QCheckBox("不会的事自己写插件（只有你能触发）")
+        self.chk_self_forge.setToolTip("只有你能触发：它自己写个插件装上，再回你。")
+        pv.addWidget(self.chk_self_forge)
+
+        # 跨平台互通（2026-10-04 内置基础功能）：发消息/发文件到用户自己的另一个平台
+        self.chk_cross_platform = QCheckBox("跨平台互通（发到我的微信/QQ）")
+        self.chk_cross_platform.setToolTip("只能发给你自己绑定的平台，别人收不到。")
+        pv.addWidget(self.chk_cross_platform)
+        self.cross_status_lbl = QLabel("绑定状态：还没绑定（发「绑定」拿码）")
+        self.cross_status_lbl.setToolTip("在任意平台私聊发「绑定」，拿码后去另一个平台发「绑定 六位数字」。")
+        self.cross_status_lbl.setStyleSheet(f"color: {TEXT_3}; font-size: 12px;")
+        self.cross_status_lbl.setWordWrap(True)
+        pv.addWidget(self.cross_status_lbl)
+
+        # 群列表：插件收到过消息的群会自动列在这里，勾选=允许它在这个群回话。
+        # 一个都不勾（或全勾）= 不限群，和默认行为一致；不用手抄 openid。
+        self.group_list_lbl = QLabel("允许回话的群：不限群（默认）")
+        self.group_list_lbl.setStyleSheet(f"color: {TEXT_3}; font-size: 12px;")
+        self.group_list_lbl.setWordWrap(True)
+        self.group_list_lbl.setToolTip("取消勾选某个群，就只有勾上的群能回话。")
+        pv.addWidget(self.group_list_lbl)
+        self.group_list_box = QWidget()
+        self._group_rows_layout = QVBoxLayout(self.group_list_box)
+        self._group_rows_layout.setContentsMargins(0, 0, 0, 0)
+        self._group_rows_layout.setSpacing(4)
+        pv.addWidget(self.group_list_box)
 
         targets_row = QHBoxLayout()
         targets_lbl = QLabel("目标用户")
         targets_lbl.setStyleSheet(f"color: {TEXT_3}; font-size: 12px;")
         self.ai_proactive_targets = QLineEdit()
-        self.ai_proactive_targets.setPlaceholderText("QQ 官方 openid，多个用逗号分隔（留空 = 无目标；先用目标账号与机器人对话获取 openid）")
+        self.ai_proactive_targets.setPlaceholderText("多个用逗号分隔；留空 = 不主动找人")
+        self.ai_proactive_targets.setToolTip("到「消息中心」复制对方的会话标识。")
         targets_row.addWidget(targets_lbl)
         targets_row.addWidget(self.ai_proactive_targets, 1)
         pv.addLayout(targets_row)
@@ -413,7 +604,8 @@ class BrainPage(QWidget):
         groups_lbl = QLabel("搭话群聊")
         groups_lbl.setStyleSheet(f"color: {TEXT_3}; font-size: 12px;")
         self.ai_proactive_groups = QLineEdit()
-        self.ai_proactive_groups.setPlaceholderText("QQ 群 openid，多个用逗号分隔（留空 = 不搭话；机器人需已在群内接收过消息）")
+        self.ai_proactive_groups.setPlaceholderText("多个用逗号分隔；留空 = 不搭话")
+        self.ai_proactive_groups.setToolTip("先在群里发条消息，机器人收到后就能识别该群。")
         groups_row.addWidget(groups_lbl)
         groups_row.addWidget(self.ai_proactive_groups, 1)
         pv.addLayout(groups_row)
@@ -421,14 +613,73 @@ class BrainPage(QWidget):
         nums_grid = QGridLayout()
         nums_grid.setHorizontalSpacing(12)
         nums_grid.setVerticalSpacing(6)
-        nums_grid.addWidget(self._spin("间隔最小(分)", "ai_interval_min", 1, 1440, 30), 0, 0)
-        nums_grid.addWidget(self._spin("间隔最大(分)", "ai_interval_max", 1, 1440, 90), 0, 1)
-        nums_grid.addWidget(self._spin("冷却(分)", "ai_cooldown", 1, 1440, 30), 0, 2)
-        nums_grid.addWidget(self._spin("免打扰开始(时)", "ai_quiet_start", 0, 23, 0), 1, 0)
-        nums_grid.addWidget(self._spin("免打扰结束(时)", "ai_quiet_end", 0, 23, 8), 1, 1)
+        # 2026-10-11：数值项收进可折叠分组（老板反馈"占比太乱"），标题行显示当前值摘要。
+        self._sp_interval_min = self._spin("间隔最小(分)", "ai_interval_min", 1, 1440, 30)
+        self._sp_interval_max = self._spin("间隔最大(分)", "ai_interval_max", 1, 1440, 90)
+        self._sp_cooldown = self._spin("冷却(分)", "ai_cooldown", 1, 1440, 30)
+        self._sp_quiet_start = self._spin("免打扰开始(时)", "ai_quiet_start", 0, 23, 0)
+        self._sp_quiet_end = self._spin("免打扰结束(时)", "ai_quiet_end", 0, 23, 8)
+        for _i, _w in enumerate((self._sp_interval_min, self._sp_interval_max, self._sp_cooldown)):
+            nums_grid.addWidget(_w, 0, _i)
+        nums_grid.addWidget(self._sp_quiet_start, 1, 0)
+        nums_grid.addWidget(self._sp_quiet_end, 1, 1)
         nums_grid.setColumnStretch(3, 1)
-        pv.addLayout(nums_grid)
+        nums_holder = QWidget()
+        nums_holder.setLayout(nums_grid)
+        self._freq_group = CollapseGroup(
+            "主动聊天频率", nums_holder,
+            summary=lambda: (f"间隔 {self.ai_interval_min.value()}–{self.ai_interval_max.value()} 分"
+                             f" · 冷却 {self.ai_cooldown.value()} 分"
+                             f" · 免打扰 {self.ai_quiet_start.value()}–{self.ai_quiet_end.value()} 时"),
+            collapsed=True)
+        # 注意：_spin() 返回的是外壳，真正的 QSpinBox 挂在 self.ai_* 上（_spin 里 setattr 的）
+        for _sp in (self.ai_interval_min, self.ai_interval_max, self.ai_cooldown,
+                    self.ai_quiet_start, self.ai_quiet_end):
+            _sp.valueChanged.connect(lambda _v: self._freq_group.refresh_summary())
+        pv.addWidget(self._freq_group)
+
+        # ---- 群里主动搭话（内核在插件里，以前没有任何界面入口）----
+        self.chk_interject = QCheckBox("允许在群里主动搭话")
+        self.chk_interject.setToolTip("需在 q.qq.com 开启「接收所有消息」。")
+        # 危险开关（老板 2026-10-11 定：二级确认）——开启前说清后果
+        self._interject_danger = ("开启后它会自己找群里的人说话（按上面的概率与间隔），"
+                                  "群里所有人都能看到。想停就把它关掉，或把上面「搭话参数」里的概率调低。")
+        pv.addWidget(self.chk_interject)
+
+        # 免@连续对话：参数放在「连续对话能力包」里（插件商店装上后，
+        # 「已装能力包 → 配置」里改），这里只给一行说明指路。
+        session_hint = QLabel("免@连续对话：在「连续对话能力包」里配置。")
+        session_hint.setWordWrap(True)
+        session_hint.setStyleSheet(f"color: {TEXT_3}; font-size: 12px;")
+        pv.addWidget(session_hint)
+        interject_grid = QGridLayout()
+        interject_grid.setHorizontalSpacing(12)
+        interject_grid.setVerticalSpacing(6)
+        self._sp_prob = self._spin("搭话概率(%)", "ai_interject_probability", 1, 100, 30)
+        self._sp_imin = self._spin("搭话间隔最小(分)", "ai_interject_min", 1, 1440, 30)
+        self._sp_imax = self._spin("搭话间隔最大(分)", "ai_interject_max", 1, 1440, 90)
+        self._sp_ihist = self._spin("参考最近条数", "ai_interject_history", 1, 50, 10)
+        interject_grid.addWidget(self._sp_prob, 0, 0)
+        interject_grid.addWidget(self._sp_imin, 0, 1)
+        interject_grid.addWidget(self._sp_imax, 0, 2)
+        interject_grid.addWidget(self._sp_ihist, 1, 0)
+        interject_grid.setColumnStretch(3, 1)
+        interject_holder = QWidget()
+        interject_holder.setLayout(interject_grid)
+        self._interject_group = CollapseGroup(
+            "搭话参数", interject_holder,
+            summary=lambda: (f"概率 {self.ai_interject_probability.value()}%"
+                             f" · 间隔 {self.ai_interject_min.value()}–{self.ai_interject_max.value()} 分"
+                             f" · 参考 {self.ai_interject_history.value()} 条"),
+            collapsed=True)
+        for _sp in (self.ai_interject_probability, self.ai_interject_min,
+                    self.ai_interject_max, self.ai_interject_history):
+            _sp.valueChanged.connect(lambda _v: self._interject_group.refresh_summary())
+        pv.addWidget(self._interject_group)
         outer.addWidget(persona_panel)
+        # 卡片建好后先把形态摆对（进页面时不该先闪一下另一个形态）
+        self.set_persona_mode("preset" if self.ctx.settings.agent_profile_enabled else "custom",
+                              animate=False)
 
         # ---- 记忆与 MCP ----
         mem_panel = GlassPanel(strong=True)
@@ -439,8 +690,70 @@ class BrainPage(QWidget):
         m_lbl = QLabel("记忆与 MCP")
         m_lbl.setObjectName("sectionTitle")
         mv.addWidget(m_lbl)
+        # 自动通过好友申请 + Agent 模式（老板 2026-10-12）
+        # —— **能力不在就不显示开关**（他的原话：插件没装，AI 大脑的开关是不是该隐藏）
+        self.chk_auto_friend = None
+        if ai_config.has_capability(self.ctx.settings, "approve_friend"):
+            self.chk_auto_friend = QCheckBox("自动通过好友申请（卖家/客服用）")
+            self.chk_auto_friend.setToolTip(
+                "打开后：有人申请加机器人好友，它直接通过（不再问你）。"
+                "默认关闭——开着等于谁加都通过。")
+            self.chk_auto_friend.setChecked(
+                ai_config.read_auto_approve_friend(self.ctx.settings))
+            self.chk_auto_friend.toggled.connect(
+                lambda on: ai_config.save_auto_approve_friend(self.ctx.settings, on))
+            mv.addWidget(self.chk_auto_friend)
+        self.chk_agent_mode = None
+        if ai_config.has_capability(self.ctx.settings, "send_to_my_platform"):
+            self.chk_agent_mode = QCheckBox("Agent 模式：先动手办事，再说话")
+            self.chk_agent_mode.setToolTip(
+                "开启后它会真的去调工具（发到别的平台、记事、提醒、抓网页、发图…），"
+                "办完再用人设的口吻回你；关掉就只聊天不动手。")
+            self.chk_agent_mode.setChecked(ai_config.read_agent_mode(self.ctx.settings))
+            self.chk_agent_mode.toggled.connect(
+                lambda on: ai_config.save_agent_mode(self.ctx.settings, on))
+            mv.addWidget(self.chk_agent_mode)
         self.chk_memory = QCheckBox("启用全局记忆（默认开启，AI 会记住长期事项）")
         mv.addWidget(self.chk_memory)
+        # 内置记忆三档（无 / 基础 / 智能）：与下面那行复选框是同一份配置，
+        # 选「无」会自动把复选框也取消（ai_config.save_memory_level 里统一）。
+        mem_level_row = QHBoxLayout()
+        mem_level_row.setSpacing(8)
+        mem_level_lbl = QLabel("记忆档位")
+        mem_level_lbl.setStyleSheet(f"color: {TEXT_3}; font-size: 12px;")
+        mem_level_row.addWidget(mem_level_lbl)
+        self.cmb_memory_level = QComboBox()
+        self.cmb_memory_level.setMinimumHeight(30)
+        for opt in ai_config.memory_level_info()["options"]:
+            self.cmb_memory_level.addItem(
+                f"{opt['label']}", opt["value"])
+            self.cmb_memory_level.setItemData(
+                self.cmb_memory_level.count() - 1, opt["hint"], Qt.ToolTipRole)
+        self.cmb_memory_level.currentIndexChanged.connect(self._on_memory_level_changed)
+        self.cmb_memory_level.setToolTip(
+            "记忆档位改完立即生效，不用重启机器人：无 = 不记不读，"
+            "基础 = 记事实和日记，智能 = 再加权重/承诺/时间线/隐私过滤。")
+        mem_level_row.addWidget(self.cmb_memory_level, 1)
+        mv.addLayout(mem_level_row)
+        self.mem_level_hint = QLabel("")
+        self.mem_level_hint.setWordWrap(True)
+        self.mem_level_hint.setStyleSheet(f"color: {TEXT_3}; font-size: 12px;")
+        mv.addWidget(self.mem_level_hint)
+        self.mem_level_hint.setToolTip("改完立即生效，不用重启机器人。")
+        # 「现在记住了什么」：读的就是内置记忆库（list_memories）
+        mem_peek_row = QHBoxLayout()
+        mem_peek_row.setSpacing(6)
+        self.btn_mem_peek = QPushButton("现在记住了什么")
+        self.btn_mem_peek.setObjectName("ghost")
+        self.btn_mem_peek.setMinimumHeight(30)
+        self.btn_mem_peek.clicked.connect(self._peek_builtin_memory)
+        mem_peek_row.addWidget(self.btn_mem_peek)
+        mem_peek_row.addStretch(1)
+        mv.addLayout(mem_peek_row)
+        self.mem_peek_list = QListWidget()
+        self.mem_peek_list.setMaximumHeight(130)
+        self.mem_peek_list.setVisible(False)
+        mv.addWidget(self.mem_peek_list)
         self.chk_mcp = QCheckBox("启用 MCP 工具（供 AI 调用外部服务器）")
         mv.addWidget(self.chk_mcp)
         mcp_row = QHBoxLayout()
@@ -454,16 +767,15 @@ class BrainPage(QWidget):
         mcp_row.addWidget(mcp_lbl)
         mcp_row.addWidget(self.mcp_json_edit, 1)
         mv.addLayout(mcp_row)
-        mcp_hint = QLabel("JSON 格式：sse 用 url/headers；stdio 用 command/args/env；保存后重启机器人生效。")
+        mcp_hint = QLabel(
+            "照上面的示例格式填写；MCP 服务器要重启一次机器人才会真正连上"
+            "（界面上可直接点「重启机器人」）。")
         mcp_hint.setWordWrap(True)
         mcp_hint.setStyleSheet(f"color: {TEXT_3}; font-size: 12px;")
         mv.addWidget(mcp_hint)
 
-        mem_tip = QLabel(
-            "记忆时间线：这里读的是李清菡智能体档案的记忆库"
-            "（bot/data/liqinghan/agent.db），可导出 / 单条删除 / 清空。\n"
-            "内置 AI 插件的全局记忆在另一个文件（bot/data/ai/aichat_memory.json），"
-            "首页「记忆条数」与控制台时间线统计的是那一份；两份互不影响。")
+        mem_tip = QLabel("李清菡档案的记忆库，可导出、删除、清空。")
+        mem_tip.setToolTip("和下面的全局记忆是两份，互不影响。")
         mem_tip.setWordWrap(True)
         mem_tip.setStyleSheet(f"color: {TEXT_3}; font-size: 12px;")
         mv.addWidget(mem_tip)
@@ -501,8 +813,7 @@ class BrainPage(QWidget):
         ma.addLayout(mem_btns)
 
         # ---- 内置 AI 插件的全局记忆（另一个文件，与控制台同一份）----
-        self.ai_mem_tip = QLabel("内置 AI 记忆（全局）：读取 bot/data/ai/aichat_memory.json，"
-                                 "可导出 / 单条删除 / 清空全局。")
+        self.ai_mem_tip = QLabel("全局记忆：所有平台共用，可导出、删除、清空。")
         self.ai_mem_tip.setWordWrap(True)
         self.ai_mem_tip.setStyleSheet(f"color: {TEXT_3}; font-size: 12px;")
         mv.addWidget(self.ai_mem_tip)
@@ -534,8 +845,7 @@ class BrainPage(QWidget):
         ai_mem_btns.addStretch(1)
         ma.addLayout(ai_mem_btns)
 
-        kb_tip = QLabel(
-            "本地知识库：上传 txt / md 文档，AI 可调用 knowledge_search 检索回答（数据不出本机）。")
+        kb_tip = QLabel("知识库：上传 txt / md 文档，AI 会自己检索。")
         kb_tip.setWordWrap(True)
         kb_tip.setStyleSheet(f"color: {TEXT_3}; font-size: 12px;")
         mv.addWidget(kb_tip)
@@ -611,17 +921,29 @@ class BrainPage(QWidget):
         root.addWidget(self.scroll)
         self.set_beginner(bool(self.ctx.settings.beginner_mode))
 
+    def closeEvent(self, event):  # noqa: N802 —— Qt 命名
+        """关窗口前等模型拉取线程收尾，避免 Qt 强杀线程把进程带崩。"""
+        fetcher = getattr(self, "_model_fetcher", None)
+        if fetcher is not None:
+            try:
+                fetcher.wait(3.0)
+            except Exception:  # noqa: BLE001
+                pass
+        super().closeEvent(event)
+
     def set_beginner(self, on: bool):
         """小白模式：AI 大脑只保留接口配置、人设与状态摘要，隐藏档案/MCP/未接入平台。
 
         顺带把「还没配密钥就整页只留配置提示」的门禁算进来：两个条件都满足才显示，
         不然切一次小白模式就把门禁顶开了。
+
+        2026-10-07 三块并成一张「人设与主动聊天」卡后：这张卡在小白模式下**照旧显示**
+        （以前也是「人设与主动聊天」这一块显示、另外两块藏起来），卡里的「预设 / 自定义」
+        两段由胶囊切，不再各自受小白模式控制。
         """
         on = bool(on)
         self._beginner = on
-        for w in (getattr(self, "_agent_panel", None),
-                  getattr(self, "_workshop_panel", None),
-                  getattr(self, "_mem_panel", None)):
+        for w in (getattr(self, "_mem_panel", None),):
             if w is not None:
                 w.setVisible((not on) and self._ai_configured)
         persona = getattr(self, "_persona_panel", None)
@@ -682,15 +1004,45 @@ class BrainPage(QWidget):
         self.ai_quiet_start.setValue(pro["quiet_start"])
         self.ai_quiet_end.setValue(pro["quiet_end"])
 
+        # 群聊回话总开关（默认开）+ 富内容解析开关（默认开）+ 识图开关（默认开）
+        self.chk_group_chat.setChecked(ai_config.read_group_chat_enabled(s))
+        self.chk_rich_parse.setChecked(ai_config.read_rich_parse_enabled(s))
+        self.chk_vision.setChecked(ai_config.read_image_recognition(s))
+        self.chk_self_forge.setChecked(ai_config.read_self_forge(s))
+        self.chk_cross_platform.setChecked(ai_config.read_cross_platform(s))
+        self._refresh_cross_status()
+        # 群里主动搭话（插件内核 interject_*）
+        interject = ai_config.read_interject(s)
+        self.chk_interject.setChecked(interject["enabled"])
+        self.ai_interject_probability.setValue(int(round(interject["probability"] * 100)))
+        self.ai_interject_min.setValue(interject["interval_min"])
+        self.ai_interject_max.setValue(interject["interval_max"])
+        self.ai_interject_history.setValue(interject["history_count"])
+        self._refresh_group_rows()
+
         # 记忆与 MCP（程序内设置）
         self.chk_memory.setChecked(ai_config.read_memory_enabled(s))
+        mem_level = ai_config.read_memory_level(s)
+        idx = self.cmb_memory_level.findData(mem_level)
+        # 回填时别把"换档即存盘"那条热重载路径当成用户操作（会平白写一次配置）
+        self._mem_level_loading = True
+        try:
+            self.cmb_memory_level.setCurrentIndex(idx if idx >= 0 else
+                                                  self.cmb_memory_level.findData("basic"))
+            self._on_memory_level_changed()
+        finally:
+            self._mem_level_loading = False
         mcp = ai_config.read_mcp(s)
         self.chk_mcp.setChecked(mcp["enabled"])
         self.mcp_json_edit.setPlainText(
             json.dumps(mcp["servers"], ensure_ascii=False, indent=2)
             if mcp["servers"] else "")
-        # 智能体档案
-        self.chk_agent_profile.setChecked(s.agent_profile_enabled)
+        # 智能体档案（预设那一段）+ 本地人设（自定义那一段）：形态与状态行一起回填
+        self._syncing_mode = True
+        try:
+            self.chk_agent_profile.setChecked(s.agent_profile_enabled)
+        finally:
+            self._syncing_mode = False
         idx = self.agent_profile_combo.findData(s.agent_profile_id)
         self.agent_profile_combo.setCurrentIndex(idx if idx >= 0 else 0)
         self.agent_wake_edit.setText(", ".join(s.agent_wake_words))
@@ -700,8 +1052,14 @@ class BrainPage(QWidget):
         self.vision_model_edit.setText(s.vision_model)
         self.vision_key_edit.setText(s.vision_api_key)
         self._loaded_persona = ai_config.read_personality(s)
+        # 自定义态的人格设定框：和「设置 → 高级 → 人格设定」读的是同一份
+        self.personality_edit.setPlainText(self._loaded_persona)
+        self.persona_save_hint.setText("")
         self._loaded_agent_cfg = _agent_cfg_snapshot(s)
         self._suppress_fetch = False
+        self._refresh_persona_list()
+        self.set_persona_mode(
+            "preset" if s.agent_profile_enabled else "custom", animate=False)
         self._apply_config_gate()
 
     def _on_ai_provider_changed(self):
@@ -773,6 +1131,51 @@ class BrainPage(QWidget):
         """给测试/外部看：当前是不是已经配过密钥。"""
         return bool(getattr(self, "_ai_configured", False))
 
+    def _refresh_group_rows(self):
+        """列出"收到过消息的群"，勾选 = 允许在这个群回话。
+
+        全勾（或还没有任何群）= 不限群，写空名单，和默认行为一致；
+        只勾一部分才写白名单 —— 用户不用手抄 openid。
+        """
+        s = self.ctx.settings
+        rows = ai_config.known_groups(s)
+        allowed = {str(x) for x in ai_config.allowed_groups(s)}
+        while self._group_rows_layout.count():
+            item = self._group_rows_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        self._group_checkboxes = {}
+        if not rows:
+            self.group_list_lbl.setText("允许回话的群：不限群（默认）")
+            return
+        if allowed:
+            self.group_list_lbl.setText(
+                f"只允许勾选的 {len(allowed)} 个群")
+        else:
+            self.group_list_lbl.setText("允许回话的群：不限群（默认）")
+        for row in rows:
+            openid = row["openid"]
+            box = QCheckBox(
+                f"群 {openid[:8]}… · 最近 {ai_config.short_time(row['last_ts']) or '—'}"
+                f" · 收过 {row['count']} 条")
+            box.setChecked((not allowed) or (openid in allowed))
+            box.toggled.connect(self._on_group_toggled)
+            self._group_rows_layout.addWidget(box)
+            self._group_checkboxes[openid] = box
+
+    def _on_group_toggled(self):
+        """勾选变化就存盘：全勾 = 不限群（空名单），否则只允许勾选的群。"""
+        s = self.ctx.settings
+        known = [r["openid"] for r in ai_config.known_groups(s)]
+        checked = [oid for oid, box in self._group_checkboxes.items() if box.isChecked()]
+        allowed = [] if len(checked) == len(known) else checked
+        if not ai_config.save_allowed_groups(s, allowed):
+            self.ctx.show_toast("保存失败：请检查机器人目录权限")
+            return
+        self._refresh_group_rows()
+        self.ctx.show_toast("已更新，立即生效（无需重启）")
+
     def _save_config(self):
         s = self.ctx.settings
         s.ai_platforms = {
@@ -812,6 +1215,27 @@ class BrainPage(QWidget):
         )
         memory_ok = ai_config.save_memory_enabled(
             s, self.chk_memory.isChecked())
+        # 记忆档位（无/基础/智能）：与复选框写同一份配置，后写以档位为准
+        level_ok = ai_config.save_memory_level(
+            s, self.cmb_memory_level.currentData() or "basic")
+        group_ok = ai_config.save_group_chat_enabled(
+            s, self.chk_group_chat.isChecked())
+        rich_ok = ai_config.save_rich_parse_enabled(
+            s, self.chk_rich_parse.isChecked())
+        vision_ok = ai_config.save_image_recognition(
+            s, self.chk_vision.isChecked())
+        forge_ok = ai_config.save_self_forge(
+            s, self.chk_self_forge.isChecked())
+        cross_ok = ai_config.save_cross_platform(
+            s, self.chk_cross_platform.isChecked())
+        interject_ok = ai_config.save_interject(s, {
+            "enabled": self.chk_interject.isChecked(),
+            "probability": self.ai_interject_probability.value() / 100.0,
+            "interval_min": self.ai_interject_min.value(),
+            "interval_max": self.ai_interject_max.value(),
+            "history_count": self.ai_interject_history.value(),
+        })
+        session_ok = True      # 免@连续对话的参数归「连续对话能力包」，这里不再写
         try:
             servers = json.loads(self.mcp_json_edit.toPlainText().strip() or "{}")
         except ValueError as e:
@@ -833,6 +1257,9 @@ class BrainPage(QWidget):
             return
         self.refresh_status()
         self._apply_config_gate()
+        # 保存后把形态与状态行重新对齐（用户在预设态勾/取消了档案开关）
+        self.set_persona_mode(
+            "preset" if self.chk_agent_profile.isChecked() else "custom", animate=True)
         fails = []
         if not ai_ok:
             fails.append("接口")
@@ -842,11 +1269,29 @@ class BrainPage(QWidget):
             fails.append("主动聊天")
         if not memory_ok:
             fails.append("记忆")
+        if not level_ok:
+            fails.append("记忆档位")
+        if not group_ok:
+            fails.append("群聊回话")
+        if not rich_ok:
+            fails.append("引用/图片解析")
+        if not interject_ok:
+            fails.append("群里搭话")
+        if not session_ok:
+            fails.append("免@连续对话")
         if not mcp_ok:
             fails.append("MCP")
+        # 平台开关 / 记忆档位这一批**改完立即生效**（2026-10-11 热重载）：
+        # 把 .env + 有效开关快照整个刷一遍，机器人进程每条消息热读它。
+        # 以前这里是"改完重启生效"，白等一次重启。
+        try:
+            bot.refresh_hot_config(s)
+        except Exception as e:  # noqa: BLE001 —— 刷快照失败不该让保存报错
+            logger.warning("刷新机器人热配置失败（开关改动要重启才生效）: %s", e)
         self.ctx.show_toast(
-            (("AI 配置已保存，正在拉取模型列表验证连通…" if ai_ok
-              else "AI 配置已保存，重启机器人生效")
+            (("AI 配置已保存并**立即生效**（平台开关/记忆档位/人设都不用重启），"
+              "正在拉取模型列表验证连通…" if ai_ok
+              else "AI 配置已保存并立即生效（接口那几项写入失败，见下）")
              + ("" if not fails else f"（{'、'.join(fails)}写入失败，请检查目录权限）")))
         if ai_ok:
             # 「保存并测试」＝保存 + 真拉一次服务商模型列表
@@ -855,22 +1300,189 @@ class BrainPage(QWidget):
         before = dict(self._loaded_agent_cfg)
         after = _agent_cfg_snapshot(s)
         self._loaded_agent_cfg = after
-        if _agent_restart_required(before, after):
+        if _profile_restart_required(before, after):
+            # 档案开关/id 变了：只有重启一次才真的切得过去（见 _PROFILE_RESTART_KEYS）。
+            # ⚠ 必须把 before/after 传进去：上面 1302 行刚把 _loaded_agent_cfg 刷成 after，
+            # 不传就是"自己跟自己比"→ 恒判无变化 → 死分支（2026-10-16 复核抓的）。
+            self._restart_agent_after_switch("已保存", before=before, after=after)
+        elif _agent_restart_required(before, after):
             self._auto_restart_agent()
         self._maybe_auto_wake_generation(s)
 
+    # ------------------------------------------------------------ 人设形态（胶囊）
+    def set_persona_mode(self, mode: str, animate: bool = True):
+        """切换卡片形态：preset = 用预设档案，custom = 用本地人设/手写。
+
+        只改显示与滑块位置（回填状态、点胶囊都走这里），**不改配置** ——
+        真正改配置的是 _on_persona_seg（用户点了胶囊）。
+        """
+        mode = "preset" if mode == "preset" else "custom"
+        self.persona_seg.set_current(mode, animate=animate)
+        agent = getattr(self, "_agent_panel", None)
+        if agent is not None:
+            agent.setVisible(mode == "preset")
+        workshop = getattr(self, "_workshop_panel", None)
+        if workshop is not None:
+            workshop.setVisible(mode == "custom")
+        self._refresh_persona_status()
+
+    def _on_persona_seg(self, mode: str):
+        """用户点了胶囊（或按了左右方向键）：切换即互斥，并且一定说清改了什么。"""
+        s = self.ctx.settings
+        if mode == "preset":
+            had_local = bool(str(getattr(s, "local_persona_id", "") or ""))
+            name = self._active_persona_name()
+            if had_local:
+                from ...core import persona_workshop
+                try:
+                    persona_workshop.deactivate_persona(s)
+                except Exception as e:  # noqa: BLE001 —— 停用失败也要接着把档案打开
+                    self.ctx.show_toast("停用本地人设失败：" + str(e))
+            s.agent_profile_enabled = True
+            s.save()
+            self.chk_agent_profile.setChecked(True)
+            self._refresh_persona_list()
+            self.persona_switch_hint.setText(
+                f"已切到预设：本地人设《{name}》已停用，改用档案里的人格。"
+                if had_local else "已切到预设：按档案走，本地人设保持停用。")
+            self._restart_agent_after_switch("已切到预设档案")
+        else:
+            had_profile = bool(self.chk_agent_profile.isChecked() or s.agent_profile_enabled)
+            s.agent_profile_enabled = False
+            s.save()
+            self.chk_agent_profile.setChecked(False)
+            self.persona_switch_hint.setText(
+                "已切到自定义：预设档案已停用，人格以本地人设 /「设置 → 高级 → 人格设定」里那段为准。"
+                if had_profile else
+                "已切到自定义：预设档案本来就是关的，人格以本地人设 /「设置 → 高级 → 人格设定」里那段为准。")
+            self._restart_agent_after_switch("已切到自定义")
+        self.set_persona_mode(mode)
+
+    def _on_agent_profile_toggled(self, on: bool):
+        """档案开关：打开 = 切到预设那一段并停用本地人设；关掉 = 回到自定义。"""
+        if self._syncing_mode:
+            return
+        self._syncing_mode = True
+        try:
+            if on:
+                self._on_persona_seg("preset")
+            else:
+                self._on_persona_seg("custom")
+        finally:
+            self._syncing_mode = False
+
+    def _active_persona_name(self) -> str:
+        """当前启用的本地人设名字（读不到就退回 id，再读不到给「本地人设」）。"""
+        pid = str(getattr(self.ctx.settings, "local_persona_id", "") or "")
+        if not pid:
+            return ""
+        try:
+            from ...core import persona_workshop
+            for p in persona_workshop.list_personas(self.ctx.settings):
+                if str(p.get("id")) == pid:
+                    return str(p.get("name") or pid)
+        except Exception:  # noqa: BLE001 —— 列表读不到也要能把状态行说清楚
+            pass
+        return pid
+
+    def _refresh_persona_status(self):
+        """状态行：本地人设 > 预设档案 > 手写人设（与后端一致，二者互斥）。"""
+        lbl = getattr(self, "persona_mode_lbl", None)
+        if lbl is None:
+            return
+        name = self._active_persona_name()
+        if name:
+            lbl.setText(f"当前生效：本地人设《{name}》")
+        elif self.chk_agent_profile.isChecked():
+            prof = str(self.agent_profile_combo.currentText() or "星群助手")
+            lbl.setText(f"当前生效：预设档案 {prof}")
+        else:
+            lbl.setText("当前生效：手写人设")
+
+    def _save_persona_text(self):
+        """保存「人格设定」这一项：与「设置 → 高级 → 人格设定」同一个字段、同一个函数。
+
+        老板要求两端一致（控制台那张卡的自定义态里就有这个框），所以这里也放一个；
+        写的是 ai_config.save_personality（机器人侧 aichat_manager.json 的 personality），
+        不另造一份存储 —— 否则「设置」那边和这里又会各说各话。
+        """
+        text = self.personality_edit.toPlainText()
+        if not ai_config.save_personality(self.ctx.settings, text):
+            self.persona_save_hint.setText("保存人设失败：机器人目录可能没有写入权限。")
+            self.ctx.show_toast("保存人设失败：机器人目录可能没有写入权限")
+            return
+        self._loaded_persona = ai_config.read_personality(self.ctx.settings)
+        self.persona_save_hint.setText("人设已保存，立即生效（无需重启）。")
+        self.ctx.show_toast("人设已保存，立即生效（无需重启）")
+
     # ------------------------------------------------------------ 智能体档案
-    def _auto_restart_agent(self):
-        """档案/模型相关配置变化后自动重启 NoneBot，让新档案真正载入。"""
+    def _restart_bot(self):
+        """「重启机器人」按钮：只重启机器人进程（不碰 NapCat / QQ）。
+
+        口径：设置改了立即生效；**代码改了才需要重启**（装/卸插件、换通道、
+        能力包、MCP 服务器），点一下就能重启。
+        """
         if self.ctx.tasks is None:
-            self.ctx.show_toast("AI 配置已保存，请手动重启 NoneBot 载入新档案")
+            self.ctx.show_toast("请到「全局管理」里点重启机器人")
             return
         from ...tasks.workers import RestartBotTask
-        self.ctx.show_toast("AI 配置已保存，正在自动重启 NoneBot 载入新档案...")
+
+        self.ctx.show_toast("正在重启机器人（约 15 秒，期间 QQ 短暂离线）…")
         self.ctx.tasks.submit(
-            "重启 NoneBot（载入智能体档案）", "service", RestartBotTask,
+            "重启机器人", "service", RestartBotTask,
             retryable=True, manager=self.ctx.manager,
         )
+
+    def _restart_agent_after_switch(self, what: str, before=None, after=None):
+        """切换人设形态/保存后：多数场景热刷即可，**档案开关/id 例外见下**。
+
+        人设/唤醒词/模型这些是热读的（机器人每条消息 `maybe_reload()`），
+        不再重启，别白等 15 秒还打断群里的对话。
+        但**档案开关 / 档案 id 变了必须重启一次** —— 李清菡插件在 import 期
+        判定 _ENABLED、注册 handler，热配置救不了（2026-10-15 审计 liqinghan/A）：
+        打开后谁都不回话、关掉后双回复。
+
+        `before/after` 允许由调用方传入快照：保存路径在调用**之前**已经刷新过
+        `_loaded_agent_cfg`，这里若不收外部快照就会"自己跟自己比"，永远判不出
+        变化（2026-10-16 对抗性复核抓到的死分支：先勾启用档案、再选李清菡、
+        保存 → 一条重启提示都不弹）。
+        """
+        s = self.ctx.settings
+        if before is None or after is None:
+            before = dict(self._loaded_agent_cfg)
+            after = _agent_cfg_snapshot(s)
+        self._loaded_agent_cfg = after
+        if _profile_restart_required(before, after):
+            # 档案开关/id 变了：热刷配置救不了（插件是 import 期注册的）——
+            # 以前这里只回一句"立即生效（无需重启）"，实际是"打开后谁都不回话 /
+            # 关掉后双回复"（2026-10-15 审计 liqinghan/A）。
+            self.ctx.show_toast(f"{what}：档案开关变了，重启一次机器人生效（约 15 秒）")
+            self._restart_bot()
+            return
+        if not _agent_restart_required(before, after):
+            self.ctx.show_toast(f"{what}（配置没变）")
+            return
+        try:
+            bot.refresh_hot_config(s)      # 主人 QQ / 唤醒词 立即生效
+        except Exception as e:  # noqa: BLE001
+            logger.warning("刷新机器人热配置失败: %s", e)
+        self.ctx.show_toast(f"{what}，立即生效（无需重启）")
+
+    def _auto_restart_agent(self):
+        """档案/模型相关配置变化后：**刷热配置，不再自动重启机器人**（2026-10-11）。
+
+        这些字段（人设 / 模型 / 唤醒词 / 主人 / 视觉）现在全是热读的，
+        机器人每条消息 `maybe_reload()` 就拿到新值；以前这里会重启一次，
+        白白打断群里正在进行的对话。
+
+        例外：**档案开关 / 档案 id 变了必须重启一次** —— 那走 `_restart_agent_after_switch`
+        （李清菡插件是 import 期注册的，热配置救不了，见 `_PROFILE_RESTART_KEYS`）。
+        """
+        try:
+            bot.refresh_hot_config(self.ctx.settings)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("刷新机器人热配置失败: %s", e)
+        self.ctx.show_toast("已保存，立即生效（无需重启）")
 
     def _on_wake_edited(self, _text):
         """手动改唤醒词 = 关闭自动覆盖，防止下次保存冲掉人工维护的词。"""
@@ -940,6 +1552,7 @@ class BrainPage(QWidget):
             item.setData(Qt.UserRole, p["id"])
             item.setToolTip(p["summary"])
             self.persona_list.addItem(item)
+        self._refresh_persona_status()
 
     def _activate_persona(self):
         from ...core import persona_workshop
@@ -954,8 +1567,20 @@ class BrainPage(QWidget):
             QMessageBox.warning(self, "启用失败", str(e))
             return
         self._loaded_persona = ai_config.read_personality(self.ctx.settings)
-        self.chk_agent_profile.setChecked(False)
+        # 启用本地人设会把编译好的人格写进人格字段：框里要跟着显示，不然用户以为没生效
+        self.personality_edit.setPlainText(self._loaded_persona)
+        # 启用本地人设 = 走自定义那一段（后端也把档案关掉了，界面要跟着动，别静默）
+        self._syncing_mode = True
+        try:
+            self.chk_agent_profile.setChecked(False)
+        finally:
+            self._syncing_mode = False
+        self.ctx.settings.agent_profile_enabled = False
+        self.ctx.settings.save()
+        self.set_persona_mode("custom")
         self._refresh_persona_list()
+        self.persona_switch_hint.setText(
+            f"已启用本地人设《{res.get('name')}》：预设档案已停用。")
         self.ctx.show_toast(f"已启用人设：{res.get('name')}，重启机器人后生效")
 
     def _deactivate_persona(self):
@@ -966,6 +1591,10 @@ class BrainPage(QWidget):
             self.ctx.show_toast("停用失败：" + str(e))
             return
         self._refresh_persona_list()
+        # 停用会把人格恢复成内置默认：框里跟着回到那一份
+        self._loaded_persona = ai_config.read_personality(self.ctx.settings)
+        self.personality_edit.setPlainText(self._loaded_persona)
+        self.persona_switch_hint.setText("已停用本地人设：改回按档案或手写人格走。")
         self.ctx.show_toast("已停用本地人设")
 
     def _uninstall_persona(self):
@@ -1213,6 +1842,90 @@ class BrainPage(QWidget):
                                    QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
         return ret == QMessageBox.Yes
 
+    # ------------------------------------------------------ 内置记忆三档
+    def _on_memory_level_changed(self, *args):
+        """换档：**立即存盘 + 立即生效**（不用点保存、更不用重启机器人）。
+
+        老板 2026-10-11 的原话就是"记忆档次改完必须重启"这件事最痛，所以这里
+        不学同一页其它控件那样"等点保存"——换档即生效，并给出明确的提示。
+        """
+        level = self.cmb_memory_level.currentData() or "basic"
+        hint = ai_config.MEMORY_LEVEL_HINTS.get(level, "")
+        self.mem_level_hint.setText(hint)
+        # 「无」档 = 不记不读：顺手把上面那个开关也摆成一致的样子（保存时统一收口）
+        if level == "off":
+            self.chk_memory.setChecked(False)
+        if getattr(self, "_mem_level_loading", False):
+            return          # 回填控件时不要触发保存
+        s = self.ctx.settings
+        try:
+            ok = ai_config.save_memory_level(s, level)
+            if ok:
+                bot.write_live_gates(s)      # 机器人侧热读的快照立刻跟上
+        except Exception as e:  # noqa: BLE001 —— 存不下来要说出来，不能装作生效了
+            logging.getLogger("qbotmanager").warning("记忆档位保存失败: %s", e)
+            self.ctx.show_toast("记忆档位保存失败：请检查机器人目录权限")
+            return
+        if not ok:
+            self.ctx.show_toast("记忆档位保存失败：请检查机器人目录权限")
+            return
+        label = ai_config.MEMORY_LEVEL_LABELS.get(level, level)
+        self.ctx.show_toast(f"记忆档位已切到「{label}」，立即生效（无需重启）")
+
+    def _peek_builtin_memory(self):
+        """「现在记住了什么」：直接读内置记忆库（list_memories）。"""
+        self.mem_peek_list.clear()
+        try:
+            from ...core import memory as memory_mod
+        except ImportError as exc:
+            self.mem_peek_list.addItem(f"（内置记忆模块不可用：{exc}）")
+            self.mem_peek_list.setVisible(True)
+            return
+        level = memory_mod.level()
+        try:
+            info = memory_mod.stats()
+        except Exception as exc:  # noqa: BLE001 —— 读库失败要说出来，不能显示成「没有记忆」
+            self.mem_peek_list.addItem("（读记忆库失败：" + str(exc) + "）")
+            self.mem_peek_list.setVisible(True)
+            return
+        if level == "off":
+            self.mem_peek_list.addItem("（档位是「无」：不记也不读）")
+            self.mem_peek_list.setVisible(True)
+            return
+        self.mem_peek_list.addItem(
+            f"档位：{ai_config.MEMORY_LEVEL_LABELS.get(level, level)}｜"
+            f"共 {info.get('total', 0)} 条（承诺 {info.get('promises', 0)} · "
+            f"印象档 {info.get('impressions', 0)} · 已过期 {info.get('expired', 0)}）")
+        db = Path(str(info.get("db") or ""))
+        self.mem_peek_list.addItem(f"库文件：{db}")
+        if not db.is_file():
+            self.mem_peek_list.addItem("（还没有记忆库：聊过天、或写进第一条记忆后才会生成）")
+            self.mem_peek_list.setVisible(True)
+            return
+        shown = 0
+        # 逐人列出（库里按 qq 分行）；一个人也没有就如实说
+        try:
+            import sqlite3
+            conn = sqlite3.connect(str(db))
+            conn.row_factory = sqlite3.Row
+            people = [r["qq"] for r in conn.execute(
+                "SELECT DISTINCT qq FROM memories WHERE expired=0 ORDER BY qq LIMIT 20")]
+            for qq in people:
+                rows = conn.execute(
+                    "SELECT fact, kind, weight FROM memories WHERE qq=? AND expired=0 "
+                    "ORDER BY id DESC LIMIT 5", (qq,)).fetchall()
+                self.mem_peek_list.addItem(f"—— {qq}（{len(rows)} 条，最多显示 5 条）——")
+                for r in rows:
+                    self.mem_peek_list.addItem(
+                        f"  [{r['kind']}/权重{r['weight']}] {str(r['fact'])[:60]}")
+                    shown += 1
+            conn.close()
+        except Exception as exc:  # noqa: BLE001
+            self.mem_peek_list.addItem("（列条目失败：" + str(exc) + "）")
+        if not shown:
+            self.mem_peek_list.addItem("（库里还没有条目）")
+        self.mem_peek_list.setVisible(True)
+
     # ------------------------------------------------------------ 本地知识库
     def _refresh_kb_list(self):
         from ...core import knowledge_base
@@ -1303,12 +2016,38 @@ class BrainPage(QWidget):
         if words:
             self.agent_wake_edit.setText(", ".join(words))
             self.chk_wake_auto.setChecked(True)
-            self.ctx.show_toast("唤醒词已生成，可手动修改（保存后重启机器人生效）")
+            self.ctx.show_toast("唤醒词已生成，可手动修改")
             return
         msg = str(res.get("error") or "无结果") if isinstance(res, dict) else "无结果"
         self.ctx.show_toast("唤醒词生成失败：" + msg + "，已保留原唤醒词")
 
     # ------------------------------------------------------------ 状态
+    def _refresh_cross_status(self):
+        """显示"谁和谁算同一个人"（读机器人侧的绑定文件，只读展示）。"""
+        try:
+            from qbotmanager.core import ai_config as _cfg
+
+            groups = _cfg.read_identity_bindings(self.ctx.settings)
+        except Exception:  # noqa: BLE001
+            groups = []
+        if not groups:
+            self.cross_status_lbl.setText("绑定状态：还没绑定（在微信或 QQ 上发「绑定」拿码）")
+            return
+        names = {
+            "qq": "QQ", "qq_official": "QQ 官方", "wechat": "微信",
+            "feishu": "飞书", "telegram": "纸飞机",
+        }
+        parts = []
+        for group in groups[:3]:
+            labels = []
+            for key in group:
+                head = str(key).split(":", 1)[0]
+                label = names.get(head, head)
+                if label not in labels:
+                    labels.append(label)
+            parts.append(" ↔ ".join(labels))
+        more = f"（还有 {len(groups) - 3} 组）" if len(groups) > 3 else ""
+        self.cross_status_lbl.setText("绑定状态：" + "；".join(parts) + more)
     def refresh_status(self):
         s = self.ctx.settings
         summary = message_store.brain_summary(s)
@@ -1319,25 +2058,22 @@ class BrainPage(QWidget):
         self.empty.setVisible(not installed)
         if not installed:
             self.empty.set_content(
-                "未检测到内置 AI 插件",
-                "重启一次机器人后，AstroSwarm 会自动把内置 ai 插件安装到插件目录，"
-                "并在这里展示模型、MCP、记忆与身份绑定状态。")
+                "AI 插件还没装好",
+                "重启一次机器人就会自动装好。")
             return
         if not getattr(s, "ai_enabled", True):
             self.summary_panel.setVisible(False)
             self.empty.setVisible(True)
             self.empty.set_content(
                 "AI 插件已停用",
-                "当前在「设置」页关闭了 AI 插件总开关，机器人启动时不会加载 AI 功能；"
-                "接口配置与平台开关仍可在上方提前填好。")
+                "在「设置」页打开 AI 插件总开关即可。")
             return
         if not configured:
             self.summary_panel.setVisible(False)
             self.empty.setVisible(True)
             self.empty.set_content(
-                "尚未配置 AI 接口",
-                "在上方选择服务商（DeepSeek/通义/智谱/Kimi/OpenAI 等），"
-                "填入 API 密钥并保存，重启机器人生效。")
+                "还没配置 AI",
+                "在上方选服务商、填密钥并保存。")
             return
         self.summary_labels["model"].setText(summary["model"] or "未配置")
         mcp = ("已开启" if summary["mcp_enabled"] else "未开启") + \

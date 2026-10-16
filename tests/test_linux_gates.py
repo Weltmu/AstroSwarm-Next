@@ -127,32 +127,38 @@ def test_feature_gate_monthly_is_member_but_not_all_plugins(cfg_home):
     assert gate["all_plugins"] is False
 
 
-def test_feature_gate_trial_not_member_not_full(cfg_home):
-    """回归：3 天试用（plan=trial）不解锁付费包。"""
+def test_feature_gate_trial_gets_wechat_too(cfg_home):
+    """微信通道已免费开放（2026-10-01）：试用档也能用，但 full 仍为 False。"""
     _set_plan("trial", FUTURE)
     gate = auth.feature_gate()
-    assert gate["full"] is False and gate["member"] is False, gate
+    assert gate["full"] is False, gate
+    assert gate["member"] is True, "微信通道免费开放，不该再按档位拦"
+    assert "免费开放" in gate["reason"], gate
 
 
-def test_feature_gate_expired_permanent_locks(cfg_home):
+def test_feature_gate_expired_permanent_locks_full_only(cfg_home):
+    """到期只影响 full（历史字段），微信通道照样可用。"""
     _set_plan("permanent", PAST)
     gate = auth.feature_gate()
-    assert gate["full"] is False and gate["member"] is False, gate
+    assert gate["full"] is False, gate
+    assert gate["member"] is True, gate
 
 
-def test_feature_gate_none_locks(cfg_home):
+def test_feature_gate_none_locks_full_only(cfg_home):
     _set_plan("none")
     gate = auth.feature_gate()
-    assert gate["full"] is False and gate["member"] is False, gate
+    assert gate["full"] is False, gate
+    assert gate["member"] is True, gate
 
 
 def test_feature_gate_requires_signature(cfg_home, monkeypatch):
-    """没有账号服务签名时，plan 写什么都不算（改 config.json 白改）。"""
+    """没有账号服务签名时 full 不算（改 config.json 白改）；微信通道与签名无关。"""
     monkeypatch.setattr(auth, "verify_entitlement", lambda cfg=None: False)
     _set_plan("permanent")
     gate = auth.feature_gate()
-    assert gate["full"] is False and gate["member"] is False, gate
-    assert "签名" in gate["reason"]
+    assert gate["full"] is False, gate
+    assert gate["member"] is True, "微信通道免费开放，与账号签名无关"
+    assert "免费开放" in gate["reason"], gate
 
 
 # --------------------------------------------------------------- _allowed_packs

@@ -12,17 +12,18 @@
 """
 import os
 import sys
+import threading
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
-    QFrame, QHBoxLayout, QLabel, QPushButton, QVBoxLayout, QWidget,
+    QFrame, QHBoxLayout, QLabel, QPushButton, QSpinBox, QVBoxLayout, QWidget,
 )
 
 from ...constants import APP_VERSION
 from ...tasks.workers import RestartBotTask, StartStopTask
 from ..theme import TEXT_3
 from ..widgets import GlassPanel, StatusBadge
-from .common import PageContext, TaskPanel, make_row
+from .common import PageContext, TaskPanel, Worker, make_row
 
 _FOLD_CLOSED = "运维细节：端口 / 目录 / 日志路径　▾"
 _FOLD_OPEN = "运维细节：端口 / 目录 / 日志路径　▴"
@@ -48,7 +49,7 @@ class ServicesPage(QWidget):
 
         title = QLabel("全局管理")
         title.setObjectName("pageTitle")
-        sub = QLabel("服务状态与开关；端口、路径、日志位置在下面的「运维细节」里")
+        sub = QLabel("服务状态与开关。")
         sub.setObjectName("pageSub")
         outer.addWidget(title)
         outer.addWidget(sub)
@@ -73,7 +74,7 @@ class ServicesPage(QWidget):
         row = QHBoxLayout()
         left = QVBoxLayout()
         left.setSpacing(2)
-        name = QLabel("机器人（NoneBot）")
+        name = QLabel("机器人")
         name.setStyleSheet("font-size: 14px;")
         meta = QLabel("QQ / 微信 共用一个进程，重启会短暂离线约 10 秒")
         meta.setWordWrap(True)
@@ -95,7 +96,7 @@ class ServicesPage(QWidget):
         left.setSpacing(2)
         name = QLabel("DSH 智能体")
         name.setStyleSheet("font-size: 14px;")
-        meta = QLabel("本机的群聊智能体通道（dsh）；没开启时这一行只是状态提示")
+        meta = QLabel("本机的群聊智能体通道")
         meta.setWordWrap(True)
         meta.setStyleSheet(f"color: {TEXT_3}; font-size: 12px;")
         left.addWidget(name)
@@ -128,12 +129,34 @@ class ServicesPage(QWidget):
             val.setStyleSheet(f"color: {TEXT_3}; font-size: 12px;")
             self.detail_labels[key] = val
             dv.addLayout(make_row(label, val))
+        # ---- 日志保留（默认 10 天，超期自动删）----
+        log_row = QHBoxLayout()
+        log_row.setSpacing(8)
+        log_tip = QLabel("日志保留")
+        log_tip.setStyleSheet(f"color: {TEXT_3}; font-size: 12px;")
+        log_row.addWidget(log_tip)
+        self.spin_keep_days = QSpinBox()
+        self.spin_keep_days.setRange(1, 365)
+        self.spin_keep_days.setSuffix(" 天")
+        self.spin_keep_days.setValue(int(getattr(self.ctx.settings, "logs_keep_days", 10) or 10))
+        self.spin_keep_days.setToolTip("超期的旧日志自动删，正在写的不删。")
+        self.spin_keep_days.valueChanged.connect(self._save_keep_days)
+        log_row.addWidget(self.spin_keep_days)
+        self.log_usage = QLabel("—")
+        self.log_usage.setStyleSheet(f"color: {TEXT_3}; font-size: 12px;")
+        log_row.addWidget(self.log_usage, 1)
+        btn_clean_logs = QPushButton("立刻清理旧日志")
+        btn_clean_logs.setObjectName("ghost")
+        btn_clean_logs.clicked.connect(self._clean_logs_now)
+        log_row.addWidget(btn_clean_logs)
+        dv.addLayout(log_row)
+
         btns = QHBoxLayout()
         btns.setSpacing(8)
-        for text, handler in (
-            ("打开机器人目录", lambda: self._open_path(self.ctx.settings.bot_dir)),
+        for text, handler in (            ("打开机器人目录", lambda: self._open_path(self.ctx.settings.bot_dir)),
             ("打开日志目录", lambda: self._open_path(self.ctx.settings.logs_dir)),
             ("实时日志", lambda: self.ctx.switch_page("日志")),
+            ("消息中心", lambda: self.ctx.switch_page("消息中心")),
             ("依赖管理", lambda: self.ctx.switch_page("依赖")),
             ("接入配置", lambda: self.ctx.switch_page("接入")),
         ):
@@ -160,6 +183,42 @@ class ServicesPage(QWidget):
         self.details.setVisible(self._details_open)
         self.btn_fold.setText(_FOLD_OPEN if self._details_open else _FOLD_CLOSED)
 
+    def _save_keep_days(self, value: int):
+        """日志保留天数：10 天是默认值（老板定的）。"""
+        try:
+            self.ctx.settings.logs_keep_days = max(1, min(int(value or 10), 365))
+            self.ctx.settings.save()
+        except Exception as e:  # noqa: BLE001
+            self.ctx.show_toast("保存日志保留天数失败：" + str(e))
+            return
+        self._refresh_log_usage()
+
+    def _refresh_log_usage(self):
+        from ...core import cleanup as cleanup_mod
+
+        try:
+            info = cleanup_mod.logs_usage(self.ctx.settings.logs_dir)
+            keep = int(getattr(self.ctx.settings, "logs_keep_days", 10) or 10)
+            self.log_usage.setText(f"现在占 {info['mb']} MB（{info['files']} 个文件）· 只留最近 {keep} 天")
+        except Exception:  # noqa: BLE001
+            self.log_usage.setText("—")
+
+    def _clean_logs_now(self):
+        from ...core import cleanup as cleanup_mod
+
+        try:
+            stats = cleanup_mod.rotate_and_prune_logs(
+                self.ctx.settings.logs_dir,
+                int(getattr(self.ctx.settings, "logs_keep_days", 10) or 10))
+        except Exception as e:  # noqa: BLE001
+            self.ctx.show_toast("清理失败：" + str(e))
+            return
+        freed = round((stats.get("bytes_freed") or 0) / 1048576, 2)
+        msg = f"删了 {len(stats.get('deleted') or [])} 个旧日志，回收 {freed} MB"
+        if stats.get("skipped"):
+            msg += "（有几个正被占用，下次重启后再删）"
+        self.ctx.show_toast(msg)
+        self._refresh_log_usage()
     def _open_path(self, path):
         """打开目录：Windows 用资源管理器，其余平台退回系统默认方式。"""
         target = str(path)
@@ -199,7 +258,7 @@ class ServicesPage(QWidget):
                 "大约 10 秒内 QQ / 微信 会短暂离线，正在进行的对话会中断。\n\n确定重启吗？"):
             return
         self.ctx.tasks.submit(
-            "重启 NoneBot", "service", RestartBotTask,
+            "重启机器人", "service", RestartBotTask,
             payload={"reset_wechat": False}, retryable=True, manager=self.ctx.manager,
         )
 
@@ -217,7 +276,7 @@ class ServicesPage(QWidget):
         t.finished.connect(self._on_service_finished)
 
     def _on_service_started(self, tid, name):
-        if name in ("启动服务", "停止服务", "重启 NoneBot"):
+        if name in ("启动服务", "停止服务", "重启机器人"):
             self._service_tid = tid
             self.task_panel.bind(tid)
             self.task_panel.setVisible(True)
@@ -237,6 +296,7 @@ class ServicesPage(QWidget):
 
     # ------------------------------------------------------------ 状态
     def refresh_status(self):
+        self._refresh_log_usage()
         s = self.ctx.settings
         m = self.ctx.manager
         try:
@@ -264,11 +324,37 @@ class ServicesPage(QWidget):
         self.detail_labels["bot_dir"].setText(str(s.bot_dir))
         self.detail_labels["logs_dir"].setText(str(s.logs_dir))
         if not self._machine_id:
+            self._start_machine_id_probe()
+        mid = f" · {self._machine_id[:8]}…" if self._machine_id else ""
+        self.detail_labels["version"].setText(f"v{APP_VERSION}{mid}")
+
+    def _start_machine_id_probe(self):
+        """机器码在后台算：它要起一次 PowerShell 采硬件序列号，实测约 2 秒。
+
+        以前是在这里同步等它，等于每次开机都白等 2 秒（还会把启动动画冻住）。
+        现在先把版本号显示出来，算完再由信号回主线程补上后 8 位。
+        """
+        if getattr(self, "_machine_probe", None) is not None:
+            return
+        worker = Worker(self)
+        worker.finished.connect(self._on_machine_id)
+        self._machine_probe = worker          # 挂引用，别被回收
+
+        def _work():
             try:
                 from ...core import license as lic_mod
 
-                self._machine_id = lic_mod.machine_code()
-            except Exception:  # noqa: BLE001
-                self._machine_id = ""
-        mid = f" · {self._machine_id[:8]}…" if self._machine_id else ""
-        self.detail_labels["version"].setText(f"v{APP_VERSION}{mid}")
+                return lic_mod.machine_code()
+            except Exception:  # noqa: BLE001 —— 采不到就不显示，不影响任何功能
+                return ""
+
+        threading.Thread(target=lambda: worker.run(_work), daemon=True).start()
+
+    def _on_machine_id(self, val):
+        self._machine_id = val if isinstance(val, str) else ""
+        if not self._machine_id:
+            return
+        try:
+            self.detail_labels["version"].setText(f"v{APP_VERSION} · {self._machine_id[:8]}…")
+        except Exception:  # noqa: BLE001
+            pass

@@ -68,11 +68,11 @@ class Settings:
         self.animations_enabled: bool = True  # 是否启用界面动效
         self.bg_image_enabled: bool = False   # 图片背景开关（优先于视频）
         self.bg_image_path: str = ""          # 图片背景路径
-        self.theme: str = "glass"             # UI 主题：glass（极光玻璃）/ swiss（瑞士极简）
+        self.theme: str = "glass"             # UI 主题：只剩极光玻璃（glass）一套
         self.accent: str = "default"          # 极光玻璃的强调色（THEMES 键）
         self.glass_effect: str = "default"    # UI 框质感：default/liquid/frosted
         self.ui_opacity: int = 70             # UI 框透明度（%）
-        self.ui_color: str = "#FFFFFF"        # UI 框颜色（瑞士极简卡片底色，默认白）
+        self.ui_color: str = "#FFFFFF"        # 旧版 UI 框颜色，已废弃（保留字段兼容老配置）
         self.ai_enabled: bool = True          # 内置 AI 插件总开关（启动机器人时注入 AI_DISABLED）
         self.nonebot_enabled: bool = True     # NoneBot 总开关
         self.ai_platforms: dict = {           # AI 大脑在各平台的启用开关（默认全开）
@@ -82,6 +82,14 @@ class Settings:
             "telegram": True,
         }
         self.auto_start_services: bool = False   # 启动程序时自动启动全部服务
+        # 日志保留天数（默认 10 天）：超期的旧日志自动删掉，正在写的那份永不删
+        self.logs_keep_days: int = 10
+        # 飞书通道（G4，2026-10-02 先落地凭证与指引；适配器装好后重启即生效）
+        self.feishu_enabled: bool = False
+        self.feishu_app_id: str = ""
+        self.feishu_app_secret: str = ""
+        self.feishu_encrypt_key: str = ""
+        self.feishu_verification_token: str = ""
         self.auto_launch_on_boot: bool = False   # 开机自动启动程序
         self.developer_mode: bool = False        # 开发者模式（恢复第三方插件安装，后果自负）
         self.beginner_mode: bool = True          # 小白模式（默认只显示常用功能）
@@ -261,6 +269,11 @@ class Settings:
                 os.close(dfd)
         except Exception:     # noqa: BLE001 —— Windows 打不开目录，忽略
             pass
+        if not self._plausible_root(Path(self.root)):
+            # 临时目录 / 未部署的根不写指针（2026-10-12 实锤：体检/模拟脚本用
+            # %TEMP% 假根调 save()，把真指针覆盖成残留目录，find_root 被带偏）。
+            # 与 _remember_root、_plausible_root 同一口径，写入侧也守一道。
+            return
         try:
             POINTER_DIR.mkdir(parents=True, exist_ok=True)
             POINTER_FILE.write_text(json.dumps({"root": str(self.root)}), encoding="utf-8")

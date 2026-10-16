@@ -113,6 +113,48 @@ def test_settings_agent_fields_roundtrip():
     assert s2.vision_model.endswith("Omni-30B-A3B-Instruct")
 
 
+# ================================================================ 2026-10-15 官方 QQ 能力矩阵
+def test_official_qq_channel_has_media_and_recall():
+    """官方通道**必须**有媒体与撤回能力 —— 适配器早就实现了，是矩阵漏了条目。
+
+    漏的后果：`channel_capabilities("qq_official:group")` 对未知通道返回**空集** →
+    `send_image` / `send_file` / `send_voice` / `recall_message` 被从模型工具表里
+    整批裁掉，`adapters/qq_official.py` 里那些实现全成了死代码
+    （连全项目**唯一**实现了键盘的 send_buttons 也调不到）。
+    """
+    caps = agent_profile.channel_capabilities("qq_official:group")
+    for need in ("chat", "memory", "image", "voice", "image_gen", "recall", "tools"):
+        assert need in caps, "官方群聊缺能力：%s" % need
+    caps_c2c = agent_profile.channel_capabilities("qq_official:c2c")
+    for need in ("chat", "memory", "image", "voice", "recall", "tools"):
+        assert need in caps_c2c, "官方私聊缺能力：%s" % need
+
+    tools = ["send_message", "send_image", "send_file", "send_voice",
+             "recall_message", "generate_image"]
+    assert agent_profile.enabled_tools("qq_official:group", tools) == tools
+
+
+def test_official_qq_channel_has_admin_but_no_proactive():
+    """官方通道：群管理**给**、定时主动**不给**。
+
+    · `group_admin`：给。安全闸在 `tools_bridge._act_mute` —— 群消息事件的
+      `author.member_role`（member/admin/owner）是必填字段，适配器带进
+      `ctx.extra`，非群主/管理员一律拒绝动手。2026-10-15 之前一直没给，
+      是因为误以为"官方查不到喊话人角色"，其实官方比 OneBot 更直接
+      （那边还得另查 `get_group_member_info`，还可能查失败）。
+    · `proactive` / `group_interject`：不给 —— 官方主动消息按日限额度，
+      不该让定时播报 / 群聊搭话默认去烧。
+    """
+    caps = agent_profile.channel_capabilities("qq_official:group")
+    assert "group_admin" in caps, "官方通道的群管理应该可用（安全闸已就位）"
+    assert "proactive" not in caps, "官方主动消息有日额度，不该默认给 proactive"
+    assert "group_interject" not in caps
+
+    tools = ["mute_user", "mute_all", "set_reminder", "send_message"]
+    assert agent_profile.enabled_tools("qq_official:group", tools) == \
+        ["mute_user", "mute_all", "send_message"]
+
+
 if __name__ == "__main__":
     test_profile_liqinghan_defaults()
     print("OK profile_liqinghan_defaults")
@@ -124,6 +166,10 @@ if __name__ == "__main__":
     print("OK capability_wechat_private")
     test_capability_unknown_channel_empty()
     print("OK capability_unknown_channel")
+    test_official_qq_channel_has_media_and_recall()
+    print("OK capability_official_media")
+    test_official_qq_channel_withholds_admin_and_proactive()
+    print("OK capability_official_withholds")
     test_enabled_tools_wechat_drops_admin_tools()
     print("OK enabled_tools_wechat")
     test_wake_words_regex_extract_from_persona()

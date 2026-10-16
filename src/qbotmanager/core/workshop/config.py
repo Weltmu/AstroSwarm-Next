@@ -11,6 +11,7 @@
 import json
 from pathlib import Path
 
+from .. import json_cache
 from ..ai_config import normalize_api_url
 
 WORKSHOP_PROVIDERS = (
@@ -44,13 +45,12 @@ def config_file(settings) -> Path:
 
 
 def load(settings) -> dict:
-    """读工坊配置（无文件返回空 dict；不抛异常）。"""
-    path = config_file(settings)
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-        return data if isinstance(data, dict) else {}
-    except Exception:  # noqa: BLE001
-        return {}
+    """读工坊配置（无文件返回空 dict；不抛异常）。
+
+    走核心的带缓存读（core/json_cache）：主界面每 2 秒会把每个页面 refresh 一遍，
+    以前每次都真读盘（py-spy 抓到的现场就是这里）。文件被改过会立刻重读。
+    """
+    return json_cache.load_json(config_file(settings))
 
 
 def resolved(settings) -> dict:
@@ -91,6 +91,7 @@ def save(settings, data: dict) -> dict:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(clean, ensure_ascii=False, indent=2),
                     encoding="utf-8")
+    json_cache.invalidate(path)        # 自己写的，别让下一次读命中旧缓存
     return clean
 
 

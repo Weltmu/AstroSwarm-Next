@@ -1,0 +1,8 @@
+{
+  "session": {
+    "enabled": true,
+    "mode": "timeout",
+    "expire_seconds": 180,
+    "unrelated_limit": 5
+  }
+}

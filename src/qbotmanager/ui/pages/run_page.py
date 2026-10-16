@@ -3,29 +3,29 @@ import os
 
 from PySide6.QtCore import QSize, Qt
 from PySide6.QtWidgets import (
-    QCheckBox, QFileDialog, QFrame, QHBoxLayout,
+    QCheckBox, QDialog, QFileDialog, QFrame, QHBoxLayout,
     QLabel, QLineEdit, QPushButton, QScrollArea, QVBoxLayout, QWidget,
 )
 
 from ...core import ai_config
 from ...core import bot as bot_mod
 from ...core import dsh as dsh_mod
+from ...core import qq_doctor
 from ...tasks.workers import (DshControlTask, InstallDshTask, RestartBotTask,
                               StartStopTask)
 from .. import theme as theme_mod
 from ..icon_font import make_icon
 from ..theme import TEXT_3
-from ..widgets import FoldSection, GlassPanel, StatusBadge
+from ..widgets import FoldSection, GlassPanel, StatusBadge, set_busy
 from .channel_panels import QQChannelPanel
 from .common import PageContext, TaskPanel, make_row
 
 
 def _make_warning_box(text: str) -> QFrame:
-    """红框警告条：警告线性图标 + 换行文本，颜色随 UI 主题（玻璃深色 / 瑞士浅色）。"""
-    swiss = theme_mod.UI_STYLE == "swiss"
-    fg = "#B00020" if swiss else "#FCA5A5"
-    border = "#E30613" if swiss else "rgba(248,113,113,0.45)"
-    bg = "rgba(230,6,19,0.06)" if swiss else "rgba(248,113,113,0.08)"
+    """红框警告条：警告线性图标 + 换行文本（极光玻璃深色配色）。"""
+    fg = "#FCA5A5"
+    border = "rgba(248,113,113,0.45)"
+    bg = "rgba(248,113,113,0.08)"
     box = QFrame()
     box.setObjectName("warningBox")
     box.setStyleSheet(
@@ -80,7 +80,7 @@ class RunPage(QWidget):
 
         title = QLabel("QQ 机器人")
         title.setObjectName("pageTitle")
-        sub = QLabel("QQ 通道：官方机器人（q.qq.com 凭证）或第三方 OneBot 协议，两种都能接")
+        sub = QLabel("QQ 官方机器人或第三方 OneBot，两种都能接。")
         sub.setObjectName("pageSub")
         outer.addWidget(title)
         outer.addWidget(sub)
@@ -93,7 +93,7 @@ class RunPage(QWidget):
         self.btn_stop = QPushButton("停止全部")
         self.btn_stop.setObjectName("danger")
         self.btn_stop.clicked.connect(lambda: self._start_stop(False))
-        self.btn_restart = QPushButton("重启 NoneBot")
+        self.btn_restart = QPushButton("重启机器人")
         self.btn_restart.setObjectName("ghost")
         self.btn_restart.clicked.connect(self._restart_bot)
         for b in (self.btn_start, self.btn_stop, self.btn_restart):
@@ -162,6 +162,19 @@ class RunPage(QWidget):
         qv.addLayout(row_appid)
         qv.addLayout(make_row("通道", self.qq_mode))
         qv.addLayout(make_row("状态", self.qq_state))
+        # 收消息模式：全量 / 仅 @ / 还没收到过 —— 这一行专门治"群里 @ 没反应"说不清
+        self.qq_group_mode = QLabel("—")
+        self.qq_group_mode.setWordWrap(True)
+        self.qq_group_mode.setStyleSheet(f"color: {TEXT_3}; font-size: 12px;")
+        qv.addLayout(make_row("群消息", self.qq_group_mode))
+        # 一键体检：把"不说话"的七八种原因逐条查出来（只读，不改任何东西）
+        diag_row = QHBoxLayout()
+        self.btn_qq_diag = QPushButton("官方通道体检")
+        self.btn_qq_diag.setObjectName("ghost")
+        self.btn_qq_diag.clicked.connect(self._show_qq_diag)
+        diag_row.addWidget(self.btn_qq_diag)
+        diag_row.addStretch(1)
+        qv.addLayout(diag_row)
         # 小字提示跟着「接入方式」走：官方讲凭证，第三方讲协议端自备（见 _sync_channel_tip）
         self.qq_tip = QLabel("")
         self.qq_tip.setWordWrap(True)
@@ -188,7 +201,7 @@ class RunPage(QWidget):
         cv.addWidget(self.qq_panel)
         # 兼容旧引用：页面自己（refresh_status）和测试用的是这些名字
         for _attr in (
-            "combo_channel", "panel_official", "panel_onebot",
+            "seg_channel", "combo_channel", "panel_official", "panel_onebot",
             "edit_official_appid", "edit_official_token", "edit_official_secret",
             "chk_official_sandbox",
             "combo_onebot_mode", "panel_reverse", "panel_forward",
@@ -197,7 +210,11 @@ class RunPage(QWidget):
             "edit_reverse_port", "edit_reverse_url",
             "btn_copy_reverse_url", "btn_detect_onebot", "btn_save_creds",
         ):
-            setattr(self, _attr, getattr(self.qq_panel, _attr))
+            # 2026-10-11：控件会随界面迭代改名（下拉框→胶囊），旧名只做"有就拷"的兼容。
+            # 原来这里直接 getattr，某次把 combo_channel 换成 seg_channel 后启动就崩了。
+            _ctrl = getattr(self.qq_panel, _attr, None)
+            if _ctrl is not None:
+                setattr(self, _attr, _ctrl)
         self._refresh_reverse_url = self.qq_panel._refresh_reverse_url
         self._copy_reverse_url = self.qq_panel._copy_reverse_url
         self._detect_onebot = self.qq_panel._detect_onebot
@@ -212,11 +229,7 @@ class RunPage(QWidget):
         dl = QLabel("QQ 群聊 AI（dsh 官方通道）")
         dl.setObjectName("sectionTitle")
         dv.addWidget(dl)
-        dtip = QLabel(
-            "官方 DeepSeek Harness 通道：支持 QQ 私聊 + 群聊 AI。"
-            "纯官方凭证（AppID/AppSecret），自动复用上方凭证与 AI 大脑模型，无需扫码。"
-            "启用后 QQ 消息由 dsh 处理，NoneBot 专注微信等平台。"
-        )
+        dtip = QLabel("QQ 私聊和群聊 AI，复用上方凭证，无需扫码。")
         dtip.setWordWrap(True)
         dtip.setStyleSheet(f"color: {TEXT_3}; font-size: 12px;")
         dv.addWidget(dtip)
@@ -272,7 +285,7 @@ class RunPage(QWidget):
         self.edit_dsh_model.setPlaceholderText("留空 = 跟随 AI 大脑模型")
         self.edit_dsh_model.setMinimumWidth(220)
         self.edit_dsh_key = QLineEdit()
-        self.edit_dsh_key.setPlaceholderText("留空 = 跟随 AI 大脑 API Key")
+        self.edit_dsh_key.setPlaceholderText("留空 = 跟随 AI 大脑的密钥")
         self.edit_dsh_key.setEchoMode(QLineEdit.Password)
         self.edit_dsh_key.setMinimumWidth(220)
         for w in (self.edit_dsh_model, self.edit_dsh_key):
@@ -291,7 +304,8 @@ class RunPage(QWidget):
             arow.addWidget(b)
         arow.addStretch(1)
         av.addLayout(arow)
-        adv_hint = QLabel("这一栏改动会自动保存；dsh 已在运行时点「重装 / 重启」才会生效。")
+        adv_hint = QLabel("改动会自动保存。")
+        adv_hint.setToolTip("运行中要重新启动才会生效。")
         adv_hint.setWordWrap(True)
         adv_hint.setStyleSheet(f"color: {TEXT_3}; font-size: 12px;")
         av.addWidget(adv_hint)
@@ -325,7 +339,7 @@ class RunPage(QWidget):
         t.finished.connect(self._on_service_finished)
 
     def _on_service_started(self, tid, name):
-        if name in ("启动服务", "停止服务", "重启 NoneBot", "安装 dsh 通道", "重装 dsh 通道",
+        if name in ("启动服务", "停止服务", "重启机器人", "安装 dsh 通道", "重装 dsh 通道",
                     "启动 dsh", "停止 dsh", "重启 dsh"):
             self._service_tid = tid
             self.task_panel.bind(tid)
@@ -336,6 +350,7 @@ class RunPage(QWidget):
             self.task_panel.bind(tid)
         if tid and tid == getattr(self, "_dsh_install_tid", ""):
             self._dsh_install_tid = ""
+            set_busy(getattr(self, "btn_dsh_install", None), False)
             if status == "success":
                 self._after_dsh_install()
         self.refresh_status()
@@ -382,7 +397,7 @@ class RunPage(QWidget):
 
     def _restart_bot(self):
         self.ctx.tasks.submit(
-            "重启 NoneBot", "service", RestartBotTask,
+            "重启机器人", "service", RestartBotTask,
             retryable=True, manager=self.ctx.manager,
         )
 
@@ -393,6 +408,8 @@ class RunPage(QWidget):
             payload={"reinstall": self._dsh_reinstall},
             settings=self.ctx.settings, manager=self.ctx.manager, retryable=True,
         )
+        # 装 dsh 要下载几十兆：按钮挂呼吸点，别让用户以为点了没反应
+        set_busy(self.btn_dsh_install, True)
 
     def _start_dsh(self):
         """只启动 dsh 通道；没装就自动装、没勾「启用」就顺手勾上。
@@ -545,22 +562,96 @@ class RunPage(QWidget):
         ch = str(channel or getattr(s, "qq_channel", "") or "official")
         glass.setVisible(ch == "official" or bool(s.dsh_enabled))
 
+    def _pending_channel(self) -> str:
+        """「接入方式」当前选中的通道（可能还没保存）；取不到就返回空。
+
+        2026-10-11：下拉框换成胶囊按钮（SegmentedPill），优先读新控件，
+        同时兼容旧名字 combo_channel（外部或测试可能还在按老名字取）。
+        """
+        panel = getattr(self, "qq_panel", None)
+        seg = getattr(panel, "seg_channel", None)
+        if seg is not None:
+            try:
+                return str(seg.current() or "")
+            except Exception:  # noqa: BLE001
+                pass
+        try:
+            return str(panel.combo_channel.currentData() or "")
+        except Exception:  # noqa: BLE001 —— 面板还没建好时按空处理
+            return ""
+
+    def _pending_onebot_mode(self) -> str:
+        """「连接方式」下拉里当前选中的模式（反向/正向），同样可能还没保存。"""
+        panel = getattr(self, "qq_panel", None)
+        try:
+            return str(panel.combo_onebot_mode.currentData() or "")
+        except Exception:  # noqa: BLE001
+            return ""
+
     def _sync_channel_tip(self, channel=""):
-        """状态卡的小字提示跟通道走：官方讲凭证与沙箱，第三方讲协议端自备。"""
+        """状态卡的小字提示跟通道走：官方讲凭证与沙箱，第三方讲协议端自备。
+
+        没传通道时按下拉里选中的那个（而不是已保存的），否则用户一切换就被
+        周期性刷新顶回旧文案。
+        """
         s = self.ctx.settings
-        ch = str(channel or getattr(s, "qq_channel", "") or "official")
+        ch = str(channel or self._pending_channel()
+                 or getattr(s, "qq_channel", "") or "official")
         if ch == "official":
-            self.qq_tip.setText(
-                "官方通道不用扫码：在 q.qq.com 建好机器人，填下面的 AppID / Token / AppSecret，"
-                "重启后 NoneBot 自己连上去；先拿沙箱环境联调，正式上线要过平台审核。")
+            tip = ("官方通道不用扫码：在 q.qq.com 建好机器人，填下面的 AppID / Token / AppSecret，"
+                   "重启后 NoneBot 自己连上去；先拿沙箱环境联调，正式上线要过平台审核。"
+                   "平台对「机器人主动发消息」另有额度和时间窗限制（私聊/群聊各不相同），"
+                   "主动聊天、定时提醒可能被平台挡下，这属于平台规则，不是软件坏了。")
+            hint = ai_config.qq_group_state_hint(ai_config.read_qq_group_state(s))
+            self.qq_tip.setText(tip + ("\n" + hint if hint else ""))
         else:
-            self.qq_tip.setText(
-                "协议端由你自行安装并扫码登录（例如 LLOneBot / Lagrange），"
-                "AstroSwarm 只负责连接，不内置、不分发任何协议端；使用第三方协议有账号风险，请自备小号。")
+            self.qq_tip.setText("协议端自己装并扫码登录；第三方协议请自备小号。")
 
     def _save_creds(self):
         """兼容入口：真正的保存逻辑在共用面板里（含 .env 同步与重启提示）。"""
         self.qq_panel._save_creds()
+
+    def _show_qq_diag(self):
+        """一键体检窗口：逐条给结论（✗ 是需要处理的）。"""
+        rows = qq_doctor.run_checks(self.ctx.settings, self.ctx.manager)
+        dlg = QDialog(self)
+        dlg.setWindowTitle("QQ 官方通道体检")
+        dlg.resize(660, 460)
+        outer = QVBoxLayout(dlg)
+        outer.setContentsMargins(18, 16, 18, 16)
+        outer.setSpacing(10)
+        head = QLabel(qq_doctor.summary(rows))
+        head.setWordWrap(True)
+        head.setStyleSheet("font-size: 13px; font-weight: 600;")
+        outer.addWidget(head)
+        body = QWidget()
+        bv = QVBoxLayout(body)
+        bv.setContentsMargins(0, 0, 0, 0)
+        bv.setSpacing(8)
+        mark = {qq_doctor.OK: "✓", qq_doctor.BAD: "✗", qq_doctor.INFO: "•"}
+        for row in rows:
+            line = QLabel(f"{mark.get(row['level'], '•')} {row['name']}：{row['text']}")
+            line.setWordWrap(True)
+            bv.addWidget(line)
+            if row.get("hint"):
+                hint = QLabel("　　" + str(row["hint"]))
+                hint.setWordWrap(True)
+                hint.setStyleSheet(f"color: {TEXT_3}; font-size: 12px;")
+                bv.addWidget(hint)
+        bv.addStretch(1)
+        scroll = QScrollArea(dlg)
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setWidget(body)
+        outer.addWidget(scroll, 1)
+        btn_row = QHBoxLayout()
+        btn_row.addStretch(1)
+        btn_close = QPushButton("关闭")
+        btn_close.setObjectName("ghost")
+        btn_close.clicked.connect(dlg.accept)
+        btn_row.addWidget(btn_close)
+        outer.addLayout(btn_row)
+        dlg.exec()
 
     def refresh_status(self):
         s = self.ctx.settings
@@ -574,13 +665,23 @@ class RunPage(QWidget):
         self.bot_pid.setText("已记录 PID" if bot_on else "—")
 
         st = m.qq_login_state()
-        is_onebot = s.qq_channel == "onebot"
+        # 卡片按「接入方式」下拉里当前选中的通道画，而不是按已保存的配置：
+        # 用户切到官方、还没点保存时，卡片和小字必须跟着走，否则满屏都是第三方的字
+        # （用户报的「切了官方这里还是 OneBot 文案」）。没保存时另外标出来，不装作已生效。
+        pending = self._pending_channel()
+        effective = str(getattr(s, "qq_channel", "") or "official")
+        unsaved = bool(pending) and pending != effective
+        channel = pending or effective
+        is_onebot = channel == "onebot"
         reverse = is_onebot and str(
-            getattr(s, "qq_onebot_mode", "") or "reverse"
+            self._pending_onebot_mode() or getattr(s, "qq_onebot_mode", "") or "reverse"
         ).lower() == "reverse"
-        self.qq_badge.set_status("running" if qq_on else "stopped",
-                                 ("QQ OneBot · " if is_onebot else "QQ 官方 · ")
-                                 + ("运行中" if qq_on else "已停止"))
+        prefix = "QQ OneBot · " if is_onebot else "QQ 官方 · "
+        if unsaved:
+            self.qq_badge.set_status("warning", prefix + "未保存")
+        else:
+            self.qq_badge.set_status("running" if qq_on else "stopped",
+                                     prefix + ("运行中" if qq_on else "已停止"))
         self.qq_appid.setText(str(st.get("account") or "未配置"))
         self.qq_appid_label.setText(
             "反向地址" if reverse else ("地址/端口" if is_onebot else "AppID")
@@ -589,9 +690,24 @@ class RunPage(QWidget):
             ("第三方 OneBot（反向 WS）" if reverse else "第三方 OneBot（正向 WS）")
             if is_onebot else "QQ 官方机器人"
         )
-        self.qq_state.setText(str(st.get("reason") or "未知"))
+        state_text = str(st.get("reason") or "未知")
+        if unsaved:
+            state_text += (
+                "（接入方式已改为「{}」但还没保存：点下面「保存通道配置」，"
+                "重启 NoneBot 后生效；现在实际跑的仍是「{}」）".format(
+                    "第三方 OneBot" if is_onebot else "QQ 官方机器人",
+                    "第三方 OneBot" if effective == "onebot" else "QQ 官方机器人",
+                )
+            )
+        self.qq_state.setText(state_text)
+        # 群消息模式只有官方通道才有"全量 / 仅 @"之分；第三方协议端本来就能看到整群
+        if is_onebot:
+            self.qq_group_mode.setText("第三方协议端：群里每条消息都能收到")
+        else:
+            self.qq_group_mode.setText(
+                ai_config.qq_group_state_text(ai_config.read_qq_group_state(s)))
         self._refresh_reverse_url()
-        self._sync_dsh_visibility()
+        self._sync_dsh_visibility(channel)
         self._sync_channel_tip()
 
         dst = m.dsh_status()

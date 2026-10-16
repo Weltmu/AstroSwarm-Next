@@ -15,6 +15,40 @@ from .config import Config
 from .event import Event
 
 
+# iLink 的 item 类型（只标注已确认的；其余按"非文字消息"处理）
+_MEDIA_LABELS = {
+    2: "一张图片",
+    3: "一段语音",
+}
+
+
+def _describe_media(data: dict) -> str:
+    """没有文字项时，用一句人话说明对方发来的是什么。
+
+    2026-10-15 修（老板：微信给机器人发张图，它一点反应都没有）：
+    本适配器只从**文字项(type1)** 和 **语音转写(type3)** 取文本，所以纯图片消息
+    (type2) 拿到的 `raw_message` 是空串；紧接着 `_on_message` 里
+    `if not event.raw_message: return` 把它**整条丢掉** —— 既不入消息中心，
+    也永远到不了 `ai/adapters/wechat.py` 那套"从原始 payload 自捞图片地址 + 识图"的逻辑。
+    现在：没有文本但有内容时，回一句描述当正文，让后续照常处理。
+    """
+    items = data.get("item_list") or []
+    if not isinstance(items, list):
+        return ""
+    kinds = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        label = _MEDIA_LABELS.get(item.get("type"))
+        if label is None:
+            label = "一条非文字消息"
+        if label not in kinds:
+            kinds.append(label)
+    if not kinds:
+        return ""
+    return "[对方发来" + "、".join(kinds) + "]"
+
+
 def build_event(data: dict, self_id: str) -> Event:
     """iLink 原始消息 → NoneBot 事件。"""
     items = data.get("item_list") or []
@@ -26,6 +60,10 @@ def build_event(data: dict, self_id: str) -> Event:
         if item.get("type") == 3 and item.get("voice_item"):
             text = str(item["voice_item"].get("text", ""))
             break
+    if not text:
+        # 纯图片 / 无转写的语音 / 其它非文字消息：给一句描述当正文，
+        # 别让它因为"没文本"被下游整条丢掉（见 _describe_media 的说明）。
+        text = _describe_media(data)
     group_id = str(data.get("group_id") or "")
     message_type = "group" if group_id else "private"
     return Event(

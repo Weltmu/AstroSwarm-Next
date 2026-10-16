@@ -1,7 +1,10 @@
 """运行时门面：统一管理 NoneBot / QQ 官方通道 / 微信 iLink 的启停与状态。"""
 import json
+import os
 import re
+import signal
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -10,6 +13,134 @@ from . import bot as bot_mod
 from . import dsh as dsh_mod
 from .exceptions import CancelledError
 from .qq_channel import _pid_alive, create_qq_channel
+
+
+def _is_windows() -> bool:
+    """平台分支的**唯一**判据（关窗快杀那套在 Linux 上不能走 Windows API）。"""
+    return sys.platform.startswith("win")
+
+
+# Linux/POSIX 的强杀信号。Windows 的 signal 模块**没有 SIGKILL**，所以用 getattr 兜底成 9：
+# 这条路径在 Windows 上根本不会被执行（上面 `_is_windows()` 会先返回），但常量求值
+# 发生在调用之前，写死 `signal.SIGKILL` 会让 Windows 上的 import/调用直接炸 —— 实测踩过。
+_SIGKILL = int(getattr(signal, "SIGKILL", 9))
+
+
+def _creationflags() -> int:
+    """Windows 下不弹控制台窗口；Linux/POSIX 上该常量不存在，取 0。
+
+    2026-10-11 Linux 同步：`subprocess.CREATE_NO_WINDOW` 在 Linux 上**根本不存在**，
+    直接引用会 AttributeError；用 getattr 取值，Windows 行为一个字节不变。
+    """
+    return int(getattr(subprocess, "CREATE_NO_WINDOW", 0))
+
+
+def _proc_alive(pid) -> bool:
+    """进程是否还活着（跨平台）。Windows 行为与原实现完全一致。
+
+    备注：当前业务路径用的是 `qq_channel._pid_alive`（同一套判据）；
+    这里保留同语义的模块级版本供 Linux 侧调用/单测，不改任何既有调用点。
+    """
+    if not pid:
+        return False
+    if not _is_windows():
+        try:
+            os.kill(int(pid), 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True          # 存在但没权限发信号
+        except Exception:        # noqa: BLE001
+            return False
+        return True
+    try:
+        import ctypes
+
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        h = ctypes.windll.kernel32.OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+        if not h:
+            return False
+        ctypes.windll.kernel32.CloseHandle(h)
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _proc_kill(pid) -> None:
+    """按 PID 结束进程（Windows: taskkill /T /F；Linux: 进程组 SIGKILL）。
+
+    供 Linux 侧（无头端 / 端口兜底清理）使用；Windows 关窗快杀走 `_kill_fast`，
+    那条路一个字都没改。
+    """
+    if not pid:
+        return
+    if not _is_windows():
+        try:
+            os.killpg(os.getpgid(int(pid)), _SIGKILL)
+            return
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+        try:
+            os.kill(int(pid), _SIGKILL)
+        except Exception:  # noqa: BLE001
+            pass
+        return
+    _kill_pid_tree(pid)
+
+
+def _parse_ss_pids(text, port) -> list:
+    r"""解析 `ss -ltnp` 输出里监听 <port> 的 PID（取 `pid=NNN`）。
+
+    样例（Ubuntu iproute2 5.x）：
+        LISTEN 0  4096  127.0.0.1:8080  0.0.0.0:*  users:(("python",pid=1234,fd=6))
+        LISTEN 0  511   0.0.0.0:80      0.0.0.0:*  users:(("nginx",pid=41,fd=6),("nginx",pid=42,fd=6))
+    只认 State=LISTEN 且本地端口 == port 的行；`ss` 不带 -p 权限不足时进程列是空的，
+    那就返回空表（= 没查出监听进程），而不是把 parse 失败当异常。
+    """
+    want = int(port)
+    pids = []
+    for line in (text or "").splitlines():
+        parts = line.split()
+        if len(parts) < 5 or parts[0].upper() != "LISTEN":
+            continue
+        local = parts[3]
+        if not _ss_local_port_is(local, want):
+            continue
+        for chunk in re.findall(r"pid=(\d+)", line):
+            pids.append(int(chunk))
+    return sorted(set(pids))
+
+
+def _ss_local_port_is(local: str, port: int) -> bool:
+    """判断 ss 的 Local Address:Port 字段端口是否等于 port（支持 v6 的 [::]:80）。"""
+    text = str(local).strip()
+    if not text:
+        return False
+    tail = text.rsplit(":", 1)[-1]
+    if tail == "*":
+        return port == 0
+    if not tail.isdigit():
+        return False
+    return int(tail) == int(port)
+
+
+def _parse_lsof_pids(text) -> list:
+    r"""解析 `lsof -nP -iTCP:<port> -sTCP:LISTEN` 的 PID 列（第 2 列）。
+
+    样例：
+        COMMAND   PID USER   FD   TYPE  DEVICE SIZE/OFF NODE NAME
+        python  12345 root    6u  IPv4  123456      0t0  TCP 127.0.0.1:8080 (LISTEN)
+    没有匹配时 lsof 返回空输出（退出码 1），这里自然得到空表。
+    """
+    pids = []
+    for line in (text or "").splitlines():
+        parts = line.split()
+        if len(parts) < 2 or parts[0].upper() == "COMMAND":
+            continue
+        if parts[1].isdigit():
+            pids.append(int(parts[1]))
+    return sorted(set(pids))
 
 
 def _proc_cmdline(pid, timeout=15) -> str:
@@ -23,19 +154,126 @@ def _proc_cmdline(pid, timeout=15) -> str:
         r = subprocess.run(
             ["powershell", "-NoProfile", "-Command", ps],
             capture_output=True, text=True, encoding="utf-8", errors="replace",
-            timeout=timeout, creationflags=subprocess.CREATE_NO_WINDOW,
+            timeout=timeout, creationflags=_creationflags(),
         )
         return r.stdout.strip()
     except Exception:  # noqa: BLE001
         return ""
 
 
+def _terminate_pid(pid) -> bool:
+    """立刻终止进程（Windows: TerminateProcess 毫秒级；Linux: SIGKILL）。
+
+    为什么 Windows 用它：`taskkill /PID x /T /F` 在机器人进程上实测要等几秒
+    （遍历进程树 + 等句柄），把"关窗"从 0.5 秒拖到 6 秒。TerminateProcess 是内核直接终止；
+    子进程在应用的退出作业（KILL_ON_JOB_CLOSE）里，父进程一退就跟着回收。
+
+    2026-10-11 Linux 同步：Linux 上 `kernel32.dll` 根本不存在，`ctypes.WinDLL`
+    会抛异常且难查 —— 所以**先判平台**，Linux 直接 `os.kill(pid, SIGKILL)`。
+    Windows 分支一个字未改。
+    """
+    if not _is_windows():
+        try:
+            os.kill(int(pid), _SIGKILL)
+            return True
+        except (ProcessLookupError, ValueError):
+            return False
+        except PermissionError:
+            return False
+        except Exception:  # noqa: BLE001
+            return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        k32 = ctypes.WinDLL("kernel32.dll", use_last_error=True)
+        k32.OpenProcess.restype = wintypes.HANDLE
+        k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        k32.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
+        k32.TerminateProcess.restype = wintypes.BOOL
+        k32.CloseHandle.argtypes = [wintypes.HANDLE]
+        PROCESS_TERMINATE = 0x0001
+        h = k32.OpenProcess(PROCESS_TERMINATE, False, int(pid))
+        if not h:
+            return False
+        try:
+            return bool(k32.TerminateProcess(h, 0))
+        finally:
+            k32.CloseHandle(h)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _kill_fast(pid) -> None:
+    """关窗用：先内核终止，失败再退到整棵进程树。"""
+    if _terminate_pid(pid):
+        return
+    # 2026-10-11 修：这里原来写的是 `_kill_fast(pid)`（**自我递归**）——
+    # 一旦 _terminate_pid 失败就会无限递归 → RecursionError → 快速关闭静默失效。
+    # 本意就是 docstring 说的"退到整棵进程树"。
+    _kill_pid_tree(pid)
+
+
+def _linux_children(pid) -> list:
+    """按 /proc/<pid>/task/*/children 取直接子进程（取不到就回空表）。
+
+    只在 `os.killpg(os.getpgid(pid))` 拿不到进程组时当兜底用；这是内核在
+    CONFIG_PROC_CHILDREN 下才有的文件，读不到属正常，绝不因此报错。
+    """
+    out = []
+    try:
+        tasks = Path(f"/proc/{int(pid)}/task")
+        if not tasks.is_dir():
+            return out
+        for t in tasks.iterdir():
+            try:
+                text = (t / "children").read_text(encoding="ascii", errors="ignore")
+            except OSError:
+                continue
+            for tok in text.split():
+                if tok.isdigit():
+                    out.append(int(tok))
+    except Exception:  # noqa: BLE001
+        return out
+    return sorted(set(out))
+
+
 def _kill_pid_tree(pid, timeout=15):
+    """结束整棵进程树。
+
+    Windows：`taskkill /PID <pid> /T /F`（原样保留）。
+    Linux：先 `os.killpg(os.getpgid(pid), SIGKILL)`（等价于 /T），取不到进程组
+    （`os.getpgid` 抛 ProcessLookupError/PermissionError）就按
+    `/proc/<pid>/task/*/children` 递归，最后按 PID 直接收。
+    """
+    if not _is_windows():
+        pids = []
+        try:
+            pgid = os.getpgid(int(pid))
+            os.killpg(pgid, _SIGKILL)
+            return
+        except Exception:  # noqa: BLE001 —— 没有进程组就递归收
+            pass
+        stack = [int(pid)]
+        seen = set()
+        while stack:
+            cur = stack.pop()
+            if cur in seen:
+                continue
+            seen.add(cur)
+            pids.append(cur)
+            stack.extend(_linux_children(cur))
+        for cur in reversed(pids):       # 先叶子后父
+            try:
+                os.kill(cur, _SIGKILL)
+            except Exception:  # noqa: BLE001
+                pass
+        return
     try:
         subprocess.run(
             ["taskkill", "/PID", str(pid), "/T", "/F"],
             capture_output=True, timeout=timeout,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            creationflags=_creationflags(),
         )
     except Exception:  # noqa: BLE001
         pass
@@ -516,6 +754,39 @@ class Manager:
         time.sleep(0.8)
         self.start_bot(on_stage=on_stage, cancel_event=cancel_event)
 
+    def kill_all_fast(self) -> dict:
+        """快速强杀机器人相关进程（关窗退出用）。
+
+        为什么单独一套：`stop_all()` 是"优雅停机"，里面有等待和端口清理，可能好几秒；
+        关窗要的是"立刻退且不留孤儿"。这里只 taskkill（/T /F），通常 0.3~1 秒返回。
+
+        2026-10-10 踩的坑：关窗流程把停服务丢到后台线程 + 300ms 硬退，
+        线程还没执行到 taskkill 就被带走了 —— 结果**前端关了，机器人还在群里说话**。
+        """
+        killed = []
+        for name, proc in (("NoneBot", self.bot_proc), ("dsh", self.dsh_proc)):
+            pid = getattr(proc, "pid", None)
+            if pid:
+                _kill_fast(pid)
+                killed.append(f"{name}:{pid}")
+        # 兜底：按专用端口找残留监听进程。查端口要起 PowerShell（每次 2~5 秒），
+        # 所以只在"已知 PID 一个都没杀掉"时才查 —— 否则关窗会白等好几秒（实测 10.2s）。
+        if not killed:
+            try:
+                for port, label in ((self.settings.nonebot_port, "nonebot"),
+                                    (dsh_mod.BRIDGE_PORT, "dsh")):
+                    pids = self._port_pids_netstat(port)
+                    if pids is None:      # netstat 命令失败才退到 PowerShell（慢，1.6~4s）
+                        pids = self._port_pids(port)
+                    for pid in pids:
+                        _kill_fast(pid)
+                        killed.append(f"{label}@{port}:{pid}")
+            except Exception:  # noqa: BLE001 —— 兜底失败不影响退出
+                pass
+        self.bot_proc = None
+        self.dsh_proc = None
+        return {"killed": killed}
+
     def stop_all(self, on_stage=None) -> dict:
         """停止全部服务；任一失败时抛异常。"""
         errors = []
@@ -547,7 +818,80 @@ class Manager:
             raise RuntimeError("停止未完全成功；" + "；".join(errors))
         return {"stopped": True}
 
+    def _port_pids_netstat(self, port):
+        """返回监听该端口的 PID 列表；**命令失败时返回 None**（空列表=确实没人监听）。
+
+        按端口找监听进程（Windows netstat / Linux ss 快速版，都约 0.2 秒）。
+
+        为什么要它：`_port_pids` 在本平台走"慢命令"（Windows PowerShell
+        Get-NetTCPConnection，实测一次 2~4 秒；Linux lsof 也慢）；
+        关窗兜底路径上用它，会让"关窗"从 0.5 秒变成 8 秒（2026-10-10 实测）。
+
+        2026-10-11 Linux 同步：Windows 解析 `netstat -ano -p TCP` 的 LISTENING 行
+        （原样保留）；Linux 解析 `ss -ltnp` 的 `pid=NNN`，没有 `ss`（或它非 0 退出）
+        再退 `lsof -iTCP:<port> -sTCP:LISTEN -Pn`；两条命令都跑不起来才返回 None。
+        """
+        if not _is_windows():
+            return self._port_pids_ss(port)
+        try:
+            r = subprocess.run(
+                ["netstat", "-ano", "-p", "TCP"],
+                capture_output=True, text=True, encoding="utf-8", errors="replace",
+                timeout=6, creationflags=_creationflags(),
+            )
+        except Exception:  # noqa: BLE001 —— 命令本身失败才返回 None（调用方据此回退）
+            return None
+        pids = []
+        want = f":{int(port)}"
+        for line in (r.stdout or "").splitlines():
+            parts = line.split()
+            if len(parts) < 5 or "LISTENING" not in line.upper():
+                continue
+            local = parts[1]
+            if not local.endswith(want):
+                continue
+            if parts[-1].isdigit():
+                pids.append(int(parts[-1]))
+        return sorted(set(pids))
+
+    # ---------- Linux：按端口找监听进程 ----------
+    def _port_pids_ss(self, port):
+        """`ss -ltnp` 取 `pid=NNN`；命令跑不起来返回 None（与 Windows 版语义一致）。
+
+        注意：**空列表 = 确实没人监听**，不能当成失败 —— 2026-10-10 Windows 侧
+        就栽在"查不到 ≠ 失败"上（写成 `netstat(...) or PowerShell(...)`，
+        每次关窗白跑一次 4 秒的 PowerShell）。
+        """
+        try:
+            r = subprocess.run(
+                ["ss", "-ltnp"],
+                capture_output=True, text=True, encoding="utf-8", errors="replace",
+                timeout=6, creationflags=_creationflags(),
+            )
+        except Exception:  # noqa: BLE001 —— ss 不存在/超时：退 lsof
+            r = None
+        if r is not None and getattr(r, "returncode", 1) == 0:
+            return _parse_ss_pids(getattr(r, "stdout", "") or "", port)
+        try:
+            r2 = subprocess.run(
+                ["lsof", "-nP", f"-iTCP:{int(port)}", "-sTCP:LISTEN"],
+                capture_output=True, text=True, encoding="utf-8", errors="replace",
+                timeout=6, creationflags=_creationflags(),
+            )
+        except Exception:  # noqa: BLE001 —— 两个都没有：交调用方回退
+            return None
+        return _parse_lsof_pids(getattr(r2, "stdout", "") or "")
+
     def _port_pids(self, port) -> list:
+        """慢速兜底（Windows: PowerShell Get-NetTCPConnection；Linux: lsof）。"""
+        pids = self._port_pids_slow(port)
+        return [] if pids is None else pids
+
+    def _port_pids_slow(self, port):
+        """慢速查询；命令失败返回 None（用来区分"工具缺失"和"确实没监听"）。"""
+        if not _is_windows():
+            out = self._run_lsof(port)
+            return None if out is None else _parse_lsof_pids(out)
         ps = (
             "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; "
             "Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue | "
@@ -558,11 +902,23 @@ class Manager:
             r = subprocess.run(
                 ["powershell", "-NoProfile", "-Command", ps],
                 capture_output=True, text=True, encoding="utf-8", errors="replace",
-                timeout=15, creationflags=subprocess.CREATE_NO_WINDOW,
+                timeout=15, creationflags=_creationflags(),
             )
             return [int(x) for x in r.stdout.split() if x.strip().isdigit()]
         except Exception:  # noqa: BLE001
-            return []
+            return None
+
+    def _run_lsof(self, port):
+        """`lsof -iTCP:<port> -sTCP:LISTEN -Pn` 的原始输出；跑不起来返回 None。"""
+        try:
+            r = subprocess.run(
+                ["lsof", "-nP", f"-iTCP:{int(port)}", "-sTCP:LISTEN"],
+                capture_output=True, text=True, encoding="utf-8", errors="replace",
+                timeout=15, creationflags=_creationflags(),
+            )
+            return r.stdout or ""
+        except Exception:  # noqa: BLE001
+            return None
 
     def _ensure_port_closed(self, port, hint, force=False):
         """按端口清理残留监听进程。

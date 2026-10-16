@@ -25,6 +25,112 @@ _TEMP_LOG_NAMES = ("qbotmanager_proc.log", "astroswarm_cli.log")
 _MEI_OWN_MARKERS = ("appr", "qbotmanager")
 
 
+# 日志默认保留天数（老板 2026-10-03 定：默认只留最近 10 天）
+DEFAULT_LOG_KEEP_DAYS = 10
+# 归档文件长这样：nonebot.log.2026-10-02 / manager.log.1 / dsh.log.gz
+_ARCHIVE_HINTS = (".log.", ".log-", ".log_")
+
+
+def _is_archived_log(name: str) -> bool:
+    """这是不是"轮转出去的旧日志"（区别于正在写的那份）。"""
+    low = (name or "").lower()
+    if not low.startswith(tuple(f.lower() for f in _LOG_FILES)) and ".log" not in low:
+        return False
+    return any(hint in low for hint in _ARCHIVE_HINTS) or low.endswith(".log.gz")
+
+
+def rotate_and_prune_logs(logs_dir: Path,
+                          keep_days: int = DEFAULT_LOG_KEEP_DAYS,
+                          now: float | None = None) -> dict:
+    """日志按天归档 + 只保留最近 N 天，返回 {"rotated": [...], "deleted": [...], "skipped": [...]}。
+
+    两件事：
+    1. **归档**：正在写的那份日志如果最后修改时间不是今天（说明跨天了），改名成
+       `<名字>.<YYYY-MM-DD>`；新版日志从空文件重新开始，用户按日期找得到。
+       机器人正在写这个文件时 Windows 不允许改名 → 记进 skipped，下次再来（不报错）。
+    2. **删除**：所有归档日志超过 keep_days 天的一律删掉；正在写的那份从不删
+       （体积由 _trim_tail 按大小截断兜底）。
+    """
+    stats = {"rotated": [], "deleted": [], "skipped": [],
+             "keep_days": int(keep_days), "bytes_freed": 0}
+    logs_dir = Path(logs_dir)
+    if not logs_dir.is_dir():
+        return stats
+    now = time.time() if now is None else float(now)
+    today = time.strftime("%Y-%m-%d", time.localtime(now))
+    cutoff = now - max(1, int(keep_days)) * 86400
+
+    live_names = set(_LOG_FILES)
+    try:
+        entries = list(logs_dir.iterdir())
+    except OSError:
+        return stats
+
+    # 1) 先归档跨天的当前日志
+    for path in entries:
+        if not path.is_file() or path.name not in live_names:
+            continue
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            continue
+        if time.strftime("%Y-%m-%d", time.localtime(mtime)) == today:
+            continue
+        target = path.with_name(f"{path.name}.{time.strftime('%Y-%m-%d', time.localtime(mtime))}")
+        if target.exists():
+            continue
+        try:
+            path.rename(target)
+            stats["rotated"].append(target.name)
+        except OSError:
+            # 大概率是文件正被机器人占用：留着，下一轮再试
+            stats["skipped"].append(path.name)
+
+    # 2) 再按天数删归档
+    try:
+        entries = list(logs_dir.iterdir())
+    except OSError:
+        return stats
+    for path in entries:
+        if not path.is_file() or path.name in live_names:
+            continue
+        if not _is_archived_log(path.name):
+            continue
+        try:
+            mtime = path.stat().st_mtime
+            size = path.stat().st_size
+        except OSError:
+            continue
+        if mtime >= cutoff:
+            continue
+        try:
+            path.unlink()
+            stats["deleted"].append(path.name)
+            stats["bytes_freed"] += size
+        except OSError:
+            stats["skipped"].append(path.name)
+    return stats
+
+
+def logs_usage(logs_dir: Path) -> dict:
+    """日志目录占用（给界面显示"现在占多少"）。"""
+    logs_dir = Path(logs_dir)
+    total = 0
+    count = 0
+    if logs_dir.is_dir():
+        try:
+            for p in logs_dir.rglob("*"):
+                if p.is_file():
+                    try:
+                        total += p.stat().st_size
+                        count += 1
+                    except OSError:
+                        pass
+        except OSError:
+            pass
+    return {"bytes": total, "files": count, "mb": round(total / 1048576, 1)}
+
+
 def _trim_tail(path: Path, max_bytes: int) -> None:
     """日志/JSONL 超限时只保留末尾 max_bytes（新日志在尾部）。"""
     try:
@@ -138,9 +244,11 @@ def remove_stale_temp_dirs(temp_root: Path, max_age_hours: float,
                            markers: tuple = ()) -> int:
     """删除系统临时目录里的残留目录，返回成功删除的个数。
 
-    打包版（PyInstaller onefile）每次启动都会把自身解压到 %TEMP%/_MEIxxxxxx，
-    正常退出会自动删除；但被任务管理器强杀或崩溃时会留在盘上，单个约 450 MB，
-    用户不会自己去清。Inno 安装程序被中断时也会留下 is-*.tmp。
+    v1.2.16 之前的打包版是 PyInstaller onefile：每次启动都会把自身解压到
+    %TEMP%/_MEIxxxxxx，正常退出会自动删除；被任务管理器强杀或崩溃时会留在
+    盘上，单个约 450 MB，用户不会自己去清。v1.2.16 起改 onedir 不再产生新残留，
+    这段逻辑继续保留，负责清理老版本升级上来的历史残留。
+    Inno 安装程序被中断时也会留下 is-*.tmp。
 
     只删「最后修改时间早于保留期」的目录，并跳过 keep（本进程正在使用的
     sys._MEIPASS），避免误删正在运行的实例。markers 非空时，还要求目录顶层
@@ -238,6 +346,7 @@ def _write_summary_log(settings, summary: dict) -> None:
 
 def run(settings,
         max_log_bytes: int = 8 * 1024 * 1024,
+        log_keep_days: int | None = None,
         max_message_bytes: int = 16 * 1024 * 1024,
         max_activate_bytes: int = 256 * 1024,
         max_session_days: int = 30,
@@ -247,6 +356,11 @@ def run(settings,
         max_temp_log_hours: float = 24,
         temp_dir: Path | None = None) -> dict:
     """执行一轮清理，返回统计摘要（供日志/测试）。"""
+    # 日志按天归档 + 只留最近 N 天（默认 10 天；设置里可改）
+    if log_keep_days is None:
+        log_keep_days = int(getattr(settings, "logs_keep_days", DEFAULT_LOG_KEEP_DAYS)
+                            or DEFAULT_LOG_KEEP_DAYS)
+    log_stats = rotate_and_prune_logs(settings.logs_dir, log_keep_days)
     capped = 0
     for name in _LOG_FILES:
         p = settings.logs_dir / name
@@ -276,9 +390,9 @@ def run(settings,
     zip_removed += _remove_stale_zip(
         settings.downloads_dir / "plugins", max_zip_hours
     )
-    # 打包版每次启动都会把自身解压到 %TEMP%\_MEIxxxxxx（约 450 MB），正常退出
-    # 会自删，被任务管理器强杀或崩溃时留下；Inno 中断安装会留下 is-*.tmp。
-    # 只清超过保留期的，并跳过本进程正在使用的 sys._MEIPASS。
+    # 老版本（≤v1.2.15，onefile）每次启动会把自身解压到 %TEMP%\_MEIxxxxxx（约 450 MB），
+    # 被强杀或崩溃时留下；v1.2.16 起改 onedir 不再产生新残留，这里继续清历史残留。
+    # Inno 中断安装会留下 is-*.tmp。只清超过保留期的，并跳过本进程正在使用的 sys._MEIPASS。
     temp_root = temp_dir or Path(tempfile.gettempdir())
     mei_removed = remove_stale_temp_dirs(
         temp_root,
@@ -298,6 +412,10 @@ def run(settings,
     bak_removed = prune_pointer_backups(POINTER_DIR)
     summary = {
         "log_capped": capped,
+        "log_rotated": log_stats.get("rotated") or [],
+        "log_deleted": log_stats.get("deleted") or [],
+        "log_keep_days": log_stats.get("keep_days"),
+        "log_bytes_freed": log_stats.get("bytes_freed") or 0,
         "tmp_removed": tmp_removed,
         "sessions_removed": sessions_removed,
         "zip_removed": zip_removed,

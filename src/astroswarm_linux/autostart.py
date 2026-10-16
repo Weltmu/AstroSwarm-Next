@@ -1,4 +1,4 @@
-"""systemd 自启：生成 unit 文本并安装。"""
+"""systemd 自启：生成 unit 文本并安装（unit 文件名仍是 astroswarm.service，别改）。"""
 import os
 from pathlib import Path
 
@@ -7,7 +7,7 @@ def unit_text(root: Path, port: int) -> str:
     root = Path(root)
     user = os.environ.get("USER") or os.environ.get("USERNAME") or "root"
     return f"""[Unit]
-Description=AstroSwarm Headless
+Description=星巢 Nest（AstroSwarm 无头端）port {port}
 After=network.target
 
 [Service]

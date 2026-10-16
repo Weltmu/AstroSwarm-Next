@@ -191,7 +191,7 @@ def test_settings_roundtrip():
     s = Settings(tmp)
     s.ensure_dirs()
     assert s.beginner_mode is True, "小白模式默认应为开启"
-    s.theme = "swiss"
+    s.theme = "glass"
     s.accent = "cyber"
     s.glass_effect = "liquid"
     s.ui_opacity = 45
@@ -203,7 +203,7 @@ def test_settings_roundtrip():
     s.beginner_mode = False
     s.save()
     s2 = Settings.load(tmp)
-    assert s2.theme == "swiss" and s2.accent == "cyber"
+    assert s2.theme == "glass" and s2.accent == "cyber"
     assert s2.glass_effect == "liquid" and s2.ui_opacity == 45
     assert s2.ui_color == "#F3F4F6" and s2.bg_image_enabled
     assert s2.auto_start_services is True
@@ -1012,10 +1012,10 @@ def test_write_preset():
     assert "prefix:" in comp
     assert "星群" in comp
     # 人设变化后 preset 同步更新
-    ai_config.save_personality(s, "你是星群助手，回答极简")
+    ai_config.save_personality(s, "你是星巢助手，回答极简")
     assert dsh_mod.write_preset(s) is True
     comp2 = (d / "agent.cordis.yml").read_text(encoding="utf-8")
-    assert "你是星群助手" in comp2
+    assert "你是星巢助手" in comp2
     assert "你叫px" not in comp2
 
 
@@ -1323,6 +1323,7 @@ def test_stop_all_cleans_bridge_port():
 
 
 def test_feature_gate_not_activated():
+    """没激活/没签名：微信通道仍然可用（2026-10-01 免费开放），只是 full 不放开。"""
     from qbotmanager.core import license as lic
 
     _trust_plan(lic)
@@ -1333,12 +1334,14 @@ def test_feature_gate_not_activated():
         lic.load_license = lambda: None
         gate = lic.feature_gate()
         assert gate["full"] is False
-        assert "QQ" in gate["reason"] and "未开通" in gate["reason"]
+        assert gate["member"] is True, "微信通道已免费开放，不该再按未开通处理"
+        assert "微信通道已免费开放" in gate["reason"]
     finally:
         (lic.status, lic.load_license) = orig
 
 
-def test_feature_gate_trial_only_qq():
+def test_feature_gate_trial_gets_wechat_too():
+    """3 天试用也算：微信通道免费开放，不再区分档位。"""
     from qbotmanager.core import license as lic
 
     _trust_plan(lic)
@@ -1354,7 +1357,7 @@ def test_feature_gate_trial_only_qq():
         lic.load_license = lambda: {"plan": "trial"}
         gate = lic.feature_gate()
         assert gate["full"] is False
-        assert "QQ" in gate["reason"]
+        assert gate["member"] is True, "试用期也该能用微信通道"
     finally:
         (lic.status, lic.load_license) = orig
 
@@ -1398,7 +1401,8 @@ def test_feature_gate_monthly_is_member_not_all_plugins():
         gate = lic.feature_gate()
         assert gate["full"] is False and gate["all_plugins"] is False, gate
         assert gate["member"] is True, gate
-        assert gate["reason"] == ""
+        # 微信免费开放后 reason 统一是一句说明，不再是空串/未开通警告
+        assert "免费开放" in gate["reason"], gate
     finally:
         (lic.status, lic.load_license) = orig
 
@@ -1466,10 +1470,11 @@ def test_entitlements_roundtrip():
         ent = lic.entitlements()
         assert ent["full"] is True and ent["member"] is True
 
-        # 会员到期：full/member 都变 false，单独购买记录保留
+        # 会员到期：full 变 false；member（微信通道）已免费开放，恒为 True
         lic.save_plan("monthly", time.time() - 1)
         ent = lic.entitlements()
-        assert ent["full"] is False and ent["member"] is False
+        assert ent["full"] is False
+        assert ent["member"] is True, "微信通道已免费开放，过期也不该把通道锁上"
         assert ent["owned_plugins"] == ["pro-pack", "group-manager"]
     finally:
         lic.license_file = orig
@@ -1516,7 +1521,7 @@ def test_apply_wechat_gate_removes_and_restores_adapter():
 
 
 def test_build_bot_env_gates_wechat():
-    """build_bot_env 在试用闸门下应注入 AI_PLATFORM_WECHAT=0。"""
+    """微信通道已免费开放：真实闸门不该再往环境里塞 AI_PLATFORM_WECHAT=0。"""
     from qbotmanager.core import bot
     from qbotmanager.core import license as lic
 
@@ -1526,17 +1531,17 @@ def test_build_bot_env_gates_wechat():
     tmp = Path(tempfile.mkdtemp(prefix="qbm_botgate_"))
     s = Settings(tmp)
     s.ensure_dirs()
+    # 真实闸门（本机可能没账号/没签名）—— 微信现在一律可用
+    assert lic.feature_gate()["member"] is True
+    env = bot.build_bot_env(s)
+    assert env.get("AI_PLATFORM_WECHAT", "1") == "1", "微信通道免费开放，不该被闸门关掉"
+
     orig = lic.feature_gate
     try:
-        # 微信通道看 member，不是 full（full = 解锁全部付费包）
-        lic.feature_gate = lambda: {"full": False, "member": False, "reason": "试用"}
+        # 未来若要恢复闸门：显式判成不可用时才关通道
+        lic.feature_gate = lambda: {"full": False, "member": False, "reason": "通道已关闭"}
         env = bot.build_bot_env(s)
-        assert env.get("AI_PLATFORM_WECHAT") == "0", "试用闸门应关闭微信 AI 处理"
-
-        # 月费档：member=True 但没有 all_plugins → 微信照常开
-        lic.feature_gate = lambda: {"full": False, "member": True, "reason": ""}
-        env = bot.build_bot_env(s)
-        assert env.get("AI_PLATFORM_WECHAT", "1") == "1", "会员档应恢复微信 AI 处理"
+        assert env.get("AI_PLATFORM_WECHAT") == "0", "闸门显式关闭时应停掉微信 AI 处理"
     finally:
         lic.feature_gate = orig
 
@@ -1564,7 +1569,9 @@ def test_entitlement_signature_is_required():
         # ① 裸改 license.json：plan=permanent + 塞一个已购插件，但没有签名
         lic.save_license({"machine_id": "M", "key": "K", "plan": "permanent",
                           "owned_plugins": ["pro-pack"]})
-        assert lic.feature_gate()["full"] is False, "无签名不该解锁微信"
+        # 无签名 = full 不放开（微信通道已免费开放，不走 full 这个字段了）
+        assert lic.feature_gate()["full"] is False, "无签名不该解锁 full"
+        assert lic.feature_gate()["member"] is True, "微信通道免费开放，与签名无关"
         ent = lic.entitlements()
         assert ent["full"] is False and ent["owned_plugins"] == []
 
@@ -1798,8 +1805,8 @@ if __name__ == "__main__":
     print("OK stop_all_cleans_bridge_port")
     test_feature_gate_not_activated()
     print("OK feature_gate_not_activated")
-    test_feature_gate_trial_only_qq()
-    print("OK feature_gate_trial_only_qq")
+    test_feature_gate_trial_gets_wechat_too()
+    print("OK feature_gate_trial_gets_wechat_too")
     test_feature_gate_permanent_unlocks_all()
     print("OK feature_gate_permanent_unlocks_all")
     test_feature_gate_monthly_is_member_not_all_plugins()

@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 
 import httpx
 
-from . import games, knowledge
+from . import games, knowledge, memory_bridge
 from .capabilities import enabled_tools
 
 
@@ -44,11 +44,12 @@ def _f(name, description, params, handler):
 
 
 class Tools:
-    def __init__(self, cfg, store, ob, source="qq:c2c"):
+    def __init__(self, cfg, store, ob, source="qq_official:c2c"):
         self.cfg = cfg
         self.store = store
         self.ob = ob
-        self.last_images = {}   # session -> 最近收到的图片 [{file,url}, ...]
+        self.last_images = {}
+        self.last_main_images = {}   # 会话 -> 图片已直发主模型的时间戳   # session -> 最近收到的图片 [{file,url}, ...]
         self._vision_cache = {}  # sha256|focus -> (ts, 描述)，1 小时有效
         self._all_registry = {}
         self._all_schemas = []
@@ -124,7 +125,12 @@ class Tools:
                 "type": "object", "properties": {"fact": {"type": "string"}}, "required": ["fact"]},
                self._remember),
             _f("recall", "回忆某人让我记住的事情", {"type": "object", "properties": {}},
-               self._recall),
+               self._recall_memory),
+            _f("forget", "忘掉某人让我记住的一件事（真删；对方说「忘掉这件事」时调用）", {
+                "type": "object",
+                "properties": {"fact": {"type": "string",
+                                        "description": "要忘掉的那件事；留空 = 忘掉关于他的全部记忆"}}},
+               self._forget),
             _f("adjust_anger", "调整对某人的愤怒值（-100~100，负值=消气/原谅，正值=被惹毛更生气）", {
                 "type": "object",
                 "properties": {"delta": {"type": "integer", "minimum": -100, "maximum": 100}},
@@ -321,14 +327,33 @@ class Tools:
         fact = a.get("fact", "").strip()
         if not fact:
             return "没记下，内容为空"
-        self.store.remember(ctx.sender_qq, fact)
+        if not memory_bridge.extract_enabled():
+            return "（记忆功能现在是「无」档，我没有记）"
+        memory_bridge.remember(self.store, ctx.sender_qq, fact)
         return f"记住了：{fact}"
 
-    async def _recall(self, ctx, a):
-        rows = self.store.memories_for(ctx.sender_qq, 10)
+    async def _recall_memory(self, ctx, a):
+        """回忆记忆。
+
+        2026-10-15 改名（原来也叫 `_recall`）：本类里 `_recall` 这个名字被定义了两次 ——
+        上面那个是**撤回消息**（`delete_msg`），这个在文件更靠后、于是把前面那个覆盖掉了。
+        结果 `recall_message` 工具（注册的是 `self._recall`）实际执行的是"回忆记忆"，
+        模型按人设去撤回违规消息时**消息根本没被撤回**，还拿回一串记忆内容。
+        """
+        rows = memory_bridge.recent(self.store, ctx.sender_qq, 10)
         if not rows:
             return "（还没有关于你的记忆）"
-        return "、".join(f"'{m['fact']}'" for m in rows)
+        return "、".join(f"'{str(m['fact'])[:150]}'" for m in rows)
+
+    async def _forget(self, ctx, a):
+        """「忘掉这件事」：真删（不是标记）。返回说给对方听的确认。"""
+        fact = str(a.get("fact") or "").strip()
+        removed = memory_bridge.forget(self.store, ctx.sender_qq, fact)
+        if not removed:
+            return "（我这儿没有记着这件事）"
+        if fact:
+            return f"忘了：{fact}"
+        return f"已经把关于你的记忆清掉了（{len(removed)} 条）"
 
     async def _adjust_anger(self, ctx, a):
         delta = max(-100, min(100, int(a.get("delta", 0))))
@@ -607,8 +632,13 @@ class Tools:
         return data, mime
 
     async def _describe_image(self, ctx, a):
+        # 图片已经直发主模型的话，这里要明确告诉它"图就在你手上"，
+        # 否则模型会拿工具的结果当结论 → 回一句"我看不见图"（老板实测过）。
+        if getattr(self, "last_main_images", {}).get(getattr(ctx, "session_key", "")):
+            return "（这张图已经随消息直接提供给你了，直接看/描述它就行，不需要别的识别）"
         if not self.cfg.sf_api_key:
-            return "（视觉模型未配置，看不了图）"
+            # 别再让机器人自称"看不见"：主模型能直接看图（图片随消息一起发过去了）
+            return "（图片已随消息直接提供给你，直接描述就行，不需要额外识别）"
         focus = (a.get("focus") or "整体内容").strip()[:80]
         # 候选源：显式传的 file > 当前会话最近一张图的 file/url
         sources = self.last_images.get(ctx.session_key) or []

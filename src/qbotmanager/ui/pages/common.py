@@ -28,6 +28,8 @@ class PageContext:
         self.apply_appearance = callbacks.get("apply_appearance") or (lambda: None)
         self.set_beginner_mode = callbacks.get("set_beginner_mode") or (lambda *a, **k: None)
         self.bg_status = callbacks.get("bg_status") or (lambda: None)
+        # 首页"你想要什么功能"一句话带进工坊用（切页前塞进去，工坊页显示时消费）
+        self.pending_workshop_prompt = ""
 
 
 class Worker(QObject):
@@ -64,6 +66,7 @@ class ModelFetchController(QObject):
         self.cache_getter = cache_getter
         self.cache_setter = cache_setter
         self._busy = False
+        self._thread = None      # 记住拉取线程：页面销毁时要能等它收尾
 
     # ------------------------------------------------------------ 对外
     def start(self, reason="manual"):
@@ -87,10 +90,23 @@ class ModelFetchController(QObject):
         worker = Worker(self)
         worker.finished.connect(self._on_done)
         protocol = self.protocol() if callable(self.protocol) else self.protocol
-        threading.Thread(
+        self._thread = threading.Thread(
             target=lambda: worker.run(
                 lambda: model_list_mod.fetch_models(url, key, protocol=protocol)),
-            daemon=True).start()
+            daemon=True)
+        self._thread.start()
+
+    def wait(self, timeout: float = 3.0):
+        """等拉取线程收尾（页面/窗口销毁前调用）。
+
+        不等的话，程序正好在联网拉模型时退出，Qt 会报
+        "QThread: Destroyed while thread is still running" 并把进程带崩
+        （2026-10-06 跑测试时抓到的）。等最多 timeout 秒，超时就放着不管。
+        """
+        t = self._thread
+        if t is not None and t.is_alive():
+            t.join(timeout)
+        self._thread = None
 
     def fill(self, models):
         """把模型名灌进下拉框，保留用户已经填好/选好的那一个。"""
@@ -311,7 +327,8 @@ class DepsConfirmDialog(QDialog):
         self.setModal(True)
         self.resize(520, 360)
         lay = QVBoxLayout(self)
-        tip = QLabel("插件声明了以下依赖，是否一并安装？\n安装默认使用清华镜像，失败会自动切换官方源重试。")
+        tip = QLabel("插件声明了以下依赖，是否一并安装？")
+        tip.setToolTip("默认用清华镜像，失败自动切官方源。")
         tip.setWordWrap(True)
         lay.addWidget(tip)
         box = QListWidget()

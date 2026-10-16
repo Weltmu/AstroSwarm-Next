@@ -107,6 +107,6 @@ class RestartBotWorker(QThread):
     def run(self):
         try:
             self.manager.restart_bot()
-            self.done.emit("NoneBot 已重启")
+            self.done.emit("机器人已重启")
         except Exception as e:  # noqa: BLE001
             self.fail.emit(str(e))

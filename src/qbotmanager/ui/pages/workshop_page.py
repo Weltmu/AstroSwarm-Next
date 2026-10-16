@@ -21,6 +21,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QListWidget,
+    QMessageBox,
     QPlainTextEdit,
     QPushButton,
     QScrollArea,
@@ -33,7 +34,7 @@ from ...core import workshop
 from ...core.ai_config import normalize_api_url
 from ...core.workshop import config as ws_config
 from ..theme import TEXT_2, TEXT_3
-from ..widgets import GlassPanel
+from ..widgets import GlassPanel, set_busy
 from .common import ModelFetchController, PageContext, Worker
 
 EXAMPLES = (
@@ -57,9 +58,8 @@ class UploadDialog(QDialog):
         self._timer.timeout.connect(self._tick)
         form = QFormLayout(self)
 
-        tip = QLabel(
-            "上传的插件先进入人工审核，通过后才会出现在官网插件市场和所有用户的工坊里。\n"
-            "每次上传都要过一次邮箱验证码（防止被恶意刷），插件会带上你的作者名和账号邮箱。")
+        tip = QLabel("上传的插件要人工审核，通过后才会上架。")
+        tip.setToolTip("每次上传都要邮箱验证码，插件带作者名。")
         tip.setWordWrap(True)
         tip.setStyleSheet(f"color: {TEXT_3}; font-size: 12px;")
         form.addRow(tip)
@@ -74,7 +74,7 @@ class UploadDialog(QDialog):
         form.addRow("上传哪个插件", self.combo_plugin)
 
         self.edit_from_file = QLineEdit()
-        self.edit_from_file.setPlaceholderText("留空就上传上面选中的插件；也可以选一个 zip 文件传")
+        self.edit_from_file.setPlaceholderText("留空 = 传上面选中的插件；也可选 zip 文件")
         btn_file = QPushButton("选 zip…")
         btn_file.clicked.connect(self._pick_file)
         row_file = QHBoxLayout()
@@ -106,7 +106,7 @@ class UploadDialog(QDialog):
         row_code.addWidget(self.btn_send)
         form.addRow("邮箱验证码", row_code)
 
-        self.hint = QLabel("点「发送验证码」→ 去邮箱拿 6 位码 → 填上 → 确认上传。")
+        self.hint = QLabel("点「发送验证码」，把邮箱收到的 6 位码填上。")
         self.hint.setWordWrap(True)
         self.hint.setStyleSheet(f"color: {TEXT_3}; font-size: 12px;")
         form.addRow(self.hint)
@@ -119,7 +119,7 @@ class UploadDialog(QDialog):
         form.addRow(self.buttons)
 
         if not workshop.account_email():
-            self.hint.setText("还没登录星群账号：先去「设置 → 星群账号」登录，再回来上传。")
+            self.hint.setText("先去「设置 → 星群账号」登录，再回来上传。")
             self.btn_send.setEnabled(False)
             self.buttons.button(QDialogButtonBox.Ok).setEnabled(False)
 
@@ -157,7 +157,7 @@ class UploadDialog(QDialog):
     def _confirm(self):
         code = self.edit_code.text().strip()
         if not code:
-            self.hint.setText("先把邮箱收到的 6 位验证码填上（没收到就点「发送验证码」）。")
+            self.hint.setText("把邮箱收到的 6 位验证码填上。")
             return
         if not self.edit_from_file.text().strip() and not self.combo_plugin.count():
             self.hint.setText("先选一个要上传的插件。")
@@ -207,7 +207,7 @@ class ModelDialog(QDialog):
         model_row = QHBoxLayout()
         model_row.addWidget(self.edit_model, 1)
         self.btn_models = QPushButton("获取模型")
-        self.btn_models.setToolTip("按接口地址 + API Key 拉取该服务商可用的模型列表")
+        self.btn_models.setToolTip("拉取该服务商可用的模型列表")
         model_row.addWidget(self.btn_models)
         self.model_tip = QLabel("")
         self.model_tip.setWordWrap(True)
@@ -313,7 +313,7 @@ class WorkshopPage(QWidget):
 
         title = QLabel("插件工坊")
         title.setObjectName("pageTitle")
-        sub = QLabel("用大白话给机器人加功能：AI 写插件 → 自动检查 → 沙箱试跑 → 一键安装")
+        sub = QLabel("说一句需求，AI 写好插件并装到机器人。")
         sub.setObjectName("pageSub")
         outer.addWidget(title)
         outer.addWidget(sub)
@@ -326,11 +326,8 @@ class WorkshopPage(QWidget):
         n_title = QLabel("先配生成模型")
         n_title.setObjectName("sectionTitle")
         nv.addWidget(n_title)
-        n_body = QLabel(
-            "插件是 AI 写的，所以要先告诉它用哪个模型：选服务商、填 API 密钥，"
-            "填完会自动拉取该服务商可用的模型列表（DeepSeek / ChatGPT / Claude / "
-            "智谱 GLM / 通义千问 / Kimi）。配好之后，说需求 → 出方案 → 生成插件"
-            "的完整界面才会出现。这里的模型和「AI 大脑」互不影响。")
+        n_body = QLabel("先选服务商、填密钥，配好才能开始生成插件。")
+        n_body.setToolTip("这里的模型和「AI 大脑」互不影响。")
         n_body.setWordWrap(True)
         n_body.setStyleSheet(f"color: {TEXT_3}; font-size: 12px;")
         nv.addWidget(n_body)
@@ -342,7 +339,6 @@ class WorkshopPage(QWidget):
         n_row.addStretch(1)
         nv.addLayout(n_row)
         outer.addWidget(self.notice_panel)
-
         self.panel = GlassPanel(self, strong=True)
         box = QVBoxLayout(self.panel)
         box.setContentsMargins(18, 14, 18, 14)
@@ -352,6 +348,12 @@ class WorkshopPage(QWidget):
         self.status_label.setStyleSheet(f"color: {TEXT_2}; font-size: 13px;")
         row = QHBoxLayout()
         row.addWidget(self.status_label, 1)
+        # 插件管理已收进「工坊」组，这里给一个直达入口（不然侧栏里找不到它）
+        self.btn_plugins = QPushButton("插件管理")
+        self.btn_plugins.setObjectName("ghost")
+        self.btn_plugins.setToolTip("已安装的插件 / 能力包在这里看（开关、配置、卸载）")
+        self.btn_plugins.clicked.connect(lambda: self.ctx.switch_page("插件"))
+        row.addWidget(self.btn_plugins)
         self.btn_model = QPushButton("配置生成模型")
         self.btn_model.setObjectName("ghost")
         self.btn_model.clicked.connect(self._edit_model)
@@ -404,7 +406,7 @@ class WorkshopPage(QWidget):
         plan_title = QLabel("方案")
         plan_title.setStyleSheet(f"color: {TEXT_2}; font-size: 13px; font-weight: 600;")
         plan_box.addWidget(plan_title)
-        self.plan_text = QLabel("点「让 AI 出方案」，它会先用大白话告诉你要做什么、用哪些通道。")
+        self.plan_text = QLabel("点「让 AI 出方案」，它先说要做什么。")
         self.plan_text.setWordWrap(True)
         self.plan_text.setTextInteractionFlags(
             Qt.TextSelectableByMouse | Qt.TextSelectableByKeyboard)
@@ -439,13 +441,17 @@ class WorkshopPage(QWidget):
         ins_box = QVBoxLayout(self.installed_panel)
         ins_box.setContentsMargins(18, 12, 18, 12)
         head = QHBoxLayout()
-        head.addWidget(QLabel("已装的插件（含 AI 生成的）"))
+        head.addWidget(QLabel("我做的插件（工坊生成的）"))
         head.addStretch(1)
         btn_refresh = QPushButton("刷新")
         btn_refresh.setObjectName("ghost")
         btn_refresh.clicked.connect(self._refresh_installed)
         head.addWidget(btn_refresh)
         ins_box.addLayout(head)
+        self.installed_hint = QLabel("")
+        self.installed_hint.setWordWrap(True)
+        self.installed_hint.setStyleSheet(f"color: {TEXT_3}; font-size: 12px;")
+        ins_box.addWidget(self.installed_hint)
         self.installed_list = QListWidget()
         self.installed_list.setFixedHeight(120)
         self.installed_list.currentItemChanged.connect(lambda *_: self._refresh_error_hint())
@@ -502,6 +508,15 @@ class WorkshopPage(QWidget):
         st = workshop.status(self.ctx.settings)
         self.status_label.setText(("✅ " if st["ready"] else "⚠️ ") + st["why"])
         self._apply_model_gate()
+        # 首页"你想要什么功能"跳过来时，把那句话填进需求框（省一次复制粘贴）
+        text = str(getattr(self.ctx, "pending_workshop_prompt", "") or "").strip()
+        if text:
+            try:
+                self.need_edit.setPlainText(text)
+                self.need_edit.setFocus()
+            except Exception:  # noqa: BLE001
+                pass
+            self.ctx.pending_workshop_prompt = ""
 
     def _apply_model_gate(self):
         """没配生成模型时，本页只留「先配生成模型」那张卡，别的一律先藏起来。"""
@@ -535,6 +550,9 @@ class WorkshopPage(QWidget):
         self.btn_install.setEnabled(not busy and bool(self.built))
         for btn in (self.btn_export, self.btn_import, self.btn_upload):
             btn.setEnabled(not busy)
+        # 出方案 / 生成插件要等几十秒：按钮上挂呼吸点，用户才知道它在干活
+        for btn in (self.btn_plan, self.btn_build):
+            set_busy(btn, busy)
         if busy:
             self.btn_fix.setEnabled(False)
         else:
@@ -594,6 +612,24 @@ class WorkshopPage(QWidget):
         if not self.plan:
             return
         need = self.need_edit.toPlainText().strip()
+        # 2026-10-13（老板：防止用户觉得消耗 token 后悔）：开工前先报工程量 + 预估
+        self._last_estimate = None
+        try:
+            est = workshop.estimator.estimate(self.ctx.settings, need, self.plan)
+            text = workshop.estimator.format_estimate(est)
+            box = QMessageBox(self)
+            box.setWindowTitle("开工前先看一眼")
+            box.setIcon(QMessageBox.Information)
+            box.setText(text)
+            go = box.addButton("继续生成", QMessageBox.AcceptRole)
+            box.addButton("先算了", QMessageBox.RejectRole)
+            box.exec()
+            if box.clickedButton() is not go:
+                self._log("已取消（这一步没花 token）。")
+                return
+            self._last_estimate = est
+        except Exception as e:  # noqa: BLE001 —— 估算失败不拦生成
+            self._log(f"（工程量估算失败，照常生成：{e}）")
         self._busy(True)
 
         def job():
@@ -638,6 +674,14 @@ class WorkshopPage(QWidget):
             for item in errors[:6]:
                 lines.append("· " + str(item.get("plain")))
             lines.append("可以改一下需求描述，或者换个更强的模型再试。")
+        # 实际消耗（花完也要报账）
+        try:
+            usage_line = workshop.estimator.usage_line(
+                res.get("usage") or {}, getattr(self, "_last_estimate", None))
+            if usage_line:
+                lines.append("—— " + usage_line)
+        except Exception:  # noqa: BLE001
+            pass
         self.result_text.setText("\n".join(lines))
         self._log("完成。" if res.get("ok") else "有问题，见结果区。")
 
@@ -673,15 +717,32 @@ class WorkshopPage(QWidget):
         return item.data(0x0100) if item is not None else ""
 
     def _refresh_installed(self):
+        """只列**工坊生成的**插件。
+
+        2026-10-02 老板指出：官网下载的能力包也混在这个列表里，还能被投稿上传 ——
+        那类插件属于「插件」页（商店/已装能力包），工坊只管自己生成的东西。
+        """
         self.installed_list.clear()
-        for row in workshop.generated(self.ctx.settings):
-            mark = "AI 生成" if row.get("ai_generated") else "官方/手动"
-            label = (f"{row['name']}（{row['id']}）· {mark}"
+        mine = [row for row in workshop.generated(self.ctx.settings)
+                if row.get("ai_generated")]
+        others = [row for row in workshop.generated(self.ctx.settings)
+                  if not row.get("ai_generated")]
+        for row in mine:
+            label = (f"{row['name']}（{row['id']}）· AI 生成"
                      f" · 通道 {'/'.join(row.get('adapters') or []) or '不限'}"
                      f" · 工具 {', '.join(row.get('tools') or []) or '-'}")
-            item = self.installed_list.addItem(label)
+            self.installed_list.addItem(label)
             entry = self.installed_list.item(self.installed_list.count() - 1)
             entry.setData(0x0100, row["id"])
+        if not mine:
+            self.installed_list.addItem("还没有工坊生成的插件：上面写一句需求就能生成一个。")
+            self.installed_list.item(0).setData(0x0100, "")
+        if others:
+            self.installed_hint.setText(
+                f"另有 {len(others)} 个官网下载/手动装的能力包，去「插件」页管理"
+                "（工坊不管它们，也不给它们投稿上传）。")
+        else:
+            self.installed_hint.setText("")
         self._refresh_error_hint()
 
     # ---------- 分享 / 投稿 / 自修复 ----------
@@ -704,8 +765,7 @@ class WorkshopPage(QWidget):
             self.error_hint.setText(
                 f"有 {len(rows)} 个插件跑出过错（{names}）：选中它，点「让 AI 修一版」。")
         else:
-            self.error_hint.setText(
-                "插件在群里跑挂了会自动记下来；选中它就能让 AI 按真实报错改一版。")
+            self.error_hint.setText("插件跑挂会自动记下来，可让 AI 按报错改一版。")
         self.btn_fix.setEnabled(False)
 
     def _pick_pid(self) -> str:
@@ -760,7 +820,13 @@ class WorkshopPage(QWidget):
         self.ctx.show_toast("导入完成")
 
     def _upload(self):
-        rows = workshop.generated(self.ctx.settings)
+        # 只让"工坊生成的"插件投稿：官网下载的能力包不是用户做的，不该出现在这里
+        # （2026-10-02 老板指出过：那种插件也能上传是不对的）。
+        rows = [row for row in workshop.generated(self.ctx.settings)
+                if row.get("ai_generated")]
+        if not rows:
+            self.ctx.show_toast("还没有工坊生成的插件，先在上面写需求生成一个再投稿")
+            return
         dlg = UploadDialog(self.ctx.settings, rows, current_pid=self._selected_pid(), parent=self)
         if dlg.exec() != QDialog.Accepted:
             return
@@ -819,9 +885,8 @@ class WorkshopPage(QWidget):
         self.built = res if res.get("ok") else None
         errors = [i for i in (res.get("issues") or []) if i.get("level") == "error"]
         if res.get("ok"):
-            self.result_text.setText(
-                "✅ AI 按真实报错改好了一版，检查全过。\n"
-                "点「安装到机器人」换上（旧版本留在历史里，不满意可以「换回上一版」）。")
+            self.result_text.setText("✅ 改好了一版，检查全过，可装到机器人。")
+            self.result_text.setToolTip("不满意可以换回上一版。")
             self._log("改好了，等安装。")
         else:
             lines = ["❌ 改完还是没过检查（可以改一下需求描述，或换个更强的模型）："]

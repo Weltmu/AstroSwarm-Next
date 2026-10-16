@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""通道配置面板：QQ（官方机器人 / 第三方 OneBot）与微信 ClawBot。
+"""通道配置面板：QQ（官方机器人 / 第三方 OneBot）与微信 iLink。
 
 为什么单独抽一层：控制台（Linux 无头端）的「接入」页是「每通道一行、展开就地配置」，
 桌面端要跟它对齐，就得让同一份配置表单同时出现在「接入」页的内联展开区和通道独立页里。
@@ -28,6 +28,7 @@ from ...tasks.workers import DshControlTask, RestartBotTask
 from ..theme import TEXT_3
 from ..widgets import StatusBadge
 from .common import PageContext, make_row
+from ..segmented import SegmentedPill
 
 try:
     import qrcode
@@ -67,6 +68,54 @@ def _wire_snapshot(s) -> tuple:
     )
 
 
+class _SegAsCombo:
+    """把「接入方式」胶囊（SegmentedPill）包成旧下拉框（QComboBox）的读法。
+
+    2026-10-11 老板把 QQ 通道选择从下拉框换成了胶囊按钮；`RunPage` 里那段
+    「兼容旧引用」仍按老名字 `combo_channel` 找控件 —— 找不到就整批拷不进去，
+    于是 UI 用例（和任何按老 API 写的外部代码）一碰 `combo_channel` 就 AttributeError。
+
+    这里补一个最小适配器，恢复旧 API：
+      · 读：count / itemData / findData / currentData；
+      · `setCurrentIndex(i)` 按**用户操作**语义走 —— 挪滑块 + 补发 `changed`
+        （旧 QComboBox 的 setCurrentIndex 本来就会发信号；单纯回填请用
+        `seg_channel.set_current`，那个不发信号，是给"按配置回显"用的）。
+    """
+
+    def __init__(self, seg, keys):
+        self._seg = seg
+        self._keys = list(keys)
+
+    def count(self):
+        return len(self._keys)
+
+    def itemData(self, i):
+        try:
+            return self._keys[int(i)]
+        except (IndexError, ValueError, TypeError):
+            return None
+
+    def findData(self, key):
+        try:
+            return self._keys.index(str(key))
+        except ValueError:
+            return -1
+
+    def currentData(self):
+        return self._seg.current()
+
+    def setCurrentIndex(self, i):
+        try:
+            i = int(i)
+        except (ValueError, TypeError):
+            return
+        if 0 <= i < len(self._keys):
+            key = self._keys[i]
+            if key != self._seg.current():
+                self._seg.set_current(key)
+                self._seg.changed.emit(key)
+
+
 class QQChannelPanel(QWidget):
     """QQ 通道配置：官方机器人（AppID / Token / AppSecret）与第三方 OneBot。
 
@@ -97,10 +146,20 @@ class QQChannelPanel(QWidget):
         v.setSpacing(8)
 
         # 接入方式：官方机器人 / 第三方 OneBot，选哪套就只露哪套表单
-        self.combo_channel = QComboBox()
-        self.combo_channel.addItem("QQ 官方机器人（q.qq.com 开放平台）", "official")
-        self.combo_channel.addItem("第三方 OneBot 协议（协议端自行安装）", "onebot")
-        v.addLayout(make_row("接入方式", self.combo_channel))
+        # 老板 2026-10-11：下拉框太不直观，换成胶囊按钮切换（和人设那块同一套外观）。
+        # 两段互斥：选哪套就只注册哪套适配器（官方机器人 / 第三方 OneBot）。
+        self.seg_channel = SegmentedPill(
+            ("official", "onebot"),
+            ("QQ 官方机器人", "第三方 OneBot"),
+            accessible_name="QQ 接入方式",
+            tooltip="二选一：官方机器人（q.qq.com 开放平台凭证）或第三方 OneBot 协议端（如 NapCat）。"
+                    "切换后要重启一次机器人才真正生效。",
+            min_width=300,
+        )
+        # 旧名字兼容：RunPage 的"兼容旧引用"列表与 UI 用例都按 combo_channel 取它。
+        # 少了这一行，`rp.combo_channel` 直接 AttributeError（2026-10-16 修）。
+        self.combo_channel = _SegAsCombo(self.seg_channel, ("official", "onebot"))
+        v.addLayout(make_row("接入方式", self.seg_channel))
 
         # 官方通道面板：AppID / Token / AppSecret
         self.panel_official = QWidget()
@@ -223,10 +282,10 @@ class QQChannelPanel(QWidget):
         save_row.addStretch(1)
         v.addLayout(save_row)
 
-        self.combo_channel.currentIndexChanged.connect(self._on_channel_changed)
+        self.seg_channel.changed.connect(self._on_channel_changed)
         # 只有「用户真的动了」才算脏：programmatic 的 setCurrentIndex / setText
         # 不会发 activated / textEdited / clicked，回显不会被误判成改动。
-        self.combo_channel.activated.connect(self._mark_dirty)
+        self.seg_channel.changed.connect(lambda _k: self._mark_dirty())
         self.combo_onebot_mode.activated.connect(self._mark_dirty)
         self.chk_official_sandbox.clicked.connect(self._mark_dirty)
         for _w in (self.edit_official_appid, self.edit_official_token,
@@ -249,8 +308,8 @@ class QQChannelPanel(QWidget):
             return
         s = self.ctx.settings
         ch = str(getattr(s, "qq_channel", "") or "official")
-        ch_idx = self.combo_channel.findData(ch)
-        self.combo_channel.setCurrentIndex(ch_idx if ch_idx >= 0 else 0)
+        self.seg_channel.set_current(ch if ch in ("official", "onebot") else "official",
+                                     animate=False)
         self.edit_official_appid.setText(s.qq_official_appid)
         self.edit_official_token.setText(s.qq_official_token)
         self.edit_official_secret.setText(s.qq_official_secret)
@@ -267,7 +326,7 @@ class QQChannelPanel(QWidget):
 
     def _on_channel_changed(self):
         """接入方式切换：只露当前通道的表单，并通知宿主（dsh 卡片显隐 / 接入页重算高度）。"""
-        ch = str(self.combo_channel.currentData() or "official")
+        ch = str(self.seg_channel.current() or "official")
         self.panel_official.setVisible(ch == "official")
         self.panel_onebot.setVisible(ch == "onebot")
         cb = self._on_channel_changed_cb
@@ -328,7 +387,7 @@ class QQChannelPanel(QWidget):
     def _save_creds(self):
         s = self.ctx.settings
         before = _wire_snapshot(s)
-        s.qq_channel = str(self.combo_channel.currentData() or "official")
+        s.qq_channel = str(self.seg_channel.current() or "official")
         s.qq_official_appid = self.edit_official_appid.text().strip()
         s.qq_official_token = self.edit_official_token.text().strip()
         s.qq_official_secret = self.edit_official_secret.text().strip()
@@ -380,7 +439,7 @@ class QQChannelPanel(QWidget):
             if self.ctx.manager.bot_running():
                 restarted = True
                 self.ctx.tasks.submit(
-                    "重启 NoneBot（切换 QQ 通道）", "service", RestartBotTask,
+                    "重启机器人（切换 QQ 通道）", "service", RestartBotTask,
                     retryable=True, manager=self.ctx.manager,
                 )
         self.ctx.show_toast(self._saved_hint(auto_off, dsh_stopped, restarted))
@@ -406,7 +465,7 @@ class QQChannelPanel(QWidget):
 
 
 class WeChatChannelPanel(QWidget):
-    """微信 ClawBot 登录卡：状态、二维码、扫码 / 配对码 / 重启。
+    """微信 iLink 登录卡：状态、二维码、扫码 / 配对码 / 重启。
 
     开通判断放在面板里：独立页和接入页各有一个实例，谁都不需要知道对方存在。
     """
@@ -417,7 +476,6 @@ class WeChatChannelPanel(QWidget):
         self._show_badge = show_badge
         self._qr_url_cache = ""
         self._qr_shown_at = 0.0
-        self._qr_auto_at = 0.0
         self._build_ui()
         self.refresh_status()
 
@@ -427,7 +485,7 @@ class WeChatChannelPanel(QWidget):
         v.setContentsMargins(0, 0, 0, 0)
         v.setSpacing(8)
 
-        self.badge = StatusBadge("微信 ClawBot", "unknown")
+        self.badge = StatusBadge("微信 iLink", "unknown")
         # 内联进「接入」页时外层那行已经有状态徽标了，这里不再重复一遍
         self.badge.setVisible(self._show_badge)
         v.addWidget(self.badge)
@@ -451,9 +509,17 @@ class WeChatChannelPanel(QWidget):
             "background: #FFFFFF; color: #64748B; border-radius: 8px; font-size: 12px;")
         self.qr_box.setWordWrap(True)
         v.addWidget(self.qr_box, 0, Qt.AlignHCenter)
+        # 二维码下方的提示：什么时候该手动换码（不再自动刷新，这里必须说清）
+        # 2026-10-04：文案精简时把"不会自动刷新"删掉了，用户就不知道能不能挂着。
+        # 这句是老板当初明确要求的（"让用户自己手动刷新"），保留但压短。
+        self.qr_tip = QLabel("扫这张码就能连上。不会自动刷新，过期了点「刷新二维码」。")
+        self.qr_tip.setWordWrap(True)
+        self.qr_tip.setAlignment(Qt.AlignHCenter)
+        self.qr_tip.setStyleSheet(f"color: {TEXT_3}; font-size: 12px;")
+        v.addWidget(self.qr_tip)
 
         v.addWidget(_tip(
-            "说明：ClawBot 是私密个人助手通道，不支持群聊；其他用户无法添加你的 ClawBot。"))
+            "说明：iLink 是私密个人助手通道，不支持群聊；其他用户无法添加你的 iLink。"))
 
         btns = QHBoxLayout()
         self.btn_reset = QPushButton("重新扫码登录")
@@ -466,7 +532,7 @@ class WeChatChannelPanel(QWidget):
         self.btn_verify_code = QPushButton("输入配对码")
         self.btn_verify_code.setToolTip("扫码后手机微信显示数字配对码时，点这里输入")
         self.btn_verify_code.clicked.connect(self._submit_verify_code)
-        self.btn_restart = QPushButton("重启 NoneBot")
+        self.btn_restart = QPushButton("重启机器人")
         self.btn_restart.clicked.connect(lambda: self._restart_bot())
         for b in (self.btn_reset, self.btn_qr_refresh, self.btn_qr,
                   self.btn_verify_code, self.btn_restart):
@@ -484,10 +550,11 @@ class WeChatChannelPanel(QWidget):
 
     # ------------------------------------------------------------ 状态
     def _is_member(self) -> bool:
+        """微信通道是否可用 —— 已免费开放，所有人都是 True（保留方法给未来闸门用）。"""
         try:
-            return bool(lic_mod.feature_gate().get("member", False))
+            return bool(lic_mod.feature_gate().get("member", True))
         except Exception:  # noqa: BLE001
-            return False
+            return True
 
     def set_buttons_enabled(self, enabled: bool):
         for b in (self.btn_reset, self.btn_qr_refresh, self.btn_qr,
@@ -498,30 +565,31 @@ class WeChatChannelPanel(QWidget):
         member = self._is_member()
         self.set_buttons_enabled(member)
         if not member:
-            self.badge.set_status("stopped", "微信 ClawBot · 未开通")
+            # 只有把 WECHAT_FREE_FOR_ALL 改回 False 才会走到这里
+            self.badge.set_status("stopped", "微信 iLink · 通道已关闭")
             self.login_hint.hide()
             self.qr_box.setPixmap(QPixmap())
-            self.qr_box.setText("微信通道未开通\n开通后可扫码登录微信 ClawBot")
+            self.qr_box.setText("微信通道当前不可用")
             self.ai_warn.hide()
             return
 
         try:
             wx = self.ctx.manager.wechat_status()
         except Exception as e:  # noqa: BLE001
-            self.badge.set_status("warning", "微信 ClawBot · 状态读不到")
+            self.badge.set_status("warning", "微信 iLink · 状态读不到")
             self.login_hint.setText("状态读取失败：" + str(e))
             self.login_hint.show()
             return
 
         if not wx["installed"]:
-            self.badge.set_status("unknown", "微信 ClawBot · 未安装适配器")
+            self.badge.set_status("unknown", "微信 iLink · 未安装适配器")
         elif wx["logged_in"]:
             if wx.get("connected"):
-                self.badge.set_status("connected", "微信 ClawBot · 已连接")
+                self.badge.set_status("connected", "微信 iLink · 已连接")
             else:
-                self.badge.set_status("warning", "微信 ClawBot · 已登录但未连接")
+                self.badge.set_status("warning", "微信 iLink · 已登录但未连接")
         else:
-            self.badge.set_status("stopped", "微信 ClawBot · 未登录")
+            self.badge.set_status("stopped", "微信 iLink · 未登录")
         self._update_login_hint(wx)
         self.bot_id.setText(str(wx["bot_id"] or "—"))
         t = wx["login_time"]
@@ -534,7 +602,7 @@ class WeChatChannelPanel(QWidget):
             self._qr_url_cache = ""
             self.qr_box.setPixmap(QPixmap())
             if wx.get("connected"):
-                self.qr_box.setText("已连接 ✓\n微信里直接和 ClawBot 聊天")
+                self.qr_box.setText("已连接 ✓\n微信里直接和 iLink 聊天")
             else:
                 self.qr_box.setText("已登录但未连接\n" + (wx.get("reason") or "请检查机器人运行状态"))
         else:
@@ -550,9 +618,13 @@ class WeChatChannelPanel(QWidget):
                     self.qr_box.setPixmap(QPixmap())
                     self.qr_box.setText("二维码生成失败\n请点「打开扫码链接」")
             elif url:
-                # URL 长时间未变（微信未扫码/未确认）：自动刷新
-                if now - self._qr_shown_at > 120 and now - self._qr_auto_at > 180:
-                    self._auto_refresh_qr()
+                # 2026-10-03 起**不再自动刷新**：以前这里隔几分钟就自动重启一次 NoneBot
+                # 去换新二维码，后台一直重启既费内存又刷日志（老板实测发现）。
+                # 现在只提示一句，换不换由用户点「重新扫码登录」决定。
+                if now - self._qr_shown_at > 110:
+                    self.qr_tip.setText("二维码过期就点「刷新二维码」换一张。")
+                else:
+                    self.qr_tip.setText("微信里扫这张码就能连上；二维码 2 分钟一换。")
             else:
                 self._qr_url_cache = ""
                 self.qr_box.setPixmap(QPixmap())
@@ -562,8 +634,8 @@ class WeChatChannelPanel(QWidget):
         cfg = ai_config.current_config(self.ctx.settings)
         if getattr(self.ctx.settings, "ai_enabled", True) and not (
                 cfg.get("api_key") and cfg.get("api_url") and cfg.get("model")):
-            self.ai_warn.setText("⚠️ AI 接口未配置：机器人能收到消息但不会自动回复，"
-                                 "请到「AI 大脑」选择服务商并填入 API 密钥")
+            self.ai_warn.setText("还没配 AI：去「AI 大脑」填密钥。")
+            self.ai_warn.setToolTip("机器人能收到消息，但不会自动回复。")
             self.ai_warn.show()
         else:
             self.ai_warn.hide()
@@ -580,8 +652,8 @@ class WeChatChannelPanel(QWidget):
         texts = {
             "scaned": "已扫码 ✓ 请在微信里继续操作（确认连接；如显示配对码，点「输入配对码」提交）",
             "need_verifycode": "手机微信显示了数字配对码 → 点「输入配对码」提交后自动继续",
-            "binded_redirect": "这个微信号已绑定过 ClawBot，无法重复绑定；请换微信号扫码，"
-                               "或在微信 ClawBot 里先解绑",
+            "binded_redirect": "这个微信号已绑定过 iLink，无法重复绑定；请换微信号扫码，"
+                               "或在微信 iLink 里先解绑",
             "verify_code_blocked": "配对码错误次数过多，二维码即将刷新，请稍后重新扫码",
             "expired": "二维码已过期，点「刷新二维码」重新获取",
             "timeout": "等待扫码超时，点「刷新二维码」重新获取",
@@ -599,7 +671,7 @@ class WeChatChannelPanel(QWidget):
             return
         ret = QMessageBox.question(
             self, "微信重新扫码",
-            "将清除微信 ClawBot 登录状态并重启 NoneBot，重启后点「打开扫码链接」扫码。\n\n确定继续吗？",
+            "将清除微信 iLink 登录状态并重启 NoneBot，重启后点「打开扫码链接」扫码。\n\n确定继续吗？",
             QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
         )
         if ret != QMessageBox.Yes:
@@ -621,13 +693,6 @@ class WeChatChannelPanel(QWidget):
         self.qr_box.setText("正在获取新二维码…")
         self._restart_bot(reset_wechat=True)
 
-    def _auto_refresh_qr(self):
-        """二维码展示超过 120 秒未更新且未登录时，自动刷新一次（180 秒冷却）。"""
-        self._qr_auto_at = time.time()
-        self.qr_box.setPixmap(QPixmap())
-        self.qr_box.setText("二维码可能已过期\n正在自动刷新…")
-        self._qr_url_cache = ""
-        self._restart_bot(reset_wechat=True)
 
     def _open_qr(self):
         url = self.ctx.manager.wechat_qr_url()
@@ -669,7 +734,7 @@ class WeChatChannelPanel(QWidget):
 
     def _restart_bot(self, reset_wechat=False):
         self.ctx.tasks.submit(
-            "重启 NoneBot", "service", RestartBotTask,
+            "重启机器人", "service", RestartBotTask,
             retryable=True, manager=self.ctx.manager,
             payload={"reset_wechat": reset_wechat},
         )

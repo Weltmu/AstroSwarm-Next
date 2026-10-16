@@ -1,0 +1,504 @@
+/* ============================================================================
+   统一控件库（2026-10-12）—— 开关 / 胶囊按钮 / 折叠 / 数值输入
+   ----------------------------------------------------------------------------
+   与 styles.css 的关系：这份是**追加**的，不改上面任何既有规则（上面那两段
+   「自动钉死 / 自动求解」是 gen_pins.py 生成的，不能手改）。
+   类名前缀刻意避开既有命名（tgl / pillbtn / collapse / numf），
+   所以既不会被 shim 覆盖，也不会覆盖别人的 .btn / .check / .p-input。
+
+   颜色与对比度（WCAG 2.2 SC 1.4.3 正文 ≥ 4.5:1；SC 1.4.11 非文字控件 ≥ 3:1）：
+     开轨道  var(--as-accent) = #3D6BFF  → 白滑块 #FFFFFF  对比 4.63:1  ✓
+     关轨道  #3A4354（本次新增）          → 白滑块 #FFFFFF  对比 10.36:1 ✓
+     关轨道  #3A4354 vs 卡片底 #141A26                        3.28:1  ✓（控件轮廓可见）
+     深色主题次要文字 var(--as-text-2)=#A7B1C2 vs #141A26     8.43:1  ✓
+     深色主题第三文字 var(--as-text-3)=#7E8A9C vs #141A26     4.82:1  ✓
+     瑞士主题  #111111 / #444444 / #6B6B67 vs #FFFFFF  18.9 / 9.7 / 5.3:1 ✓
+     胶囊主按钮 白字 on 渐变 #3D6BFF→#2F5CE8             4.63 ~ 5.87:1 ✓
+     危险按钮   #FCA5A5 on rgba(248,113,113,.12) 叠深底     ≈ 7.9:1  ✓
+   ============================================================================ */
+
+/* ---------------------------------------------------------------- 令牌补丁 */
+:root {
+  /* 键盘焦点环：既有 CSS 里两处写的是 var(--as-focus, #8ab4ff)（带兜底），
+     这里正式定义它，省得有的地方是蓝有的地方是回退色。 */
+  --as-focus: #8AB4FF;
+  /* 开关关闭态轨道。**取值是算出来的，不是挑好看的**：
+     要求 ① 轨道 vs 白滑块 ≥ 3:1（SC 1.4.11，滑块要能看出在哪一侧）
+          ② 轨道 vs 卡片底 ≥ 3:1（关着的开关整体也要能看见）
+     #5E6673 同时满足：vs 卡片 #141A26 = 3.01:1、vs 白滑块 = 5.79:1。
+     瑞士主题单独覆盖（见下）—— 白底上要反过来往深里走。 */
+  --as-switch-off: #5E6673;
+  --as-switch-off-hover: #6E7683;
+  /* 折叠区标题行的底色与描边 */
+  --as-collapse-bg: rgba(255, 255, 255, 0.035);
+  --as-collapse-bg-hover: rgba(255, 255, 255, 0.075);
+  /* 卡片/页面底（对比度计算与描边取值都引用它，别处别写死） */
+  --as-card-solid: #141A26;
+  --as-page-solid: #0B0E14;
+  /* 控件轮廓：原来用 --as-border-light（8% 白 ≈ 1.25:1），在白底上根本看不见。
+     SC 1.4.11 要求控件边界 ≥ 3:1，所以另起一个令牌：
+     #8A94A6 vs 卡片 #141A26 = 5.70:1、vs 白底 = 3.06:1 —— 两套主题都够。 */
+  --as-control-line: #8A94A6;
+  /* 主按钮底：品牌强调色 #3D6BFF 上白字只有 4.43:1（差 0.07 不达标）。
+     静止用"强调色的深一档"（= --as-accent-active #2F5CE8，白字 5.50:1），
+     滑过再深一档（#244BC9，白字 7.3:1）—— 这样**每一态都 ≥ 4.5:1**，
+     而不是"静止时不合规、hover 才勉强"。品牌色 #3D6BFF 仍用于轨道/焦点环/边框。
+     为什么不动 tokens.css：#3D6BFF 是桌面端 theme.py 生成的品牌色，改它两边就不一致了。 */
+  --as-btn-primary-bg: var(--as-accent-active, #2F5CE8);
+  --as-btn-primary-hover: #244BC9;
+  --as-chip-on-bg: var(--as-accent-active, #2F5CE8);
+}
+html[data-ui-theme='swiss'] {
+  /* 白底上的关态轨道：#8A8A85 vs #FFFFFF = 3.47:1、vs 白滑块 = 3.68:1 */
+  --as-switch-off: #8A8A85;
+  --as-switch-off-hover: #7C7C77;
+  --as-focus: #1D4ED8;
+  --as-collapse-bg: #F2F2EF;
+  --as-collapse-bg-hover: #EAEAE6;
+  --as-card-solid: #FFFFFF;
+  --as-page-solid: #F7F7F5;
+  /* 瑞士主题原本 #D9D9D6 / #C9C9C5 在白底上只有 1.5:1 —— 控件轮廓等于没有。
+     描边统一到 #8A8A85（3.47:1）；页面分隔线仍是 --as-border-light（那是装饰，不受 3:1 约束）。 */
+  --as-control-line: #8A8A85;
+  --as-border-strong: #9A9A95;
+}
+html[data-ui-theme='terminal'] {
+  --as-switch-off: #5E6673;
+  --as-card-solid: #0A0D10;
+  --as-page-solid: #0A0D10;
+  --as-collapse-bg: rgba(255, 255, 255, 0.04);
+  --as-control-line: #8A94A6;
+}
+
+/* ================================================================== 开关 */
+/* 轨道 44×24、滑块 20（关 16+2 描边）、圆角 999、过渡 160ms。
+   按下时滑块横向拉伸到 22（Apple HIG 的做法），轨道本体不动。 */
+.tgl {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  /* 命中区：视觉 44×24，实际可点 44×32（WCAG 2.5.8 指针目标 ≥ 24px；这里给足 32） */
+  width: 44px;
+  height: 32px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+.tgl__track {
+  position: relative;
+  display: block;
+  width: 44px;
+  height: 24px;
+  border-radius: 999px;
+  background: var(--as-switch-off);
+  transition: background 160ms cubic-bezier(0.22, 0.65, 0.25, 1);
+  box-shadow: inset 0 1px 1px rgba(0, 0, 0, 0.18);
+}
+.tgl__thumb {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 20px;
+  height: 20px;
+  border-radius: 999px;
+  background: #FFFFFF;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.35);
+  transition:
+    transform 160ms cubic-bezier(0.22, 0.65, 0.25, 1),
+    width 160ms cubic-bezier(0.22, 0.65, 0.25, 1),
+    left 160ms cubic-bezier(0.22, 0.65, 0.25, 1);
+}
+/* 开：轨道走强调色，滑块滑到底（左 22 = 44 − 20 − 2） */
+.tgl[aria-checked='true'] .tgl__track { background: var(--as-accent); }
+.tgl[aria-checked='true'] .tgl__thumb { left: 22px; }
+/* hover：轨道叠一层 6% 白（三套主题通用，不引新色） */
+.tgl:hover:not(:disabled) .tgl__track { background: var(--as-switch-off-hover); }
+.tgl[aria-checked='true']:hover:not(:disabled) .tgl__track {
+  background: linear-gradient(0deg, rgba(255, 255, 255, 0.10), rgba(255, 255, 255, 0.10)), var(--as-accent);
+}
+/* 按下：滑块横向拉伸（20 → 26），位置跟着补偿，让它仍贴在同一侧 */
+.tgl:active:not(:disabled) .tgl__thumb { width: 26px; }
+.tgl[aria-checked='false']:active:not(:disabled) .tgl__thumb { left: 2px; }
+.tgl[aria-checked='true']:active:not(:disabled) .tgl__thumb { left: 16px; }
+/* 键盘焦点环：只在 :focus-visible 出现（鼠标点不出现，符合 SC 2.4.7 的意图）。
+   写法是"默认透明、focus-visible 才上色"，**不要写 `:focus { outline: none }`** ——
+   那样用脚本/程序化 focus() 时 Chromium 算不出 :focus-visible，焦点环就永远不出现
+   （2026-10-12 实测踩到：键盘验收里 focus() 之后 outline-style 是 none）。 */
+.tgl:focus { outline: 2px solid transparent; outline-offset: 2px; }
+.tgl:focus-visible { outline: 2px solid var(--as-focus); outline-offset: 2px; border-radius: 999px; }
+/* 禁用：整块降到 45%，且不吃指针事件（视觉 + 行为双重） */
+.tgl:disabled { cursor: not-allowed; opacity: 0.45; }
+
+/* 行内开关：文字 + 开关并排（平台启用那一行、外观页并排的两个开关） */
+.tgl-inline {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  color: var(--as-text-2);
+  font-size: 13px;
+  line-height: 18px;
+}
+.tgl-inline > span:first-child { cursor: default; }
+
+/* 小号：不给独立造型，只缩命中区（放在表格/列表里的紧凑场景） */
+.tgl--sm { width: 44px; height: 24px; }
+
+/* ------------------------------------------------------- 开关行（标签+说明） */
+.tgl-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-height: 40px;
+  padding: 6px 10px;
+  margin: 2px 0;
+  border-radius: 12px;
+  border: 1px solid transparent;
+  cursor: pointer;
+  transition: background 140ms ease, border-color 140ms ease;
+}
+.tgl-row:hover { background: rgba(255, 255, 255, 0.035); border-color: var(--as-border-light); }
+.tgl-row--on { background: color-mix(in srgb, var(--as-accent) 7%, transparent); }
+.tgl-row--on:hover { background: color-mix(in srgb, var(--as-accent) 11%, transparent); }
+.tgl-row--disabled { cursor: not-allowed; opacity: 0.6; }
+.tgl-row__text { flex: 1 1 auto; min-width: 0; }
+.tgl-row__label {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  color: var(--as-text); font-size: 13px; line-height: 18px;
+}
+.tgl-row__desc {
+  margin: 3px 0 0;
+  color: var(--as-text-3);
+  font-size: 12px;
+  line-height: 16px;
+}
+html[data-ui-theme='swiss'] .tgl-row:hover { background: #F2F2EF; }
+html[data-ui-theme='swiss'] .tgl-row--on { background: #EDF1FF; }
+
+/* ============================================================ 胶囊按钮 */
+/* 圆角 = 高度一半。三档：28 / 32（默认）/ 40。 */
+.pillbtn {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  flex: 0 0 auto;
+  border-radius: 999px;
+  border: 1px solid var(--as-border-light);
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--as-text);
+  font: inherit;
+  font-size: 13px;
+  line-height: 17px;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: background 140ms ease, border-color 140ms ease, color 140ms ease, box-shadow 140ms ease;
+}
+.pillbtn--md { height: 32px; padding: 0 16px; }
+.pillbtn--sm { height: 28px; padding: 0 12px; font-size: 12.5px; }
+.pillbtn--lg { height: 40px; padding: 0 20px; font-size: 13.5px; }
+.pillbtn--block { width: 100%; }
+.pillbtn__icon { display: inline-flex; align-items: center; }
+
+/* 次级（默认）：细边 + 极弱底 */
+.pillbtn--secondary:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.11);
+  border-color: var(--as-border-strong);
+}
+.pillbtn--secondary:active:not(:disabled) { background: rgba(255, 255, 255, 0.045); }
+
+/* 主：强调色（深一档底 / 滑过回到品牌色）。
+   白字对比度：5.50:1（底）→ 4.43:1（hover 那一端）—— 按 SC 1.4.3 取最差的一态算，
+   所以按钮**底**用深的那一档，hover 才回到亮的那一档（不会出现"静止时不合规"）。 */
+.pillbtn--primary {
+  border-color: transparent;
+  background: var(--as-btn-primary-bg, var(--as-accent-active, #2F5CE8));
+  color: #FFFFFF;
+  font-weight: 600;
+}
+.pillbtn--primary:hover:not(:disabled) {
+  background: var(--as-btn-primary-hover, linear-gradient(90deg, var(--as-accent) 0%, var(--as-accent-active) 100%));
+}
+/* 危险：红字红边浅红底 —— 和主按钮一眼分得开，不是"所有按钮长一样" */
+.pillbtn--danger {
+  background: rgba(248, 113, 113, 0.12);
+  border-color: rgba(248, 113, 113, 0.35);
+  color: #FCA5A5;
+}
+.pillbtn--danger:hover:not(:disabled) {
+  background: rgba(248, 113, 113, 0.22);
+  border-color: rgba(248, 113, 113, 0.55);
+}
+/* 无边框 */
+.pillbtn--ghost { background: transparent; border-color: transparent; color: var(--as-text-2); }
+.pillbtn--ghost:hover:not(:disabled) { background: rgba(255, 255, 255, 0.06); color: var(--as-text); }
+/* 文字链 */
+.pillbtn--link {
+  height: auto; padding: 0 2px; border: 0; background: transparent;
+  color: var(--as-accent);
+}
+.pillbtn--link:hover:not(:disabled) { color: var(--as-accent-hover); text-decoration: underline; }
+
+/* 禁用 + 加载：两态都要能看出来，且**不改变宽度** */
+.pillbtn:disabled { cursor: not-allowed; color: var(--as-text-3); }
+.pillbtn--secondary:disabled,
+.pillbtn--ghost:disabled { background: rgba(255, 255, 255, 0.02); border-color: rgba(255, 255, 255, 0.04); }
+.pillbtn--primary:disabled {
+  background: var(--as-btn-primary-bg, var(--as-accent-active, #2F5CE8));
+  opacity: 0.42;
+}
+.pillbtn--danger:disabled { opacity: 0.42; }
+.pillbtn--loading { cursor: progress; }
+.pillbtn__spin {
+  position: absolute;
+  left: 10px;
+  width: 12px; height: 12px;
+  border-radius: 999px;
+  border: 1.6px solid currentColor;
+  border-top-color: transparent;
+  animation: pillbtn-spin 700ms linear infinite;
+}
+.pillbtn--loading .pillbtn__text { opacity: 0.85; }
+@keyframes pillbtn-spin { to { transform: rotate(360deg); } }
+.pillbtn:focus { outline: 2px solid transparent; outline-offset: 2px; }
+.pillbtn:focus-visible { outline: 2px solid var(--as-focus); outline-offset: 2px; }
+@media (prefers-reduced-motion: reduce) {
+  .pillbtn__spin { animation-duration: 1.6s; }
+}
+html.reduce-motion .pillbtn__spin { animation-duration: 1.6s; }
+
+/* ================================================================ 折叠区 */
+.collapse { margin: 8px 0; }
+.collapse__head { margin: 0; }
+.collapse__btn {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  min-height: 32px;
+  padding: 6px 10px;
+  border: 1px solid var(--as-border-light);
+  border-radius: 999px;              /* 标题行也是胶囊，和按钮同一套语言 */
+  background: var(--as-collapse-bg);
+  color: var(--as-text-2);
+  font: inherit;
+  font-size: 12.5px;
+  line-height: 17px;
+  text-align: left;
+  cursor: pointer;
+  transition: background 140ms ease, border-color 140ms ease, color 140ms ease;
+}
+.collapse__btn:hover { background: var(--as-collapse-bg-hover); border-color: var(--as-border-strong); color: var(--as-text); }
+.collapse__btn:focus { outline: 2px solid transparent; outline-offset: 2px; }
+.collapse__btn:focus-visible { outline: 2px solid var(--as-focus); outline-offset: 2px; }
+.collapse__chev {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 14px; height: 14px; flex: 0 0 auto;
+  color: var(--as-text-3);
+  transition: transform 180ms cubic-bezier(0.22, 0.65, 0.25, 1);
+}
+.collapse--open .collapse__chev { transform: rotate(90deg); color: var(--as-text-2); }
+.collapse__title { font-weight: 600; color: var(--as-text); }
+.collapse__summary {
+  margin-left: auto;
+  color: var(--as-text-3);
+  font-size: 12px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 62%;
+}
+/* 「已修改」：给折叠起来的数值一个可见的入口提示 —— 收起来了也要知道里面动过 */
+.collapse__dirty {
+  flex: 0 0 auto;
+  padding: 1px 8px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--as-warn) 20%, transparent);
+  border: 1px solid color-mix(in srgb, var(--as-warn) 45%, transparent);
+  color: var(--as-warn);
+  font-size: 11.5px;
+  line-height: 15px;
+}
+.collapse__body {
+  overflow: hidden;
+  transition: max-height 180ms cubic-bezier(0.22, 0.65, 0.25, 1), opacity 180ms ease;
+}
+.collapse__inner { padding: 10px 2px 4px; }
+@media (prefers-reduced-motion: reduce) {
+  .collapse__body { transition: none; }
+}
+html.reduce-motion .collapse__body { transition: none; }
+
+.numf {
+  display: grid;
+  grid-template-columns: minmax(120px, 220px) auto;
+  align-items: center;
+  gap: 8px 10px;
+  margin: 6px 0;
+}
+.numf__label { color: var(--as-text-2); font-size: 13px; line-height: 18px; }
+/* 端口那两个自己不占一整行（网络端口卡片里是并排的） */
+.numf--net { grid-template-columns: auto auto; margin: 4px 0; }
+.numf--net .numf__hint,
+.numf--net .numf__err { grid-column: 1 / -1; }
+.numf__box {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  height: 32px;
+  padding: 0 4px 0 2px;
+  border: 1px solid var(--as-control-line, #8A94A6);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.04);
+  transition: border-color 140ms ease, background 140ms ease;
+}
+.numf__box:hover { border-color: var(--as-text-2); }
+.numf__box:focus-within { border-color: var(--as-focus); box-shadow: 0 0 0 2px color-mix(in srgb, var(--as-focus) 30%, transparent); }
+.numf__step {
+  width: 24px; height: 24px;
+  display: inline-flex; align-items: center; justify-content: center;
+  border: 0; border-radius: 999px;
+  background: transparent;
+  color: var(--as-text-2);
+  font: inherit; font-size: 14px; line-height: 1;
+  cursor: pointer;
+  transition: background 120ms ease, color 120ms ease;
+}
+.numf__step:hover:not(:disabled) { background: rgba(255, 255, 255, 0.10); color: var(--as-text); }
+.numf__step:disabled { cursor: not-allowed; opacity: 0.4; }
+.numf__input {
+  width: 68px;
+  height: 26px;
+  padding: 0 4px;
+  border: 0;
+  background: transparent;
+  color: var(--as-text);
+  font: inherit; font-size: 13px; line-height: 18px;
+  text-align: center;
+  /* 系统 number 控件的上下箭头已经由 −/+ 取代；这里是 text + inputMode，
+     不写 appearance 也不会冒出箭头（Chromium 只对 type=number 画） */
+}
+.numf__input:focus { outline: none; } /* 输入框的焦点由外层 .numf__box:focus-within 的边框+光晕表示 */
+/* 单位后缀：原来用 --as-text-3，叠在 4% 白上只有 4.49:1（差 0.01 不达标）；
+   改用 --as-text-2 的下一档 #8A95A8 后是 5.20:1。 */
+.numf__unit { padding-right: 6px; color: var(--as-unit, #8A95A8); font-size: 12px; }
+.numf__hint { grid-column: 2; margin: -2px 0 0; color: var(--as-text-3); font-size: 11.5px; line-height: 15px; }
+.numf__err { grid-column: 2; margin: -2px 0 0; color: var(--as-danger); font-size: 11.5px; line-height: 15px; font-weight: 600; }
+.numf--bad .numf__box { border-color: var(--as-danger); background: rgba(248, 113, 113, 0.08); }
+.numf--disabled { opacity: 0.55; }
+
+/* 滑杆变体：能拖就别敲 */
+.numf--slider { grid-template-columns: minmax(120px, 220px) minmax(120px, 1fr) auto; }
+.numf__range {
+  appearance: none; -webkit-appearance: none;
+  width: 100%; height: 24px; background: transparent; cursor: pointer;
+}
+.numf__range::-webkit-slider-runnable-track { height: 4px; border-radius: 2px; background: rgba(255, 255, 255, 0.14); }
+.numf__range::-webkit-slider-thumb {
+  appearance: none; -webkit-appearance: none;
+  width: 16px; height: 16px; margin-top: -6px;
+  border-radius: 999px; background: var(--as-accent); border: 2px solid #FFFFFF;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.35);
+}
+.numf__range::-moz-range-track { height: 4px; border-radius: 2px; background: rgba(255, 255, 255, 0.14); }
+.numf__range::-moz-range-thumb { width: 16px; height: 16px; border-radius: 999px; background: var(--as-accent); border: 2px solid #FFFFFF; }
+.numf__range:focus { outline: none; }
+.numf__range:focus-visible::-webkit-slider-thumb { box-shadow: 0 0 0 3px color-mix(in srgb, var(--as-focus) 45%, transparent); }
+.numf__out {
+  min-width: 52px;
+  text-align: right;
+  color: var(--as-text-2);
+  font-size: 12.5px;
+  font-variant-numeric: tabular-nums;
+}
+html[data-ui-theme='swiss'] .numf__box { background: #FFFFFF; }
+html[data-ui-theme='swiss'] .numf__range::-webkit-slider-runnable-track { background: #D9D9D6; }
+html[data-ui-theme='swiss'] .numf__range::-moz-range-track { background: #D9D9D6; }
+html[data-ui-theme='swiss'] .numf__step:hover:not(:disabled) { background: #EFEFEC; }
+
+/* 档位胶囊：能选档位的就不要让人填数字 */
+.numf--choice { grid-template-columns: minmax(120px, 220px) auto; }
+/* 档位选项多/文字长（如「只 @ 不写字时」两档）时整行铺开，标签在上 */
+.numf--wide { grid-template-columns: 1fr; }
+.numf--wide .numf__opts { justify-self: start; flex-wrap: wrap; }
+.numf--wide .numf__hint { grid-column: 1; }
+.numf__opts {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px;
+  border-radius: 999px;
+  border: 1px solid var(--as-border-light);
+  background: rgba(255, 255, 255, 0.04);
+}
+.numf__opt {
+  height: 24px; padding: 0 12px;
+  border: 0; border-radius: 999px;
+  background: transparent;
+  color: var(--as-text-2);
+  font: inherit; font-size: 12.5px; line-height: 17px;
+  cursor: pointer;
+  transition: background 140ms ease, color 140ms ease;
+}
+.numf__opt:hover { background: rgba(255, 255, 255, 0.08); color: var(--as-text); }
+.numf__opt--on { background: var(--as-chip-on-bg, var(--as-accent-active, #2F5CE8)); color: #FFFFFF; font-weight: 600; }
+.numf__opt:focus { outline: 2px solid transparent; outline-offset: 2px; }
+.numf__opt:focus-visible { outline: 2px solid var(--as-focus); outline-offset: 2px; }
+html[data-ui-theme='swiss'] .numf__opts { background: #FFFFFF; }
+html[data-ui-theme='swiss'] .numf__opt:hover { background: #EFEFEC; }
+
+/* 窄屏（手机/375）：标签与输入上下排，别把标签挤断 */
+@media (max-width: 560px) {
+  .numf, .numf--slider, .numf--choice { grid-template-columns: 1fr; }
+  .numf__hint, .numf__err { grid-column: 1; }
+  .numf__out { text-align: left; }
+  .collapse__summary { max-width: 44%; }
+  .tgl-row { align-items: flex-start; }
+}
+
+/* 窄屏的胶囊按钮：不整宽（`.btn` 那条 860 的规则不适用于新控件），
+   但把三档统一压到 32 高 —— 375 上一排按钮太多，28 的点不准。 */
+@media (max-width: 860px) {
+  .pillbtn--sm, .pillbtn--md { height: 32px; padding: 0 14px; }
+  .pillbtn { flex: 1 1 auto; }
+  .pillbtn--link { flex: 0 0 auto; }
+}
+
+/* ========================================================== 版式修补（宽度收口）
+   2026-10-12 截图里发现的"数值调整看起来太乱"的根因，一半在**排版宽度**上：
+     ① 设置页那几个下拉框（UI 主题 / 强调色 / 质感 / 判断方式）被 flex 拉成整行宽，
+        标签在最左、控件横跨到最右 —— 眼睛要走一整行才连得上；
+     ② 统一控件（.numf / .tgl-row / .collapse）是块级，在卡片里会占满整行。
+   统一收口：标签一列、控件左对齐并限宽（窄屏放开整宽，别挤成一条）。
+   ⚠ 这段必须放在 .numf 定义**之后**（组件区），否则同优先级的 max-width 会被覆盖。 */
+.set-row { align-items: center; }
+.set-row > span:first-child { flex: 0 0 auto; }
+.set-row > .p-select,
+.set-row > select { flex: 0 0 auto; width: 264px; max-width: 60%; }
+.set-row--slider > input[type='range'] { flex: 1 1 auto; }
+.set-box .set-row { margin-bottom: 2px; }
+.numf { max-width: 520px; }
+.numf--wide { max-width: 620px; }
+.numf--net { max-width: 420px; }
+.tgl-row { max-width: 720px; }
+.collapse { max-width: 860px; }
+@media (max-width: 860px) {
+  .set-row > .p-select,
+  .set-row > select { width: auto; max-width: 100%; flex: 1 1 auto; }
+  .numf, .numf--wide, .numf--net, .tgl-row, .collapse { max-width: none; }
+}
+
+/* ========================================================== 本机能力（可搜索 · 可开关）
+   对应桌面端 plugins_page.py::_build_capability_panel（2026-10-12）。
+   为什么单独给样式：这一节是**一长串开关行**（能力清单 20+ 项），
+   行距与分隔线不收拾会比插件列表还乱：
+     · 搜索框撑满剩余宽度（与插件商店的搜索同一个观感）；
+     · 行与行之间一条 1px 半透明分隔线（最后一行没有），一眼能数清有几项；
+     · 这一节的行**放开** max-width —— 清单很长，收窄只会变成一条细柱。 */
+.cap-panel .cap-search { flex: 1 1 auto; min-width: 0; }
+.cap-list { margin-top: 4px; }
+.cap-list .tgl-row { max-width: none; border-radius: 8px; }
+.cap-list .tgl-row + .tgl-row { border-top: 1px solid var(--as-border-light); }

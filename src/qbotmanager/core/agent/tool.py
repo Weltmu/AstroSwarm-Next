@@ -53,7 +53,7 @@ class ToolUnavailableError(RuntimeError):
 
 # 会真的改变外部世界的动作：这些失败了才算"没做成"（读类动作失败是正常流程）
 EFFECT_ACTIONS = {
-    "send_message", "mute_user", "mute_all", "recall_message",
+    "send_message", "send_music_card", "mute_user", "mute_all", "recall_message",
     "http_request", "memory_write", "data_write", "reminder_add",
 }
 

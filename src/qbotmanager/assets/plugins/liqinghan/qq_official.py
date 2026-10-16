@@ -10,6 +10,11 @@ import time
 import urllib.request
 from datetime import datetime, timezone
 
+try:                        # 这个模块要能被"按路径单独加载"（单测不触发包 __init__，
+    from . import gates     # 避免拉进 NoneBot 依赖）；那种场景没有包上下文，相对导入会 ImportError
+except ImportError:  # noqa: BLE001
+    gates = None
+
 API_BASE = "https://api.sgroup.qq.com"
 _RESTRICT = "/v2/groups/{group_openid}/restrict_chat_setting"
 
@@ -27,6 +32,49 @@ def _text_of(message):
         elif isinstance(s, dict) and s.get("type") == "at":
             parts.append("@")
     return "".join(parts).strip()
+
+
+def _is_at_bot(event, bot_qq: str = "") -> bool:
+    """这条消息 @ 的是不是机器人自己。
+
+    2026-10-10 修：原来只看 `event.to_me`，而 QQ 官方**全量群事件**里 mention 段
+    不一定带 is_bot/is_you 标记、to_me 也就恒为 False —— 后果是群里 @ 它，
+    档案这边认不出"在叫它"，就不回话（和 AI 插件那边同一类问题）。
+    现在多一条：mention 的 user_id 等于机器人自己的 id 也算。
+    """
+    if bool(getattr(event, "to_me", False)):
+        return True
+    ids = set()
+    for cand in (bot_qq, getattr(event, "self_id", "")):
+        s = str(cand or "").strip()
+        if s:
+            ids.add(s)
+    try:
+        for seg in event.get_message():
+            data = getattr(seg, "data", None) or {}
+            if getattr(seg, "type", "") != "mention_user":
+                continue
+            if data.get("is_bot") or data.get("is_you"):
+                return True
+            if ids and str(data.get("user_id") or "").strip() in ids:
+                return True
+    except Exception:  # noqa: BLE001 —— 拿不到消息体就当没 @
+        pass
+    try:
+        for mention in (getattr(event, "mentions", None) or []):
+            if bool(getattr(mention, "is_you", False)) or bool(getattr(mention, "bot", False)):
+                return True
+            mid = ""
+            for attr in ("id", "user_id", "user_openid", "openid"):
+                v = getattr(mention, attr, None)
+                if v:
+                    mid = str(v).strip()
+                    break
+            if mid and ids and mid in ids:
+                return True
+    except Exception:  # noqa: BLE001
+        pass
+    return False
 
 
 def to_data(event, bot_qq="", source=None):
@@ -63,7 +111,7 @@ def to_data(event, bot_qq="", source=None):
             segs.append({"type": s_type, "data": s_data})
     if not segs:
         segs.append({"type": "text", "data": {"text": plain}})
-    to_me = bool(getattr(event, "to_me", False))
+    to_me = _is_at_bot(event, bot_qq)
     if is_group and to_me and bot_qq:
         segs.insert(0, {"type": "at", "data": {"qq": bot_qq, "name": ""}})
     author = getattr(event, "author", None)
@@ -71,6 +119,9 @@ def to_data(event, bot_qq="", source=None):
     return {
         "post_type": "message",
         "message_type": "group" if is_group else "private",
+        # 明确标记"这条是 @ 我的"：官方通道里 at 段的 qq 是 openid 体系，
+        # 和配置里的 bot_qq（AppID / 默认 astrobot）对不上，靠 id 比会永远认不出来。
+        "at_me": bool(to_me),
         "user_id": user_id,
         "group_id": group_id,
         "message_id": str(getattr(event, "id", "") or ""),
@@ -78,7 +129,11 @@ def to_data(event, bot_qq="", source=None):
         "raw_message": plain,
         "member_role": str(getattr(author, "member_role", "") or "") if author is not None else "",
         "sender": {"nickname": nickname, "card": nickname},
-        "source": source or ("qq:group" if is_group else "qq:c2c"),
+        # 2026-10-16（审计 platform/E #55）：本插件**只**收官方 QQ 事件（openid 体系），
+        # source 标注统一成 `qq_official:*` —— 与程序侧核心能力矩阵、内置记忆的
+        # `qq_official:<openid>` key 形态、以及"官方通道不给 proactive（主动消息按
+        # 日限额度）"的口径对齐。旧标签 `qq:*` 在能力矩阵里仍保留（老数据兼容）。
+        "source": source or ("qq_official:group" if is_group else "qq_official:c2c"),
     }
 
 
@@ -92,7 +147,7 @@ class OfficialChannel:
     def __init__(self):
         self.bot = None
         self._event = None
-        self._source = "qq:c2c"
+        self._source = "qq_official:c2c"
         self._seq = {}
         self._msg_scope = {}
         self.api_base = API_BASE
@@ -100,16 +155,18 @@ class OfficialChannel:
     def attach(self, bot):
         self.bot = bot
 
-    def set_current(self, bot, event, source="qq:c2c"):
+    def set_current(self, bot, event, source="qq_official:c2c"):
         self.bot = bot
         self._event = event
         self.set_source(source)
 
     def set_source(self, source):
-        self._source = source or "qq:c2c"
+        self._source = source or "qq_official:c2c"
 
     def _is_group(self, params):
-        if self._source == "qq:group":
+        # 新旧标签都认（2026-10-16 改名 qq_official:*）：改名不能把"发到群里"
+        # 悄悄变成"发给个人"，所以这里同时接受老写法。
+        if self._source in ("qq:group", "qq_official:group"):
             return True
         if "group_id" in params:
             return True
@@ -242,19 +299,25 @@ class DispatchChannel:
     def __init__(self):
         self.official = OfficialChannel()
         self.noop = NoopChannel()
-        self._source = "qq:c2c"
+        self._source = "qq_official:c2c"
 
     def attach(self, bot):
         self.official.attach(bot)
 
-    def set_current(self, bot, event, source="qq:c2c"):
+    def set_current(self, bot, event, source="qq_official:c2c"):
         self.official.set_current(bot, event, source)
         self.set_source(source)
 
     def set_source(self, source):
-        self._source = source or "qq:c2c"
+        self._source = source or "qq_official:c2c"
 
     async def action(self, action, params=None):
+        # 2026-10-15：这里是**所有**出站动作的唯一出口（回复、连发、语音、定时提醒、
+        # 群管），所以共享开关（AI 总开关 / 档案开关）放这儿兜底 —— 上面几条路
+        # 谁漏了判都不会漏出去。关着时返回错误码而不是静默成功：调用方按"没做成"处理。
+        blocked = gates.blocked_once() if gates is not None else ""
+        if blocked:
+            return {"error": "agent_disabled", "detail": blocked}
         if self._source.startswith("wechat"):
             return await self.noop.action(action, params)
         return await self.official.action(action, params)

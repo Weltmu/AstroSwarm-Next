@@ -14,12 +14,13 @@ LIQINGHAN_PROFILE_ID = "liqinghan"
 
 DEFAULT_WAKE_WORDS = ["李清菡", "学姐", "姐姐", "菡姐", "菡菡"]
 
-# 李清菡实际注册的 26 个工具（tools.py _register）
+# 李清菡实际注册的 27 个工具（tools.py _register；2026-10-16 补漏掉的 forget，
+# 审计 liqinghan/F1、platform/I —— 档案页工具清单以前少一项，跟真实能力对不上）
 LIQINGHAN_TOOLS = [
     "get_time", "recall_message", "mute_user", "mute_all",
     "read_recent_history", "set_reminder", "add_rule", "list_rules",
     "remove_rule", "checkin", "work", "balance", "leaderboard",
-    "get_user_profile", "set_relationship", "remember", "recall",
+    "get_user_profile", "set_relationship", "remember", "recall", "forget",
     "adjust_anger", "product_faq", "describe_image",
     "start_game", "game_guess", "game_end", "game_state",
     "send_face", "generate_image",
@@ -28,7 +29,7 @@ LIQINGHAN_TOOLS = [
 PROFILES = {
     DEFAULT_PROFILE_ID: {
         "id": DEFAULT_PROFILE_ID,
-        "name": "星群助手",
+        "name": "星巢助手",
         "description": "默认助手，无额外功能层，行为由内置 AI 插件与 dsh 预设决定。",
         "tools": [],
         "default_wake_words": [],
@@ -37,7 +38,12 @@ PROFILES = {
         "id": LIQINGHAN_PROFILE_ID,
         "name": "李清菡",
         "description": "真人感智能体：群聊插话、语音、图片描述/生成、游戏、群管、记忆等。"
-                       "人格仍跟随程序「人格设定」，此处只提供功能层。",
+                       "人格由插件自带的李清菡人设决定（可在 .env 里用 "
+                       "QBM_AGENT_PERSONA_EXTRA 追加补充，那段优先级最高）。",
+        # ⚠ 2026-10-15 改文案：以前这里写"人格仍跟随程序「人格设定」" —— 与实现不符
+        # （persona.py 用的是插件内的固定人设 + PERSONA_EXTRA，程序侧「人格设定」
+        # 那一段从没被读进来）。没去改实现，是因为那会把整份李清菡人设换掉，
+        # 属于产品决策；先把承诺改成实话，别让用户改了「人格设定」以为生效了。
         "tools": LIQINGHAN_TOOLS,
         "default_wake_words": list(DEFAULT_WAKE_WORDS),
     },
@@ -67,8 +73,41 @@ CHANNEL_CAPABILITIES = {
     "qq:group": {"chat", "memory", "voice", "image", "image_gen",
                  "proactive", "group_interject", "group_admin",
                  "recall", "tools"},
+    # ---- QQ 官方机器人（nonebot-adapter-qq）----
+    # 2026-10-15 补：以前这里**根本没有 qq_official 的键**，而 `channel_capabilities()`
+    # 对未知通道返回**空集** —— 于是官方通道的本地动作权限只剩
+    # send_message / memory / network / timer：
+    #   · send_image / send_file / send_voice / recall_message 被从模型工具表里整批裁掉；
+    #   · `adapters/qq_official.py` 里**早就实现好**的 send_image / send_file /
+    #     send_voice / send_card / send_buttons 全成了死代码 —— 连全项目**唯一**
+    #     实现了键盘的那条也调不到；
+    #   · `tool_packs/group-manager` 只声明 adapters=["qq_official"] 却要求
+    #     group_admin，在它自己声明的通道上必然 ToolPermissionError（等于装不上）。
+    #
+    # 下面这份是**对着适配器实现逐个核对**出来的，不是照抄上面 qq:* 两行：
+    #   · image / voice / image_gen：适配器走官方富媒体上传接口，已实现 → 给；
+    #   · recall：适配器有 delete_group_message / delete_c2c_message → 给；
+    #   · proactive / group_interject：**不给** —— 官方主动消息按日限额度，
+    #     发一条少一条，不该默认让定时播报/群聊搭话去烧额度；
+    #   · group_admin：**给**（2026-10-15 安全闸就位之后）。之前一直没给，是因为
+    #     误以为"官方 API 查不到喊话人在群里的角色"—— 其实官方**更直接**：
+    #     群消息事件的 `author.member_role`（member/admin/owner）是必填字段，
+    #     适配器已带进 `ctx.extra["member_role"]`，一次接口都不用调。
+    #     现在 `tools_bridge._act_mute` 两种通道都用它做"谁喊都动手"那道闸：
+    #     非群主/管理员一律拒绝；取不到角色也保守拒绝。
+    #     （OneBot 侧反而麻烦些，要另查 get_group_member_info，还可能查失败。）
+    "qq_official:c2c": {"chat", "memory", "voice", "image", "image_gen",
+                        "recall", "tools"},
+    "qq_official:group": {"chat", "memory", "voice", "image", "image_gen",
+                          "group_admin", "recall", "tools"},
     "wechat:private": {"chat", "memory", "tools"},
+    # 2026-10-15：这两条通道也可能来**群消息**（iLink 事件自带 group_id、飞书事件带
+    # chat_id）。以前没有 wechat:group / feishu:group 这两个键，而未知通道返回**空集**
+    # → 群里那条消息会被裁掉**全部**工具（连 chat 都被判掉），表现是"在群里回了话但
+    # 什么都不会做"。群聊按"只聊天 + 记记忆"给，不给群管/主动/搭话。
+    "wechat:group": {"chat", "memory", "tools"},
     "feishu:private": {"chat", "memory", "tools"},
+    "feishu:group": {"chat", "memory", "tools"},
     "telegram:private": {"chat", "memory", "tools"},
 }
 
@@ -82,6 +121,7 @@ TOOL_CAPABILITIES = {
     "generate_image": "image_gen",
     "remember": "memory",
     "recall": "memory",
+    "forget": "memory",
     "recall_message": "recall",
 }
 
@@ -186,7 +226,14 @@ def generate_wake_words(persona: str, call_llm, default: list | None = None) -> 
 
 def openai_chat(prompt: str, api_url: str, api_key: str, model: str,
                 timeout: int = 60) -> str:
-    """OpenAI 兼容 chat/completions 单轮调用，返回首条消息文本。"""
+    """OpenAI 兼容 chat/completions 单轮调用，返回首条消息文本。
+
+    额度策略（老板 2026-10-11 定：**不设上限 + 适配思考型模型**）：
+      · 请求里**不带 `max_tokens`** —— 交给服务商按模型自身上限走；
+      · 思考型模型（deepseek 等）的 `reasoning_content` 也计入输出额度，以前写死 800
+        会把正文挤空 → 上层把"空回复"当成"没生成出来"（10-10/11 同一坑踩过两次）；
+      · 正文为空时退回读 `reasoning_content`，实在没有才报一句能看懂的话。
+    """
     base = (api_url or "").strip().rstrip("/")
     if not base or not api_key or not model:
         raise ValueError("语言模型接口地址 / 密钥 / 模型未配置")
@@ -195,7 +242,6 @@ def openai_chat(prompt: str, api_url: str, api_key: str, model: str,
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
         "temperature": 0.7,
-        "max_tokens": 300,
     }).encode("utf-8")
     req = urllib.request.Request(url, data=body, method="POST")
     req.add_header("Content-Type", "application/json")
@@ -203,6 +249,20 @@ def openai_chat(prompt: str, api_url: str, api_key: str, model: str,
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         data = json.loads(resp.read().decode("utf-8"))
     try:
-        return str(data["choices"][0]["message"]["content"])
+        message = data["choices"][0]["message"] or {}
     except (KeyError, IndexError, TypeError) as e:
         raise ValueError("模型返回格式异常: " + str(e)) from e
+    text = str(message.get("content") or "").strip()
+    if text:
+        return text
+    thought = str(message.get("reasoning_content") or message.get("reasoning") or "").strip()
+    if thought:
+        return thought          # 正文空但思考有内容：思考里通常也给了答案
+    finish = ""
+    try:
+        finish = str(data["choices"][0].get("finish_reason") or "")
+    except Exception:  # noqa: BLE001
+        pass
+    raise ValueError(
+        f"模型（{model}）返回了空内容" + (f"，finish_reason={finish}" if finish else "") +
+        "。换个模型再试（换成非思考型最稳），或检查服务商那边的输出上限。")

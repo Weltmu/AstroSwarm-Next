@@ -22,6 +22,17 @@ DEFAULTS = {
     "qq_onebot_path": "/onebot/v11/ws",
     "qq_onebot_token": "",
     "qq_onebot_listen_host": "127.0.0.1",
+    # 飞书通道（2026-10-04 加）：以前这几个键没进配置表，控制台填了也进不了机器人 .env，
+    # 表现就是"界面上填好了、机器人那边当没有"。
+    # 界面：小白模式（与桌面端 settings.beginner_mode 同义，默认开）
+    # 2026-10-04 加：控制台原来把它存在浏览器 localStorage，不同浏览器/不同设备不一致，
+    # 桌面端存在服务器配置里，两边永远可能对不上。
+    "beginner_mode": True,
+    "feishu_enabled": False,
+    "feishu_app_id": "",
+    "feishu_app_secret": "",
+    "feishu_encrypt_key": "",
+    "feishu_verification_token": "",
     # 智能体档案（李清菡等）
     "agent_profile_enabled": False,
     "agent_profile_id": "star_helper",
@@ -71,6 +82,7 @@ DEFAULTS = {
 SAFE_KEYS = {
     "port": int,
     "bot_port": int,
+    "beginner_mode": bool,
     "qq_app_id": str,
     "qq_app_secret": str,
     "qq_app_token": str,
@@ -102,7 +114,136 @@ SAFE_KEYS = {
     "agent_wake_auto": bool,
     "local_persona_id": str,
     "account_base": str,
+    # ── 界面偏好（ui_* 前缀）─────────────────────────────────────────────
+    # 2026-10-07：控制台原来把「外观」整份存在浏览器 localStorage（as_appearance），
+    # 换浏览器/换设备/清缓存就全丢，老板看到的是"配置归 0"。
+    # 这里只收「配置 / 偏好」类，且**都带 ui_ 前缀**：
+    #   · 前缀是为了绝不与桌面端 settings.json 的通用键（theme / accent / …）撞名 ——
+    #     撞名会让无头端写下的控制台外观去改桌面端的界面；
+    #   · 草稿（插件工坊正在编辑的内容、工坊 job_id）故意不收：草稿留在本地是对的。
+    # 值域校验（类型 / 长度 / 数值范围 / 枚举）在 validate_ui_prefs() 里，
+    # 读和写两条路径都过一遍，手改 config.json 写坏也不会把前端搞崩。
+    "ui_bg_enabled": bool,
+    "ui_bg_path": str,
+    "ui_bg_mask": int,
+    "ui_bg_opacity": int,
+    "ui_bg_bright": int,
+    "ui_bg_autoplay": bool,
+    "ui_bg_loop": bool,
+    "ui_animations": bool,
+    "ui_theme": str,
+    "ui_accent": str,
+    "ui_glass": str,
 }
+
+# ── 界面偏好白名单：类型 + 值域（见上面 ui_* 的说明）──────────────────────
+# 数值统一用「夹取」而不是拒绝：滑杆拖动时打到边界是正常操作，
+# 回 400 会让用户以为设置坏了。字符串超长直接截断，枚举不认识就回落默认。
+UI_PREF_SETS = {
+    "ui_theme": {"极光玻璃", "瑞士极简", "深空终端"},
+    "ui_accent": {"深邃蓝", "暗夜紫", "赛博青", "暖阳橙", "薄荷绿", "深空绿（新色板）"},
+    "ui_glass": {"默认（原样）", "液态玻璃", "颗粒磨砂"},
+}
+UI_PREF_RANGES = {
+    "ui_bg_mask": (0, 100),
+    "ui_bg_opacity": (10, 95),
+    "ui_bg_bright": (-100, 100),
+}
+UI_PREF_DEFAULTS = {
+    "ui_bg_enabled": False,
+    "ui_bg_path": "",
+    "ui_bg_mask": 68,
+    "ui_bg_opacity": 70,
+    "ui_bg_bright": 0,
+    "ui_bg_autoplay": False,
+    "ui_bg_loop": False,
+    "ui_animations": True,
+    "ui_theme": "极光玻璃",
+    "ui_accent": "深邃蓝",
+    "ui_glass": "默认（原样）",
+}
+UI_PREF_MAXLEN = {"ui_bg_path": 1024}
+# 允许写进配置的界面偏好键（= SAFE_KEYS 里 ui_ 开头那批，单独列出来给校验用）
+UI_PREF_KEYS = tuple(UI_PREF_DEFAULTS)
+
+
+def validate_ui_prefs(cfg: dict) -> dict:
+    """就地校验/夹取配置里的 ui_* 键，返回改动过的键名列表。
+
+    读（load）与写（PUT /api/config）两条路径都要过：
+    写的时候挡住越界值，读的时候兜住被手工改坏的 config.json。
+    """
+    changed = []
+    for key in UI_PREF_KEYS:
+        if key not in cfg:
+            continue                     # 没设过就不写默认值：留空 = 前端用自带默认
+        raw = cfg[key]
+        want = type(UI_PREF_DEFAULTS[key])
+        if want is bool:
+            if not isinstance(raw, bool):
+                cfg[key] = UI_PREF_DEFAULTS[key]
+                changed.append(key)
+            continue
+        if want is int:
+            if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+                cfg[key] = UI_PREF_DEFAULTS[key]
+                changed.append(key)
+                continue
+            lo, hi = UI_PREF_RANGES[key]
+            val = int(raw)
+            clamped = min(hi, max(lo, val))
+            if clamped != raw:
+                cfg[key] = clamped
+                changed.append(key)
+            continue
+        # str
+        if not isinstance(raw, str):
+            cfg[key] = UI_PREF_DEFAULTS[key]
+            changed.append(key)
+            continue
+        allowed = UI_PREF_SETS.get(key)
+        if allowed is not None and raw not in allowed:
+            cfg[key] = UI_PREF_DEFAULTS[key]
+            changed.append(key)
+            continue
+        limit = UI_PREF_MAXLEN.get(key)
+        if limit and len(raw) > limit:
+            cfg[key] = raw[:limit]
+            changed.append(key)
+    return changed
+
+
+def ui_pref_value(key: str, value):
+    """PUT /api/config 用：按 UI_PREF_* 规则把单个 ui_* 键的入参转成落库值。
+
+    与 validate_ui_prefs() 共用同一套值域表，避免写入口和读入口两套规则。
+    类型不对抛 ValueError（→ 接口回 400，前端能看见"格式不正确"）；
+    数值越界/文案超长/枚举不认识都按规则**夹取或回落**，不算错 ——
+    滑杆拖到边界、主题名以后改了，都不该让保存失败。
+    """
+    if key not in UI_PREF_DEFAULTS:
+        raise ValueError("未知的界面偏好键：%s" % key)
+    want = type(UI_PREF_DEFAULTS[key])
+    if want is bool:
+        if not isinstance(value, bool):
+            raise ValueError("%s 需要 true/false" % key)
+        return value
+    if want is int:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError("%s 需要数字" % key)
+        if value != value or value in (float("inf"), float("-inf")):   # NaN / inf
+            raise ValueError("%s 数值不合法" % key)
+        lo, hi = UI_PREF_RANGES[key]
+        return min(hi, max(lo, int(value)))
+    if not isinstance(value, str):
+        raise ValueError("%s 需要文本" % key)
+    allowed = UI_PREF_SETS.get(key)
+    if allowed is not None and value not in allowed:
+        raise ValueError("%s 不是可选的取值" % key)
+    limit = UI_PREF_MAXLEN.get(key)
+    if limit and len(value) > limit:
+        raise ValueError("%s 太长了（最多 %d 字）" % (key, limit))
+    return value
 
 
 def config_path() -> Path:
@@ -174,6 +315,9 @@ def load() -> dict:
         if not isinstance(loaded, dict):
             raise ValueError("config.json 顶层不是 JSON 对象")
         data.update(loaded)
+        # 界面偏好单独过一遍值域：这份文件可能被人手工改过，
+        # 越界/枚举不认识的值不该直接灌进前端。
+        validate_ui_prefs(data)
         return data
     except Exception as exc:  # noqa: BLE001
         bak = path.with_name(path.name + ".corrupt." + time.strftime("%Y%m%d-%H%M%S"))

@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""打「Linux 无头端」客户安装包（astroswarm-linux-<版本>.tar.gz）。
+"""打「星巢 Nest（Linux 无头端）」客户安装包（astroswarm-linux-<版本>.tar.gz）。
 
 为什么要有这个脚本：
     给客户下载的包必须是「可复现的一条命令」打出来的，并且打完自动做一次交付物自检，
@@ -231,7 +231,7 @@ def check_deliverable(root: Path, version: str) -> list:
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="打 Linux 无头端客户包")
+    ap = argparse.ArgumentParser(description="打星巢 Nest（Linux 无头端）客户包")
     ap.add_argument("--version", default=None, help="版本号（默认取 astroswarm_linux/__init__.py）")
     ap.add_argument("--console-dist", default=None, help="控制台前端产物目录")
     ap.add_argument("--wheels", default=None,
@@ -255,7 +255,7 @@ def main() -> int:
 
     console_candidates = [
         Path(args.console_dist) if args.console_dist else None,
-        Path("D:/ai/QBotManager_website/console-dist"),
+        
         REPO / "console-dist",
     ]
     console_dist = next(
