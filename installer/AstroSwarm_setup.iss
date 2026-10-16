@@ -12,7 +12,7 @@
 ; 用户看得见的软件名（2026-10-10 老板改名）：快捷方式/卸载项/应用列表都用它；
 ; MyAppName 仍是内部标识（安装目录默认名、注册表键），别混用。
 #define MyAppDisplay "星巢 Nest"
-#define MyAppVersion "1.2.24"
+#define MyAppVersion "1.2.25"
 #define MyAppExeName "AstroSwarm.exe"
 
 [Setup]

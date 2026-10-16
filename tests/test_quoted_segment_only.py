@@ -407,5 +407,56 @@ def test_hint_injected_by_brain_not_adapter(pw):
     assert info["quoted_state"] == "unresolved" and picked == []
 
 
+# ================================================================ 2026-10-16：引用照片看得见
+def test_quoted_image_is_recognized_when_vision_on(pw, qq, capsys):
+    """引用消息里的图片要过识图（老板实测：群里引用照片，机器人回"看不见"）。
+
+    以前 `_plain_from_raw` 只把图片段折成字面量 `[图片]` —— 模型看不到画面、
+    也没有原图地址，只能回"我看不见"。现在引用图片会走和主消息同一条识图链。
+    """
+    async def fake_recognize(url, prompt="请简洁描述这张图片的内容"):
+        return "一只橘猫趴在键盘上"
+
+    qq.recognize_image = fake_recognize
+    qq.chat_manager.is_image_recognition_enabled = lambda: True
+    try:
+        segments = [Seg("reply", id="12345"), Seg("at", qq="1"), Seg("text", text=" 这是什么")]
+        messages = {12345: {"message": [{"type": "image",
+                                         "data": {"url": "http://127.0.0.1:3000/img_a.jpg"}}],
+                            "sender": {"nickname": "清秋"}}}
+        quoted = quoted_of(qq, segments, messages)
+    finally:
+        qq.chat_manager.is_image_recognition_enabled = lambda: False
+    print("\n[引用图片] content = %r" % (quoted and quoted["content"]))
+    assert quoted and "一只橘猫趴在键盘上" in quoted["content"], "引用图片的识别结果必须进正文"
+    assert "[图片]" in quoted["content"], "占位符保留（标出图在原文里的位置）"
+    assert "http://127.0.0.1:3000/img_a.jpg" in quoted["content"], "原图地址要给它（能转发）"
+
+
+def test_quoted_image_without_recognition_still_says_something(pw, qq, capsys):
+    """识图关着 / 识别失败：如实给一句"没识别出内容"，但 content 不许为空。
+
+    content 为空 = 下游判"引用解析不出来" → 不带上文，这条路以前整批丢上下文。
+    """
+    segments = [Seg("reply", id="12345"), Seg("at", qq="1")]
+    messages = {12345: {"message": [{"type": "image", "data": {"url": "http://x/img.jpg"}}],
+                        "sender": {"nickname": "路人"}}}
+    quoted = quoted_of(qq, segments, messages)
+    print("\n[引用图片·无识图] content = %r" % (quoted and quoted["content"]))
+    assert quoted and quoted["content"], "content 不能为空"
+    assert "没识别出内容" in quoted["content"]
+
+
+def test_quoted_voice_and_sticker_have_placeholders(qq, capsys):
+    """引用语音 / 动画表情：以前正文全空 → 引用被判"解析不出来"。"""
+    segments = [Seg("reply", id="999"), Seg("at", qq="1")]
+    msg = {999: {"message": [{"type": "record", "data": {"file": "a.silk"}},
+                             {"type": "mface", "data": {}}],
+                 "sender": {"nickname": "小李"}}}
+    quoted = quoted_of(qq, segments, msg)
+    print("\n[引用语音/表情] content = %r" % (quoted and quoted["content"]))
+    assert quoted and "[语音]" in quoted["content"] and "[动画表情]" in quoted["content"]
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q", "-s"]))

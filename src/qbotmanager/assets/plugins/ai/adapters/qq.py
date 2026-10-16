@@ -146,6 +146,18 @@ def _plain_from_raw(raw) -> str:
             parts.append("[图片]")
         elif kind == "face":
             parts.append("[表情]")
+        # 2026-10-16：补几个以前会被整条吞掉的段型（引用里是语音/视频/文件/表情包时，
+        # 正文不至于全空 → 引用被当成"解析不出来"，上下文整批丢）。
+        elif kind in ("mface", "marketface", "bface"):
+            parts.append("[动画表情]")
+        elif kind == "record":
+            parts.append("[语音]")
+        elif kind == "video":
+            parts.append("[视频]")
+        elif kind == "file":
+            parts.append("[文件]")
+        elif kind in ("json", "xml"):
+            parts.append("[卡片]")
     text = "".join(parts).strip()
     if text:
         return text
@@ -154,6 +166,57 @@ def _plain_from_raw(raw) -> str:
         return Message(raw).extract_plain_text().strip()
     except Exception:  # noqa: BLE001
         return ""
+
+
+async def _describe_quoted_media(raw) -> str:
+    """把**被引用消息里的图片**讲给 AI 听（2026-10-16 老板实测：群里引用照片，它说看不见）。
+
+    以前 `_plain_from_raw` 把图片段折成字面量 `[图片]` —— 模型只知道"被引用的是一条
+    图片"，看不到画面、也没有原图地址，只能回"我看不见"。这里按和主消息
+    （`_extract_text`）**同一条链**补上：
+      · 登记原图地址（media_guard）→ 这张图之后可以转发到别的平台；
+      · 识图开关开着 → 走多模态模型识别，结果写进引用正文；
+      · 识别失败/开关关着 → 如实说一句，并把原图地址给它（转发仍然可用）。
+    """
+    segs = raw if isinstance(raw, list) else [raw]
+    urls = []
+    for seg in segs:
+        if not isinstance(seg, dict):
+            continue
+        if str(seg.get("type") or "") != "image":
+            continue
+        data = seg.get("data") if isinstance(seg.get("data"), dict) else {}
+        url = str(data.get("url") or "").strip()
+        if url.startswith(("http://", "https://")) and url not in urls:
+            urls.append(url)
+    if not urls:
+        return ""
+    recognize_on = False
+    try:
+        recognize_on = bool(chat_manager.is_image_recognition_enabled())
+    except Exception:  # noqa: BLE001 —— 读开关失败按"不识别"处理，别挡住引用正文
+        recognize_on = False
+    lines = []
+    for i, url in enumerate(urls[:2], 1):
+        # 和主消息路径一致：NapCat 的图片地址常常长在本机端口上，先登记出处
+        try:
+            media_guard.trust_origin(url)
+        except Exception:  # noqa: BLE001
+            pass
+        desc = ""
+        if recognize_on:
+            try:
+                desc = str(await recognize_image(url) or "").strip()
+            except Exception as e:  # noqa: BLE001 —— 识别失败不影响引用正文
+                logger.info(f"[qq] 引用图片{i}识别失败：{str(e)[:100]}")
+        if desc:
+            lines.append(f"[引用的消息里是图片{i}，内容识别结果] {desc}"
+                         f"｜原图地址：{url}")
+        else:
+            lines.append(f"[引用的消息里是图片{i}，但这次没识别出内容]"
+                         "（别猜画面，如实说看不到、请对方把图重新发一条）"
+                         f"｜原图地址：{url}")
+    return "\n".join(lines)
 
 
 async def _extract_quoted(bot, event):
@@ -204,6 +267,15 @@ async def _extract_quoted(bot, event):
                     logger.info(f"[qq] 引用文件读取失败：{str(e)[:100]}")
                 if file_text:
                     text = (text + "\n" + file_text).strip() if text else file_text
+            # 2026-10-16（老板实测：引用照片说"看不见"）：被引用的图片要过识图
+            if raw is not None:
+                try:
+                    media_text = await _describe_quoted_media(raw)
+                except Exception as e:  # noqa: BLE001 —— 读引用媒体失败不影响其它引用
+                    media_text = ""
+                    logger.info(f"[qq] 引用媒体解析失败：{str(e)[:100]}")
+                if media_text:
+                    text = (text + "\n" + media_text).strip() if text else media_text
             sender = str(((got.get("sender") or {}).get("nickname")) or "")
     except Exception as e:  # noqa: BLE001 —— 取被引用那条失败不是错误，只是没有上文
         reason = f"取被引用消息失败：{str(e)[:120]}"
